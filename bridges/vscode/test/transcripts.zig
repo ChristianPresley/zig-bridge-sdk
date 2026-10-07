@@ -10,6 +10,8 @@
 //! - `negative_test.zig`: the lines that are not valid, the responses of VS Code and the error
 //!   table.
 //! - `input_test.zig`: the input requests of the upstream server and the answers of VS Code.
+//! - `notify_test.zig`: the list changes, the resource updates and the log messages of the
+//!   upstream server.
 const std = @import("std");
 
 test {
@@ -18,4 +20,5 @@ test {
     _ = @import("forward_test.zig");
     _ = @import("negative_test.zig");
     _ = @import("input_test.zig");
+    _ = @import("notify_test.zig");
 }

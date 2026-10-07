@@ -507,6 +507,226 @@ test "--version and --help write to stdout and exit with code 0" {
     }
 }
 
+/// The number of calls of the test of the order of the frames.
+const ordering_loops = 1000;
+
+/// The time limit of the calls of the test of the order of the frames. Each call is one
+/// exchange over the pipes, thus the calls usually take a few seconds.
+const ordering_limit: Io.Duration = .fromSeconds(60);
+
+test "a tool that changes the tool list: the list change comes before the result of the call, 1000 times" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    const b = try Bridge.spawn(gpa, &.{ paths.bridge, "--", paths.fixture });
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    try initialize(b, arena);
+
+    // The upstream server writes the list change to the listen stream before the result. The
+    // listen stream gives its events to the bridge on the reader task of the upstream client.
+    // Thus VS Code gets the list change first, and lists the tools again before the next turn.
+    b.watchdog.arm("toggle calls", ordering_limit);
+    var inversions: usize = 0;
+    for (0..ordering_loops) |i| {
+        const id: i64 = @intCast(i + 2);
+        // The tool `toggled` is enabled at the start, thus the first call disables it.
+        const enabled = i % 2 == 1;
+        var buf: [160]u8 = undefined;
+        try b.send(try std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"tools/call\",\"params\":{{\"name\":\"toggle\",\"arguments\":{{\"enabled\":{}}}}}}}", .{ id, enabled }));
+        const notifications, const msg = try b.responseWithNotifications(arena, id);
+        const text = try firstText(try expectResult(msg));
+        try testing.expectEqualStrings(if (enabled) "tool toggled: enabled" else "tool toggled: disabled", text);
+        if (notifications.len != 1) {
+            inversions += 1;
+            continue;
+        }
+        try testing.expectEqualStrings("notifications/tools/list_changed", notifications[0].method);
+    }
+    if (inversions != 0) return fail("{d} of {d} results came before their list change", .{ inversions, ordering_loops });
+
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin with an open listen stream");
+    try testing.expectEqual(@as(usize, 1 + list_changes.len + 2 * ordering_loops), try expectFrames(arena, b.out.items));
+}
+
+test "the log messages of the upstream server reach VS Code at the level of logging/setLevel, and no cancellation of the upstream server does" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    const b = try Bridge.spawn(gpa, &.{ paths.bridge, "--", paths.fixture });
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    try initialize(b, arena);
+
+    // Without a level, the upstream server sends no log message.
+    b.watchdog.arm("log without a level", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"log"}}
+    );
+    const none, _ = try b.responseWithNotifications(arena, 2);
+    try testing.expectEqual(@as(usize, 0), none.len);
+
+    // On stdio, a log message has no id of a request. The bridge gets it through the
+    // notification callback of the upstream client.
+    const cases = [_]struct { level: []const u8, expected: []const []const u8 }{
+        .{ .level = "warning", .expected = &.{ "warning", "error" } },
+        .{ .level = "debug", .expected = &.{ "debug", "info", "warning", "error" } },
+    };
+    var id: i64 = 3;
+    for (cases) |case| {
+        b.watchdog.arm("logging/setLevel", exchange_limit);
+        var buf: [128]u8 = undefined;
+        try b.send(try std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"logging/setLevel\",\"params\":{{\"level\":\"{s}\"}}}}", .{ id, case.level }));
+        _ = try expectResult(try b.response(arena, id));
+        id += 1;
+        b.watchdog.arm("log", exchange_limit);
+        try b.send(try std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"method\":\"tools/call\",\"params\":{{\"name\":\"log\"}}}}", .{id}));
+        const notifications, const msg = try b.responseWithNotifications(arena, id);
+        try testing.expectEqualStrings("logged 4 messages", try firstText(try expectResult(msg)));
+        try testing.expectEqual(case.expected.len, notifications.len);
+        for (notifications, case.expected) |n, level| {
+            try testing.expectEqualStrings("notifications/message", n.method);
+            const params = n.params orelse return fail("a log message without params", .{});
+            try testing.expectEqualStrings(level, mcp.json.getString(params, "level") orelse "");
+            try testing.expectEqualStrings(fixture.log_logger, mcp.json.getString(params, "logger") orelse "");
+            try testing.expect(params.object.get("data").? == .string);
+            try testing.expect(params.object.get("_meta") == null);
+        }
+        id += 1;
+    }
+
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin after the log messages");
+    // At the end of stdin, the bridge cancels its listen stream before it closes the upstream
+    // server. No request of the bridge waits for VS Code, thus no cancellation goes to VS
+    // Code.
+    if (std.mem.indexOf(u8, b.out.items, "notifications/cancelled") != null) return fail("stdout has a notifications/cancelled", .{});
+    try testing.expectEqual(@as(usize, 1 + list_changes.len + 1 + 2 * 2 + 2 + 4), try expectFrames(arena, b.out.items));
+}
+
+test "resources/subscribe: the response comes first, then the updates of the resource until resources/unsubscribe" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    const b = try Bridge.spawn(gpa, &.{ paths.bridge, "--", paths.fixture });
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    try initialize(b, arena);
+
+    const subscribe =
+        \\{"jsonrpc":"2.0","id":2,"method":"resources/subscribe","params":{"uri":"
+    ++ fixture.notes_uri ++
+        \\"}}
+    ;
+    const touch =
+        \\"method":"tools/call","params":{"name":"touch","arguments":{"uri":"
+    ++ fixture.notes_uri ++
+        \\"}}}
+    ;
+    // The bridge opens a new listen stream with the URI. Its acknowledgment gives the
+    // response, and the swap gives no list change.
+    b.watchdog.arm("resources/subscribe", exchange_limit);
+    try b.send(subscribe);
+    const before_subscribe, const subscribed = try b.responseWithNotifications(arena, 2);
+    try testing.expectEqual(@as(usize, 0), before_subscribe.len);
+    try testing.expectEqual(@as(usize, 0), (try expectResult(subscribed)).object.count());
+
+    // The update of the resource comes before the result of the call that caused it.
+    b.watchdog.arm("touch", exchange_limit);
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":3," ++ touch);
+    const updates, const touched = try b.responseWithNotifications(arena, 3);
+    try testing.expectEqualStrings("touched " ++ fixture.notes_uri, try firstText(try expectResult(touched)));
+    try testing.expectEqual(@as(usize, 1), updates.len);
+    try testing.expectEqualStrings("notifications/resources/updated", updates[0].method);
+    const params = updates[0].params orelse return fail("the update has no params", .{});
+    try testing.expectEqualStrings(fixture.notes_uri, mcp.json.getString(params, "uri") orelse "");
+    // The subscription id of the upstream server does not reach VS Code.
+    try testing.expect(params.object.get("_meta") == null);
+
+    b.watchdog.arm("resources/unsubscribe", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":4,"method":"resources/unsubscribe","params":{"uri":"
+    ++ fixture.notes_uri ++
+        \\"}}
+    );
+    _ = try expectResult(try b.response(arena, 4));
+    b.watchdog.arm("touch after unsubscribe", exchange_limit);
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":5," ++ touch);
+    const none, _ = try b.responseWithNotifications(arena, 5);
+    try testing.expectEqual(@as(usize, 0), none.len);
+
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin with a subscription");
+    try testing.expectEqual(@as(usize, 1 + list_changes.len + 4 + 1), try expectFrames(arena, b.out.items));
+}
+
+test "the upstream server ends its listen stream at its shutdown: VS Code gets no notifications/cancelled, and the bridge exits with code 1" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    // The debug lines tell that the bridge got the cancellation of the upstream server.
+    const b = try Bridge.spawn(gpa, &.{ paths.bridge, "--log-level", "debug", "--", paths.fixture });
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    try initialize(b, arena);
+
+    // The fixture server ends its listen stream as at the end of its input. On stdio, the
+    // stream gets its result and then a notifications/cancelled with the id of the stream.
+    // That id is an id of the bridge, and VS Code can have a request with the same id. The
+    // server stops 100 ms later, before the bridge opens a new stream (500 ms).
+    b.watchdog.arm("shutdown tools/call", exchange_limit);
+    const start = Io.Timestamp.now(b.io, .awake);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"shutdown","arguments":{"after_ms":100}}}
+    );
+    try testing.expectEqualStrings(
+        "the server ended its listen streams and stops in 100 ms",
+        try firstText(try expectResult(try b.response(arena, 2))),
+    );
+
+    // Stdin stays open. The bridge exits by itself.
+    const exit = try b.finish(start);
+    try expectExit(exit, 1);
+    try expectWithin(exit.elapsed, exit_bound, "the exit after the shutdown of the upstream server");
+    // The initialize result and the result of the call. A new listen stream can still give
+    // list changes when the bridge opens it before the end of the upstream server, but never a
+    // cancellation.
+    _ = try expectFrames(arena, b.out.items);
+    const frames = try sortFrames(arena, b.out.items);
+    try testing.expectEqual(@as(usize, 2), frames.responses.len);
+    try expectStrings(&.{}, frames.cancelled);
+    if (std.mem.indexOf(u8, b.out.items, "notifications/cancelled") != null) return fail("stdout has a notifications/cancelled", .{});
+    // The upstream server sent the cancellation, and the bridge dropped it.
+    try expectStderr(b, "mcp-bridge-vscode: bridge: debug: dropped the notification notifications/cancelled of the upstream server");
+    try expectStderr(b, std.fmt.comptimePrint("mcp-bridge-vscode: bridge: error: the upstream server exited with code {d}\n", .{fixture.shutdown_exit_code}));
+}
+
 // ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
@@ -735,6 +955,28 @@ const Bridge = struct {
                 return fail("the bridge sent the notification {s}, not {s}", .{ n.method, method });
             },
             else => return fail("the bridge sent a message that is not the notification {s}: {s}", .{ method, line }),
+        }
+    }
+
+    /// Read stdout until the response with `id`. Each line must be one JSON-RPC message.
+    /// Returns the notifications before the response, and the response. Each other message
+    /// is an error.
+    fn responseWithNotifications(self: *Bridge, arena: Allocator, id: i64) !struct { []const Message.Notification, Message } {
+        var notifications: std.ArrayList(Message.Notification) = .empty;
+        while (true) {
+            const line = try self.nextLine(arena);
+            const msg = try parseFrame(arena, line);
+            const msg_id: ?mcp.RequestId = switch (msg) {
+                .notification => |n| {
+                    try notifications.append(arena, n);
+                    continue;
+                },
+                .request => null,
+                .response => |r| r.id,
+                .error_response => |r| r.id,
+            };
+            if (msg_id) |i| if (i == .integer and i.integer == id) return .{ notifications.items, msg };
+            return fail("the bridge sent a message that is not the response {d}: {s}", .{ id, line });
         }
     }
 

@@ -4,7 +4,8 @@
 //! (`Upstream.Config.transport`) and `mcp.transport.memory.ClientLink`. The tap can also give
 //! scripted responses, also for `server/discover`.
 //!
-//! A listen stream goes to the fixture server, and the tap keeps it in its own list.
+//! A listen stream goes to the fixture server, and the tap keeps it in its own list. A
+//! `ListenScript` can hold one listen stream, or play it in place of the fixture server.
 //!
 //! `Transcript.verify` checks each frame of the bridge against the schema of revision
 //! 2025-11-25. It also checks each request to the upstream server that the tap saw against
@@ -201,6 +202,26 @@ pub const Transcript = struct {
         if (!d.tools_list_changed and !d.prompts_list_changed and !d.resources_list_changed) return;
         const until = self.deadline();
         while (self.frontend.listener.acknowledgments.load(.acquire) < n) try self.pause(until, "an acknowledgment of a listen stream");
+    }
+
+    /// The number of frames after `start` with the method `method`.
+    pub fn methodCountFrom(self: *Transcript, start: usize, method: []const u8) !usize {
+        var n: usize = 0;
+        for ((try self.parsedFrames())[start..]) |v| {
+            const m = mcp.json.getString(v, "method") orelse continue;
+            if (std.mem.eql(u8, m, method)) n += 1;
+        }
+        return n;
+    }
+
+    /// The index of the first frame at or after `start` with the method `method`, or null.
+    pub fn methodIndexFrom(self: *Transcript, start: usize, method: []const u8) !?usize {
+        const frames = try self.parsedFrames();
+        for (frames[start..], start..) |v, i| {
+            const m = mcp.json.getString(v, "method") orelse continue;
+            if (std.mem.eql(u8, m, method)) return i;
+        }
+        return null;
     }
 
     /// Give `data` to `Frontend.run` through a reader with a buffer of `buffer_len` bytes.
@@ -524,6 +545,8 @@ pub const Tap = struct {
     /// The index in `exchanges` of the request with the index 0 of `count`, `exchange` and
     /// `request`. Guarded by `lock`.
     base: usize = 0,
+    /// The script of the next listen stream, or null. Guarded by `lock`.
+    listen_script: ?*ListenScript = null,
 
     /// What the tap does with the next requests.
     pub const Script = union(enum) {
@@ -572,6 +595,31 @@ pub const Tap = struct {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
         return self.listens.items[index];
+    }
+
+    /// The `notifications` filter of the listen stream at `index`, parsed in `a`.
+    pub fn listenFilter(self: *Tap, a: Allocator, index: usize) !Value {
+        return (try self.listenRequest(a, index)).object.get("params").?.object.get("notifications").?;
+    }
+
+    /// Wait until `n` listen streams started.
+    pub fn waitListens(self: *Tap, n: usize) !void {
+        const deadline = Io.Clock.Timestamp.now(self.io, .awake).addDuration(.{ .raw = wait_limit, .clock = .awake });
+        while (self.listenCount() < n) {
+            if (Io.Clock.Timestamp.now(self.io, .awake).durationTo(deadline).raw.nanoseconds <= 0) {
+                std.debug.print("\nno listen stream {d} in {d} s\n", .{ n, wait_limit.toSeconds() });
+                return error.TestTimeout;
+            }
+            try self.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+
+    /// Use `script` for the next listen stream. The script must stay at its address until the
+    /// end of the transcript.
+    pub fn scriptListen(self: *Tap, script: *ListenScript) void {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        self.listen_script = script;
     }
 
     pub fn setScript(self: *Tap, script: Script) void {
@@ -625,10 +673,11 @@ pub const Tap = struct {
     fn onExchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
         const self: *Tap = @ptrCast(@alignCast(ptr));
         const copy = self.gpa.dupe(u8, ex.frame) catch return error.OutOfMemory;
-        // A listen stream goes to the fixture server. Thus a script for the requests of a test
-        // does not end it, and it does not count as a request of the test.
+        // A listen stream goes to the fixture server, or it follows its own script. Thus a
+        // script for the requests of a test does not end it, and it does not count as a
+        // request of the test.
         const is_listen = std.mem.eql(u8, ex.method, "subscriptions/listen");
-        const index, const script = begin: {
+        const index, const script, const listen_script = begin: {
             self.lock.lockUncancelable(self.io);
             defer self.lock.unlock(self.io);
             const list = if (is_listen) &self.listens else &self.exchanges;
@@ -636,9 +685,12 @@ pub const Tap = struct {
                 self.gpa.free(copy);
                 return error.OutOfMemory;
             };
-            break :begin .{ list.items.len - 1, if (is_listen) Script.forward else self.script };
+            if (!is_listen) break :begin .{ list.items.len - 1, self.script, null };
+            const ls = self.listen_script;
+            self.listen_script = null;
+            break :begin .{ list.items.len - 1, Script.forward, ls };
         };
-        const result = self.run(io, ex, script);
+        const result = if (listen_script) |ls| self.playListen(io, ex, ls) else self.run(io, ex, script);
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
         const list = if (is_listen) &self.listens else &self.exchanges;
@@ -669,6 +721,73 @@ pub const Tap = struct {
         ex.deliver(io, frame) catch return error.InvalidFrame;
     }
 
+    /// Play `ls` for the listen stream `ex`.
+    fn playListen(self: *Tap, io: Io, ex: *Transport.Exchange, ls: *ListenScript) Transport.ExchangeError!void {
+        if (ls.play == .hold) {
+            try waitGo(io, ex, ls);
+            ls.done.set(io);
+            return self.inner.exchange(io, ex);
+        }
+        var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const id = mcp.json.writeAlloc(a, ex.id) catch return error.OutOfMemory;
+        const filter = mcp.json.writeAlloc(a, ex.params.?.object.get("notifications").?) catch return error.OutOfMemory;
+        // The acknowledgment of zig-sdk: the subscription id is the id of the request.
+        try deliverText(io, ex, std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/subscriptions/acknowledged\",\"params\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":{s}}},\"notifications\":{s}}}}}", .{ id, filter }) catch return error.OutOfMemory);
+        if (ls.play == .late_update) return playLate(io, ex, ls, a, id);
+        try waitGo(io, ex, ls);
+        defer ls.done.set(io);
+        const result = std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"result\":{{\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":{s}}}}}}}", .{ id, id }) catch return error.OutOfMemory;
+        const cancelled = std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":{s},\"reason\":\"server shutdown\"}}}}", .{id}) catch return error.OutOfMemory;
+        const cancelled_with_id = std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{{\"requestId\":{s},\"reason\":\"the server ended the stream\",\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":{s}}}}}}}", .{ id, id }) catch return error.OutOfMemory;
+        switch (ls.play) {
+            .hold, .late_update => unreachable,
+            .result_then_cancelled => {
+                try deliverText(io, ex, result);
+                try deliverText(io, ex, cancelled);
+            },
+            .cancelled_then_result => {
+                try deliverText(io, ex, cancelled_with_id);
+                try deliverText(io, ex, result);
+            },
+            .cancelled_then_close => {
+                try deliverText(io, ex, cancelled_with_id);
+                return error.Closed;
+            },
+        }
+    }
+
+    /// Wait for the cancellation of the stream, then send an update for each URI of its filter.
+    /// `id` is the id of the stream as JSON text, in `a`.
+    fn playLate(io: Io, ex: *Transport.Exchange, ls: *ListenScript, a: Allocator, id: []const u8) Transport.ExchangeError!void {
+        defer ls.done.set(io);
+        while (!ex.cancel.isCancelled()) {
+            if (ex.expired(io)) return error.Timeout;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        const filter = ex.params.?.object.get("notifications").?;
+        const uris = filter.object.get("resourceSubscriptions") orelse return error.Canceled;
+        for (uris.array.items) |uri| {
+            const text = mcp.json.writeAlloc(a, uri) catch return error.OutOfMemory;
+            try deliverText(io, ex, std.fmt.allocPrint(a, "{{\"jsonrpc\":\"2.0\",\"method\":\"notifications/resources/updated\",\"params\":{{\"uri\":{s},\"_meta\":{{\"io.modelcontextprotocol/subscriptionId\":{s}}}}}}}", .{ text, id }) catch return error.OutOfMemory);
+        }
+        return error.Canceled;
+    }
+
+    fn deliverText(io: Io, ex: *Transport.Exchange, frame: []const u8) Transport.ExchangeError!void {
+        ex.deliver(io, frame) catch return error.InvalidFrame;
+    }
+
+    /// Wait until the test sets `ls.go`, or until the end of the stream.
+    fn waitGo(io: Io, ex: *Transport.Exchange, ls: *ListenScript) Transport.ExchangeError!void {
+        while (!ls.go.isSet()) {
+            if (ex.cancel.isCancelled()) return error.Canceled;
+            if (ex.expired(io)) return error.Timeout;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
+
     fn onNotify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
         const self: *Tap = @ptrCast(@alignCast(ptr));
         return self.inner.notify(io, frame);
@@ -687,6 +806,52 @@ pub const Tap = struct {
                 try schemas.check(.modern, definition, v, context);
                 try wire.expectUpstreamRequest(method, v);
             }
+        }
+    }
+};
+
+/// The script of one listen stream (`Tap.scriptListen`). The stream waits for `go`, then the tap
+/// plays the rest of the script. A cancellation of the stream ends the wait.
+pub const ListenScript = struct {
+    play: Play,
+    /// The test sets it.
+    go: Io.Event = .unset,
+    /// The tap sets it after it played the script.
+    done: Io.Event = .unset,
+
+    pub const Play = enum {
+        /// After `go`, the stream goes to the fixture server. Thus the acknowledgment comes
+        /// late.
+        hold,
+        /// The tap sends the acknowledgment at once. After `go`, it sends the result, then
+        /// `notifications/cancelled` without `_meta`. This is the order of zig-sdk at the stop
+        /// of a server.
+        result_then_cancelled,
+        /// The tap sends the acknowledgment at once. After `go`, it sends
+        /// `notifications/cancelled` with the subscription id, then the result.
+        cancelled_then_result,
+        /// The tap sends the acknowledgment at once. After `go`, it sends
+        /// `notifications/cancelled` with the subscription id, and the stream closes without a
+        /// result.
+        cancelled_then_close,
+        /// The tap sends the acknowledgment at once. After the cancellation of the stream, it
+        /// sends `notifications/resources/updated` for each URI of the filter. An upstream
+        /// server can write an event before it reads the cancellation. The tap does not use
+        /// `go`.
+        late_update,
+    };
+
+    /// Set `go`, and wait until the tap played the script. For `late_update`, wait until the
+    /// tap sent the updates after the cancellation.
+    pub fn finish(self: *ListenScript, io: Io) !void {
+        self.go.set(io);
+        const deadline = Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = wait_limit, .clock = .awake });
+        while (!self.done.isSet()) {
+            if (Io.Clock.Timestamp.now(io, .awake).durationTo(deadline).raw.nanoseconds <= 0) {
+                std.debug.print("\nthe tap did not play the listen script in {d} s\n", .{wait_limit.toSeconds()});
+                return error.TestTimeout;
+            }
+            try io.sleep(.fromMilliseconds(1), .awake);
         }
     }
 };
