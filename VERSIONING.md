@@ -12,6 +12,7 @@ zig-bridge-sdk uses semantic versioning with a major version of zero.
 ## The zig-sdk pin
 
 - Each release pins exactly one release of zig-sdk: one tag and its commit. `build.zig.zon` records the commit and the hash of the package.
+- Between two releases, a milestone can need a change of zig-sdk that has no release yet. Then the pin can be a commit of zig-sdk before its release. Before the next release of zig-bridge-sdk, the pin moves to the commit of the tag.
 - A change of the pin is a minor release. Milestone M5 plans a way to embed a bridge in a server of zig-sdk. From then on, the `mcp` types are a part of the public API of the `vscode` module.
 - Each release entry in `CHANGELOG.md` names the version of zig-sdk.
 - The README has one compatibility table. It has one row for each release, with the version and the commit of zig-sdk.
