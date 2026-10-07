@@ -31,9 +31,10 @@ test "the pages of tools/list never have a nextCursor that is null" {
         cursor = next.string;
         if (pages > 10) return error.TestTooManyPages;
     }
-    // echo, add, slow, progress, bare_array, structured, show and tool_0 to tool_8.
-    try testing.expectEqual(@as(usize, 16), names.items.len);
-    try testing.expectEqual(@as(usize, 4), pages);
+    // echo, add, slow, progress, bare_array, structured, the nine tools that ask for input, show
+    // and tool_0 to tool_8.
+    try testing.expectEqual(@as(usize, 25), names.items.len);
+    try testing.expectEqual(@as(usize, 7), pages);
     for (names.items, 0..) |n, i| for (names.items[i + 1 ..]) |m| try testing.expect(!std.mem.eql(u8, n, m));
     for (0..t.count()) |i| try testing.expect(std.mem.indexOf(u8, t.text(i), "\"nextCursor\":null") == null);
     try t.verify();

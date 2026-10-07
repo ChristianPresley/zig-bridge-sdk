@@ -316,7 +316,7 @@ const copilot_initialize_params =
     \\{"protocolVersion":"2025-11-25","capabilities":{"sampling":{},"elicitation":{"form":{},"url":{}}},"clientInfo":{"name":"copilot-cli","version":"1.0.89"}}
 ;
 
-test "the Copilot harness: discover first, then initialize, then requests with progress token 0" {
+test "the Copilot harness: discover first, then initialize, then requests with progress token 0 and an eliciting call" {
     const t = try Transcript.create(.{});
     defer t.destroy();
     const a = t.arena();
@@ -358,11 +358,32 @@ test "the Copilot harness: discover first, then initialize, then requests with p
     try testing.expect(names >= 7);
     _ = try h.expectResult(try t.request(4, "tools/call", "{\"name\":\"progress\",\"arguments\":{\"count\":2},\"_meta\":{\"progressToken\":0}}"));
 
-    // The progress of the call goes to the token 0 of the harness. The list request has no
-    // progress.
+    // An eliciting call. The harness answers the form, and the retry round with the answer
+    // goes upstream.
+    try t.send(try h.requestLine(a, 5, "tools/call", "{\"name\":\"ask_form\",\"_meta\":{\"progressToken\":0}}"));
+    const form = try t.bridgeRequest("elicitation/create", 1);
+    try testing.expectEqualStrings("b-1", form.object.get("id").?.string);
+    try t.reply(form, "{\"action\":\"accept\",\"content\":{\"name\":\"Ada\"}}");
+    try testing.expectEqualStrings("form: accept {\"name\":\"Ada\"}", try h.firstText(try h.expectResult(try t.waitResponse(5))));
+    try t.waitIdle();
+    try testing.expectEqual(@as(usize, 4), tap.count());
+    const retry = (try tap.request(a, 3)).object.get("params").?;
+    try testing.expectEqualStrings("ask_form", retry.object.get("name").?.string);
+    const answer = retry.object.get("inputResponses").?.object.get("profile").?;
+    try testing.expectEqualStrings("accept", answer.object.get("action").?.string);
+
+    // The harness declared no roots. Thus the zig-sdk server does not ask for them, and its
+    // error goes to the harness.
+    try h.expectError(try t.request(6, "tools/call", "{\"name\":\"list_roots\",\"_meta\":{\"progressToken\":0}}"), -32021, null, null);
+    try testing.expectEqual(@as(usize, 1), try t.methodCount("elicitation/create"));
+    try testing.expectEqual(@as(usize, 0), try t.methodCount("roots/list"));
+
+    // The progress of the call goes to the token 0 of the harness. The list request and the
+    // other calls have no progress.
     var progress: usize = 0;
     for (try t.parsedFrames()) |frame| {
         const method = mcp.json.getString(frame, "method") orelse continue;
+        if (std.mem.eql(u8, method, "elicitation/create")) continue;
         try testing.expectEqualStrings("notifications/progress", method);
         try testing.expectEqual(@as(i64, 0), frame.object.get("params").?.object.get("progressToken").?.integer);
         progress += 1;

@@ -140,6 +140,153 @@ test "the bridge stops at the end of stdin during a slow tools/call, and the chi
     try testing.expectEqual(@as(usize, 3), try expectFrames(arena, b.out.items));
 }
 
+test "VS Code answers the form of a tool over the pipe, and the result of the tool has the answer" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    const b = try Bridge.spawn(gpa, &.{ paths.bridge, "--", paths.fixture });
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    try initialize(b, arena);
+
+    // The tool asks for a form. The bridge sends the form to VS Code as its request b-1, and
+    // the answer of VS Code goes upstream in the next round of the tool call.
+    b.watchdog.arm("elicitation accept", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask_form"}}
+    );
+    const form = try b.request(arena, "elicitation/create");
+    try expectBridgeId(form, "b-1");
+    const params = form.params orelse return fail("the elicitation request has no params", .{});
+    try testing.expectEqualStrings("Tell us about you.", mcp.json.getString(params, "message") orelse "");
+    const schema = params.object.get("requestedSchema") orelse return fail("the elicitation request has no requestedSchema", .{});
+    const properties = schema.object.get("properties") orelse return fail("the requestedSchema has no properties", .{});
+    for ([_][]const u8{ "name", "age", "subscribe", "color" }) |name| {
+        if (properties.object.get(name) == null) return fail("the requestedSchema has no property '{s}'", .{name});
+    }
+    try b.send(
+        \\{"jsonrpc":"2.0","id":"b-1","result":{"action":"accept","content":{"name":"Ada","age":36,"subscribe":true,"color":"green"}}}
+    );
+    try testing.expectEqualStrings(
+        \\form: accept {"name":"Ada","age":36,"subscribe":true,"color":"green"}
+    , try firstText(try expectResult(try b.response(arena, 2))));
+
+    // The next request of the bridge has the next id.
+    b.watchdog.arm("elicitation decline", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ask_form"}}
+    );
+    try expectBridgeId(try b.request(arena, "elicitation/create"), "b-2");
+    try b.send(
+        \\{"jsonrpc":"2.0","id":"b-2","result":{"action":"decline"}}
+    );
+    try testing.expectEqualStrings("form: decline", try firstText(try expectResult(try b.response(arena, 3))));
+
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin after the answered forms");
+    // The initialize result, and for each tool call the elicitation request and the result.
+    try testing.expectEqual(@as(usize, 5), try expectFrames(arena, b.out.items));
+}
+
+test "the bridge stops at the end of stdin while its requests to VS Code wait for answers" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    const b = try Bridge.spawn(gpa, &.{ paths.bridge, "--", paths.fixture });
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    try initialize(b, arena);
+
+    // One tool asks for a form, and one tool asks for a sampling. The bridge sends both to VS
+    // Code, and VS Code never answers.
+    b.watchdog.arm("elicitation", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask_form"}}
+    );
+    try expectBridgeId(try b.request(arena, "elicitation/create"), "b-1");
+    b.watchdog.arm("sampling", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"sample"}}
+    );
+    try expectBridgeId(try b.request(arena, "sampling/createMessage"), "b-2");
+
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin with requests of the bridge");
+    // The initialize result, the two requests of the bridge and their cancellations. The
+    // canceled tools/call requests get no response.
+    try testing.expectEqual(@as(usize, 5), try expectFrames(arena, b.out.items));
+    const frames = try sortFrames(arena, b.out.items);
+    try expectStrings(&.{ "b-1", "b-2" }, frames.cancelled);
+    try testing.expectEqual(@as(usize, 1), frames.responses.len);
+}
+
+test "a crash of the upstream server while a request of the bridge waits fails the calls, and the bridge exits with code 1" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    const b = try Bridge.spawn(gpa, &.{ paths.bridge, "--", paths.fixture });
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    try initialize(b, arena);
+
+    // The form of a tool waits for VS Code. Then the upstream server stops.
+    b.watchdog.arm("elicitation", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ask_form"}}
+    );
+    try expectBridgeId(try b.request(arena, "elicitation/create"), "b-1");
+    b.watchdog.arm("crash tools/call", exchange_limit);
+    const start = Io.Timestamp.now(b.io, .awake);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"crash","arguments":{}}}
+    );
+
+    // Stdin stays open. The bridge exits by itself.
+    const exit = try b.finish(start);
+    try expectExit(exit, 1);
+    try expectWithin(exit.elapsed, exit_bound, "the exit after the crash of the upstream server with a request of the bridge");
+    // The initialize result, the elicitation request, the two errors and the cancellation of
+    // the request of the bridge.
+    try testing.expectEqual(@as(usize, 5), try expectFrames(arena, b.out.items));
+    const frames = try sortFrames(arena, b.out.items);
+    try expectStrings(&.{"b-1"}, frames.cancelled);
+    try expectStrings(&.{"the upstream server stopped"}, frames.cancel_reasons);
+    // The initialize result and one error for each call.
+    try testing.expectEqual(@as(usize, 3), frames.responses.len);
+    for ([_]i64{ 2, 3 }) |id| {
+        var found: usize = 0;
+        for (frames.responses) |msg| {
+            if (msg != .error_response) continue;
+            const e = msg.error_response;
+            const msg_id = e.id orelse continue;
+            if (msg_id != .integer or msg_id.integer != id) continue;
+            try testing.expectEqual(@as(i64, -32603), e.code);
+            try testing.expectEqualStrings("upstream_exited", mcp.json.getString(e.data orelse .null, "cause") orelse "");
+            found += 1;
+        }
+        if (found != 1) return fail("the request {d} has {d} error responses, not 1", .{ id, found });
+    }
+    try expectStderr(b, crash_line);
+}
+
 test "a crash of the upstream server fails the call in flight with -32603, and the bridge exits with code 1" {
     const gpa = testing.allocator;
     var arena_state: std.heap.ArenaAllocator = .init(gpa);
@@ -566,6 +713,22 @@ const Bridge = struct {
         }
     }
 
+    /// Read stdout until the next request of the bridge, and check that its method is
+    /// `method`. The function ignores notifications. Each other message is an error.
+    fn request(self: *Bridge, arena: Allocator, method: []const u8) !Message.Request {
+        while (true) {
+            const line = try self.nextLine(arena);
+            switch (try parseFrame(arena, line)) {
+                .notification => continue,
+                .request => |r| {
+                    if (std.mem.eql(u8, r.method, method)) return r;
+                    return fail("the bridge sent the request {s}, not {s}: {s}", .{ r.method, method, line });
+                },
+                else => return fail("the bridge sent a message that is not the request {s}: {s}", .{ method, line }),
+            }
+        }
+    }
+
     /// Read stdout and stderr to their end, and wait for the exit of the bridge. The end of
     /// stderr comes only after the exit of each process with a copy of the stderr of the
     /// bridge. The upstream child process gets that copy. Thus the function also waits for
@@ -715,6 +878,55 @@ fn expectFrames(arena: Allocator, out: []const u8) !usize {
     return count;
 }
 
+/// The messages of stdout by kind.
+const Frames = struct {
+    /// The responses and the error responses.
+    responses: []const Message,
+    /// The `requestId` of each `notifications/cancelled`, in alphabetical order.
+    cancelled: []const []const u8,
+    /// The `reason` of each `notifications/cancelled`, in alphabetical order.
+    cancel_reasons: []const []const u8,
+};
+
+/// Parse each line of `out`, and sort the messages by kind. The tasks of the bridge write
+/// their frames at the same time, thus the order of two cancellations can change.
+fn sortFrames(arena: Allocator, out: []const u8) !Frames {
+    var responses: std.ArrayList(Message) = .empty;
+    var cancelled: std.ArrayList([]const u8) = .empty;
+    var reasons: std.ArrayList([]const u8) = .empty;
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const msg = try parseFrame(arena, line);
+        switch (msg) {
+            .response, .error_response => try responses.append(arena, msg),
+            .notification => |n| if (std.mem.eql(u8, n.method, "notifications/cancelled")) {
+                const params = n.params orelse return fail("a cancellation without params: {s}", .{line});
+                try cancelled.append(arena, mcp.json.getString(params, "requestId") orelse return fail("a cancellation without a string id: {s}", .{line}));
+                try reasons.append(arena, mcp.json.getString(params, "reason") orelse "");
+            },
+            .request => {},
+        }
+    }
+    std.mem.sort([]const u8, cancelled.items, {}, lessThan);
+    std.mem.sort([]const u8, reasons.items, {}, lessThan);
+    return .{ .responses = responses.items, .cancelled = cancelled.items, .cancel_reasons = reasons.items };
+}
+
+fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+/// Check that `actual` has the strings of `expected` in the same order.
+fn expectStrings(expected: []const []const u8, actual: []const []const u8) !void {
+    if (expected.len == actual.len) {
+        for (expected, actual) |want, got| {
+            if (!std.mem.eql(u8, want, got)) break;
+        } else return;
+    }
+    return fail("expected the strings {f}, got {f}", .{ std.json.fmt(expected, .{}), std.json.fmt(actual, .{}) });
+}
+
 /// Return the `result` of a response, or fail for an error response.
 fn expectResult(msg: Message) !Value {
     return switch (msg) {
@@ -722,6 +934,14 @@ fn expectResult(msg: Message) !Value {
         .error_response => |e| fail("the bridge sent the error {d}: {s}", .{ e.code, e.message }),
         else => fail("the message is not a response", .{}),
     };
+}
+
+/// Check that the id of a request of the bridge is the string `id`.
+fn expectBridgeId(r: Message.Request, id: []const u8) !void {
+    switch (r.id) {
+        .string => |s| if (std.mem.eql(u8, s, id)) return else return fail("the request {s} of the bridge has the id '{s}', not '{s}'", .{ r.method, s, id }),
+        else => return fail("the request {s} of the bridge has an id that is not a string", .{r.method}),
+    }
 }
 
 /// Return the text of the first content block of a `tools/call` result.

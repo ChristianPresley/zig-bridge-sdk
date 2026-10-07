@@ -68,6 +68,8 @@ pub const Transcript = struct {
     parsed: std.ArrayList(Value) = .empty,
     /// The requests of the test, in the order of the lines.
     sent: std.ArrayList(Sent) = .empty,
+    /// The ids of the requests of the bridge that `verify` found, in the order of the frames.
+    bridge_ids: std.ArrayList([]const u8) = .empty,
 
     pub const Options = struct {
         fixture: fixture.Options = .{},
@@ -289,6 +291,39 @@ pub const Transcript = struct {
         }
     }
 
+    /// Wait for the request number `n` (from 1) of the bridge with the method `method`.
+    pub fn bridgeRequest(self: *Transcript, method: []const u8, n: usize) !Value {
+        const until = self.deadline();
+        while (true) {
+            var seen: usize = 0;
+            for (try self.parsedFrames()) |v| {
+                if (v != .object or v.object.get("id") == null) continue;
+                const m = mcp.json.getString(v, "method") orelse continue;
+                if (!std.mem.eql(u8, m, method)) continue;
+                seen += 1;
+                if (seen == n) return v;
+            }
+            try self.pause(until, "a request of the bridge");
+        }
+    }
+
+    /// The number of frames with the method `method`.
+    pub fn methodCount(self: *Transcript, method: []const u8) !usize {
+        var n: usize = 0;
+        for (try self.parsedFrames()) |v| {
+            const m = mcp.json.getString(v, "method") orelse continue;
+            if (std.mem.eql(u8, m, method)) n += 1;
+        }
+        return n;
+    }
+
+    /// Send the answer of VS Code to the request `bridge_request` of the bridge. `result` is the
+    /// result object as JSON text.
+    pub fn reply(self: *Transcript, bridge_request: Value, result: []const u8) !void {
+        const id = bridge_request.object.get("id").?.string;
+        try self.send(try std.fmt.allocPrint(self.arena(), "{{\"jsonrpc\":\"2.0\",\"id\":\"{s}\",\"result\":{s}}}", .{ id, result }));
+    }
+
     /// Wait until no request is in flight.
     pub fn waitIdle(self: *Transcript) !void {
         const until = self.deadline();
@@ -343,6 +378,7 @@ pub const Transcript = struct {
         var schemas: wire.Schemas = .init(self.gpa);
         defer schemas.deinit();
         for (self.sent.items) |*s| s.answered = false;
+        self.bridge_ids.clearRetainingCapacity();
         for (self.parsed.items, 0..) |frame, i| {
             self.checkFrame(&schemas, frame, self.text(i), i) catch |e| {
                 std.debug.print("frame {d}: {s}\n", .{ i, self.text(i) });
@@ -360,11 +396,30 @@ pub const Transcript = struct {
         const version = mcp.json.getString(frame, "jsonrpc") orelse "";
         if (!std.mem.eql(u8, version, "2.0")) return failCheck("the frame has no jsonrpc 2.0", .{});
         if (frame.object.get("method")) |method| {
-            // This version of the bridge sends no request to VS Code.
-            if (frame.object.get("id") != null) return failCheck("the bridge sent a request", .{});
-            if (method == .string and std.mem.eql(u8, method.string, "notifications/progress"))
-                return schemas.check(.legacy, "ProgressNotification", frame, context);
-            return failCheck("the bridge sent an unexpected notification", .{});
+            if (method != .string) return failCheck("the method is not a string", .{});
+            if (frame.object.get("id")) |id| {
+                // The bridge sends only the input requests of the upstream server, with a
+                // string id that VS Code cannot have sent.
+                if (id != .string or !std.mem.startsWith(u8, id.string, vscode.profile.request_id_prefix))
+                    return failCheck("a request of the bridge without the id prefix of the profile", .{});
+                for (self.bridge_ids.items) |earlier| if (std.mem.eql(u8, earlier, id.string)) return failCheck("the bridge sent two requests with the id {s}", .{id.string});
+                try self.bridge_ids.append(a, id.string);
+                const definition = wire.bridgeRequestDefinition(method.string) orelse return failCheck("the bridge sent the request {s}", .{method.string});
+                return schemas.check(.legacy, definition, frame, context);
+            }
+            const definition = wire.notificationDefinition(method.string) orelse return failCheck("the bridge sent an unexpected notification", .{});
+            // The bridge cancels only its own requests, and only after it sent them. VS Code
+            // applies a cancellation only to its own requests, thus an upstream cancellation
+            // must never reach it.
+            if (std.mem.eql(u8, method.string, "notifications/cancelled")) {
+                const request_id = frame.object.get("params").?.object.get("requestId") orelse Value.null;
+                if (request_id != .string or !std.mem.startsWith(u8, request_id.string, vscode.profile.request_id_prefix))
+                    return failCheck("the bridge canceled a request that it did not send", .{});
+                for (self.bridge_ids.items) |earlier| {
+                    if (std.mem.eql(u8, earlier, request_id.string)) break;
+                } else return failCheck("the bridge canceled the request {s} before it sent it", .{request_id.string});
+            }
+            return schemas.check(.legacy, definition, frame, context);
         }
         if (frame.object.get("result")) |result| {
             const id = frame.object.get("id") orelse return failCheck("a result without an id", .{});
