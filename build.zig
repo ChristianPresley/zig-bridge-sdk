@@ -87,6 +87,12 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_vscode_tests.step);
     test_vscode_step.dependOn(&run_vscode_tests.step);
 
+    // The tests of the executable: the command line parser.
+    const vscode_exe_tests = b.addTest(.{ .root_module = vscode_exe.root_module, .test_runner = test_runner, .use_llvm = use_llvm });
+    const run_vscode_exe_tests = b.addRunArtifact(vscode_exe_tests);
+    test_step.dependOn(&run_vscode_exe_tests.step);
+    test_vscode_step.dependOn(&run_vscode_exe_tests.step);
+
     // The checks of the vendored schemas. The fixtures come in as anonymous imports, because
     // Zig 0.16 does not embed a file outside the module root.
     const schema_tests = b.addTest(.{ .root_module = b.createModule(.{

@@ -18,6 +18,9 @@ pub const legacy_protocol_version = "2025-11-25";
 pub const legacy = @import("bridge/legacy.zig");
 /// The translation of capabilities, parameters, results and errors. It does no I/O.
 pub const translate = @import("bridge/translate.zig");
+/// The log function of the executables: a fixed tag on each stderr line and a level at run
+/// time.
+pub const log = @import("bridge/log.zig");
 /// The legacy stdio server of a bridge for one client connection.
 pub const Frontend = @import("bridge/Frontend.zig");
 /// The upstream server of revision 2026-07-28 and the client of zig-sdk for it.
@@ -26,6 +29,7 @@ pub const Upstream = @import("bridge/Upstream.zig");
 test {
     _ = legacy;
     _ = translate;
+    _ = log;
     _ = Frontend;
     _ = Upstream;
 }
