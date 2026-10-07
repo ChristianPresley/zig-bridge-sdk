@@ -46,6 +46,8 @@ jobs:
   test:
     name: test (${{ matrix.os }}, ${{ matrix.optimize }})
     runs-on: ${{ matrix.os }}
+    # A test that waits without end stops the job after 30 min, not after the 6 h default.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -79,8 +81,9 @@ jobs:
 
   # The legacy TypeScript SDK (MCP revision 2025-11-25) starts the bridge over stdio, like VS Code.
   # It lists and calls the tools, and it answers the input requests of the fixture tools as VS Code
-  # does: forms, URLs, sampling and roots. The lockfile pins the npm tree, and npm ci runs no
-  # install scripts.
+  # does: forms, URLs, sampling and roots. Its notification handlers get the list changes, the
+  # resource updates and the log messages, and it checks that each comes before the result of the
+  # call that caused it. The lockfile pins the npm tree, and npm ci runs no install scripts.
   interop:
     name: interop
     runs-on: ubuntu-24.04
