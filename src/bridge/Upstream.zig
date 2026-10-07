@@ -243,10 +243,16 @@ pub fn schemaLimits(self: *const Upstream) mcp.Limits.Schema {
 
 /// True when the child process stopped its stdout. Then each request fails. The other
 /// transports never stop.
+///
+/// The client closes itself at the end of the stdout, before the requests in flight fail with
+/// `error.Closed`. Thus `gone` gives true when such a request fails. The reader task of the
+/// client reaps the child process after that. `reap` waits for the reap.
 pub fn gone(self: *const Upstream) bool {
     const conn = self.conn orelse return false;
     return switch (conn.transport) {
-        .stdio => |c| c.reader_done.load(.acquire),
+        // Only `reap` and `close` close the client of a connection. `close` removes the
+        // connection first.
+        .stdio => |c| c.closed.load(.acquire),
         .memory, .external => false,
     };
 }
@@ -258,57 +264,41 @@ pub fn pid(self: *const Upstream) ?i32 {
     return if (value == 0) null else value;
 }
 
-/// Use this function after `gone` gave true. It stops each process that is left in the
-/// process tree of the upstream server. It returns the termination status of the child
-/// process. The requests in flight then fail at once. Call `close` later to release the
-/// connection. The function returns null for a transport without a child process, or when it
-/// cannot get the status.
+/// Use this function after `gone` gave true. It waits until the client reaped the child
+/// process, and returns the termination status of the child process. The function returns
+/// null for a transport without a child process, or when the system gave no status. Call
+/// `close` later to release the connection.
+///
+/// The reader task of the client reaps the child process after the end of its stdout. A child
+/// process that does not exit in `shutdown_grace` gets a termination signal, and after one
+/// more grace period a kill signal. On POSIX, the signals go to the process group of the
+/// child process. On Windows, the function also stops each process that is left in the job
+/// object of the child process. On POSIX, a process of the group continues to run when the
+/// child process exits by itself. The client sends no signal after the reap, because the
+/// system can give the process id to a new process.
 pub fn reap(self: *Upstream) ?std.process.Child.Term {
     const conn = self.conn orelse return null;
     const c = switch (conn.transport) {
         .stdio => |c| c,
         .memory, .external => return null,
     };
-    var term: ?std.process.Child.Term = null;
-    if (c.child.id) |id| {
-        // A signal to a process that stopped does not change its status. Thus the status
-        // tells why the process stopped, also after this signal.
-        switch (builtin.os.tag) {
-            .windows => _ = std.os.windows.ntdll.NtTerminateProcess(id, @enumFromInt(1)),
-            .wasi => {},
-            else => std.posix.kill(if (c.options.process_group) -id else id, .KILL) catch {},
-        }
-        if (builtin.os.tag != .wasi) term = c.child.wait(self.io) catch null;
-    }
-    // The child process is gone. `kill` waits for the reader task and, on Windows, closes the
-    // job object, which stops the other processes of the tree.
-    c.kill();
-    return term;
+    // `close` waits for the reap of the reader task, and closes the job object on Windows.
+    // `kill` sends the kill signal first. Then the status of a child process that is about to
+    // exit can be the signal and not its exit code.
+    c.close();
+    return c.exitStatus();
 }
 
 /// Stop the upstream server and release the connection. On stdio, the client closes the
-/// stdin of the child process and waits at most two times `shutdown_grace` before it stops
-/// the process tree. When the child process closed its stdout before, the function stops the
-/// process tree at once, because the child process can continue to run. The function does
-/// nothing without a connection. Call it only when no request is in flight.
+/// stdin of the child process and reaps it. A child process that does not exit in
+/// `shutdown_grace` gets a termination signal, and after one more grace period a kill signal.
+/// This also applies to a child process that closed its stdout and continues to run. The
+/// function does nothing without a connection. Call it only when no request is in flight.
 pub fn close(self: *Upstream) void {
     const conn = self.conn orelse return;
     self.conn = null;
     switch (conn.transport) {
-        .stdio => |c| {
-            // After the end of the stream, the client waits for the reader task only. Then
-            // `deinit` waits for the exit of the child process without a time limit. A child
-            // process that closed its stdout can continue to run, thus stop the tree first.
-            // `kill` waits for the reader task and for the exit of the child process.
-            if (c.reader_done.load(.acquire) and c.child.id != null) c.kill();
-            // After the end of the stream or after `reap`, the client is closed, and its
-            // `close` does not close the pipe of stdin. No request is in flight here.
-            if (c.closed.load(.acquire)) if (c.child.stdin) |stdin| {
-                stdin.close(self.io);
-                c.child.stdin = null;
-            };
-            c.deinit();
-        },
+        .stdio => |c| c.deinit(),
         .memory, .external => {},
     }
     // The child process is stopped now. Until here, a watchdog can use its process id.
@@ -541,6 +531,37 @@ test "a command that does not exist gives error.SpawnFailed" {
     try testing.expectError(error.SpawnFailed, upstream.connect(.{ .name = "x", .version = "1" }, .{}));
     try testing.expect(upstream.conn == null);
     try testing.expect(!upstream.gone());
+}
+
+test "reap gives the exit code of a child process that exits by itself" {
+    // The warning of zig-sdk about the exit is expected.
+    const saved = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = saved;
+    const io = testing.io;
+    const argv: []const []const u8 = if (builtin.os.tag == .windows)
+        &.{ "cmd.exe", "/d", "/c", "exit", "5" }
+    else
+        &.{ "/bin/sh", "-c", "exit 5" };
+    const upstream = try init(io, testing.allocator, .{ .stdio = .{ .argv = argv } });
+    defer upstream.deinit();
+    upstream.connect(.{ .name = "x", .version = "1" }, .{}) catch return error.SkipZigTest;
+    const deadline = Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = .fromSeconds(10), .clock = .awake });
+    while (!upstream.gone()) {
+        if (Io.Clock.Timestamp.now(io, .awake).durationTo(deadline).raw.nanoseconds <= 0) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+    const expected: std.process.Child.Term = .{ .exited = 5 };
+    try testing.expectEqual(@as(?std.process.Child.Term, expected), upstream.reap());
+    // The status stays after the reap, and `close` releases the connection.
+    try testing.expectEqual(@as(?std.process.Child.Term, expected), upstream.reap());
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    var token: CancelToken = .{};
+    try testing.expectError(error.Closed, upstream.request(arena_state.allocator(), "tools/list", .{ .object = .empty }, .{ .cancel = &token, .timeout = .fromSeconds(5) }));
+    upstream.close();
+    try testing.expect(!upstream.gone());
+    try testing.expectEqual(@as(?std.process.Child.Term, null), upstream.reap());
 }
 
 test "the tracer counts the rounds of each request" {

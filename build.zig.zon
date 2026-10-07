@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .mcp = .{
-            .url = "git+https://github.com/ChristianPresley/zig-sdk#c1f55f00deefb3f09ac97126d6405b1820b927dd",
-            .hash = "mcp-0.3.0-1aexQPDGMQCJDEnkNShayyMdliHTcSuts31ujU7VwU55",
+            .url = "git+https://github.com/ChristianPresley/zig-sdk#cda66dc616ce01ad69e8c7ea716416c324669a54",
+            .hash = "mcp-0.3.0-1aexQCe4NQAfD_CAcsh5N2E6hdjuoMqXnWQB3jtoGw41",
         },
     },
     .paths = .{

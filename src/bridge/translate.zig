@@ -531,7 +531,7 @@ const Walker = struct {
 // ---------------------------------------------------------------------------------------------
 
 /// The cause of an error that the bridge sends to the client. The members from `rpc` to
-/// `invalid_request` are the members of `mcp.Client.RequestError`. The other members are
+/// `invalid_meta` are the members of `mcp.Client.RequestError`. The other members are
 /// failures of the bridge. The name of the member is the value of `data.cause`.
 pub const Cause = enum {
     rpc,
@@ -547,6 +547,7 @@ pub const Cause = enum {
     not_connected,
     task_cancelled,
     invalid_request,
+    invalid_meta,
     spawn_failed,
     discover_failed,
     upstream_exited,
@@ -617,7 +618,8 @@ const Code = mcp.protocol.errors.Code;
 
 /// The JSON-RPC code of each cause. The code is -32603 when no other code applies.
 /// `invalid_request` of the upstream client gives -32602, because the transport cannot send
-/// an argument of the request. The code of `invalid_request_shape` is -32600.
+/// an argument of the request. `invalid_meta` also gives -32602, because the client refuses a
+/// key in the `_meta` of the request. The code of `invalid_request_shape` is -32600.
 pub fn codeOf(cause: Cause) i64 {
     return switch (cause) {
         .parse_error => Code.parse_error.int(),
@@ -628,7 +630,7 @@ pub fn codeOf(cause: Cause) i64 {
         .invalid_request_shape,
         => Code.invalid_request.int(),
         .method_not_found => Code.method_not_found.int(),
-        .invalid_params, .invalid_request => Code.invalid_params.int(),
+        .invalid_params, .invalid_request, .invalid_meta => Code.invalid_params.int(),
         .rpc,
         .canceled,
         .timeout,
@@ -679,6 +681,7 @@ pub fn messageOf(cause: Cause) []const u8 {
         .not_connected => .{ .message = "The bridge has no connection to the upstream server. See the Output channel of the server." },
         .task_cancelled => .{ .message = "The upstream server canceled the task of the request." },
         .invalid_request => .{ .message = "The bridge cannot send the parameters of the request to the upstream server." },
+        .invalid_meta => .{ .message = "The request has a _meta key that the bridge cannot send to the upstream server." },
         .spawn_failed => .{ .message = "The bridge cannot start the upstream server. Examine the command in the configuration of the server. See the Output channel of the server." },
         .discover_failed => .{ .message = "The upstream server did not answer server/discover. It is not an MCP server of revision 2026-07-28, or it does not respond. See the Output channel of the server." },
         .upstream_exited => .{ .message = "The upstream server process stopped. See the Output channel of the server." },
@@ -723,6 +726,7 @@ pub fn causeOf(err: mcp.Client.RequestError) Cause {
         error.NotConnected => .not_connected,
         error.TaskCancelled => .task_cancelled,
         error.InvalidRequest => .invalid_request,
+        error.InvalidMeta => .invalid_meta,
     };
 }
 
@@ -1446,6 +1450,8 @@ test "error table" {
     try testing.expectEqual(@as(i64, -32600), errorFor(.already_initialized, null).code);
     try testing.expectEqual(@as(i64, -32601), errorFor(.method_not_found, null).code);
     try testing.expectEqual(@as(i64, -32602), errorFor(.invalid_params, null).code);
+    try testing.expectEqual(@as(i64, -32602), errorFor(.invalid_request, null).code);
+    try testing.expectEqual(@as(i64, -32602), errorFor(.invalid_meta, null).code);
     try testing.expectEqual(@as(i64, -32603), errorFor(.discover_failed, null).code);
     try testing.expectEqual(@as(i64, -32603), errorFor(.undeclared_input_request, null).code);
     try testing.expectEqual(@as(i64, -32603), errorFor(.too_many_input_requests, null).code);
@@ -1480,6 +1486,7 @@ test "error table covers each member of RequestError" {
     try testing.expectEqual(Cause.not_connected, causeOf(E.NotConnected));
     try testing.expectEqual(Cause.task_cancelled, causeOf(E.TaskCancelled));
     try testing.expectEqual(Cause.invalid_request, causeOf(E.InvalidRequest));
+    try testing.expectEqual(Cause.invalid_meta, causeOf(E.InvalidMeta));
     // The names of the causes are the names of the errors in snake case.
     inline for (@typeInfo(E).error_set.?) |member| {
         const cause = causeOf(@field(E, member.name));
