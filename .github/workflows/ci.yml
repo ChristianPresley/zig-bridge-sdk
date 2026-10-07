@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    # rewrite/** branches carry a candidate main head so its checks run before main moves.
+    branches: [main, "rewrite/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt-lint:
+    name: fmt-lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      - run: zig build fmt
+      - run: zig build lint-docs -- --strict --string-literals
+      - run: zig build gen-dictionary -- --check --out docs/generated/dictionary.md
+
+  commit-policy:
+    name: commit-policy
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # On a pull request, check its head commits, not the synthetic merge commit.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - uses: ./.github/actions/setup-zig
+      - name: Check every commit of a pull request, or every reachable commit of a push
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            zig build commit-policy -- "origin/${{ github.base_ref }}..HEAD"
+          else
+            zig build commit-policy -- HEAD
+          fi
+
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.optimize }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-26, windows-2025]
+        optimize: [Debug, ReleaseSafe]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      - uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/zig-global-cache
+          key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+      - run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
+      # The install step builds mcp-bridge-vscode.
+      - run: zig build -Doptimize=${{ matrix.optimize }}
+      - run: zig build fixture-server -Doptimize=${{ matrix.optimize }}
+      - name: Run the installed executable
+        shell: bash
+        run: zig-out/bin/mcp-bridge-vscode --version
+
+  cross:
+    name: cross (${{ matrix.target }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        target: [aarch64-linux-musl, x86_64-linux-musl, x86_64-windows-gnu, aarch64-macos]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      - run: zig build -Dtarget=${{ matrix.target }}
+
+  # The stub of milestone M0. In milestone M5, the consumer also serves a server through the bridge.
+  consumer:
+    name: consumer
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      # An outside user fetches an archive, which holds only the paths of build.zig.zon. A path
+      # dependency would skip that filter, so the job fetches an archive of the commit too.
+      - name: Archive the commit
+        run: git archive --format=tar.gz HEAD -o "$RUNNER_TEMP/bridge.tar.gz"
+      - name: Add the archive as the bridge_sdk dependency
+        run: zig fetch --save=bridge_sdk "$RUNNER_TEMP/bridge.tar.gz"
+        working-directory: examples/consumer
+      - run: zig build
+        working-directory: examples/consumer
+      - run: ./zig-out/bin/consumer --check
+        working-directory: examples/consumer

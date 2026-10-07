@@ -1,0 +1,12 @@
+.{
+    .name = .consumer,
+    .version = "0.1.0",
+    .fingerprint = 0x705b3727702745ec,
+    .minimum_zig_version = "0.16.0",
+    // The committed file has no dependency. The `consumer` job of CI adds `bridge_sdk` from a
+    // tarball of the commit with `zig fetch --save=bridge_sdk`. A `.path` dependency would skip the
+    // `.paths` filter of the package, and the job would then miss a file that the package does not
+    // ship.
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "main.zig" },
+}

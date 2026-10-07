@@ -1,0 +1,36 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "47 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wiki-lint:
+    name: wiki-lint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: ${{ github.repository }}.wiki
+          path: wiki
+      - uses: ./.github/actions/setup-zig
+      - run: zig build lint-docs -- --strict --wiki-dir wiki
+
+  fuzz:
+    name: fuzz
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      # -Dfuzz: the fuzz path of the test runner of Zig 0.16.0 does not compile. See build.zig.
+      # The fuzz targets arrive with milestone M1 in src/bridge/fuzz_test.zig. Without a fuzz
+      # target, --fuzz stops with "no fuzz tests found", so the run waits for that file.
+      - if: hashFiles('src/bridge/fuzz_test.zig') != ''
+        run: zig build test -Dfuzz --fuzz=200000 --summary all
+      - if: hashFiles('src/bridge/fuzz_test.zig') == ''
+        run: echo "::notice::No fuzz target yet. The fuzz targets arrive with milestone M1."
