@@ -1,0 +1,21 @@
+.{
+    .name = .bridge_sdk,
+    .version = "0.0.0",
+    .fingerprint = 0x29b9c5f3bbd9826, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .mcp = .{
+            .url = "git+https://github.com/ChristianPresley/zig-sdk#c1f55f00deefb3f09ac97126d6405b1820b927dd",
+            .hash = "mcp-0.3.0-1aexQPDGMQCJDEnkNShayyMdliHTcSuts31ujU7VwU55",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "bridges",
+        "LICENSE",
+        "NOTICE",
+        "README.md",
+    },
+}

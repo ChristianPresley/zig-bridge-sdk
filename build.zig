@@ -1,0 +1,167 @@
+const std = @import("std");
+const zon = @import("build.zig.zon");
+
+pub fn build(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    // The pinned zig-sdk. The package exports its `mcp` module again, so that an embedder
+    // uses the same `mcp` types as the bridges (one zig-sdk hash for both).
+    const mcp_dep = b.dependency("mcp", .{ .target = target, .optimize = optimize });
+    const mcp = mcp_dep.module("mcp");
+    b.modules.put(b.graph.arena, "mcp", mcp) catch @panic("OOM");
+
+    // The version of the package, for `--version` and the serverInfo fallback.
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", zon.version);
+    const build_options = options.createModule();
+
+    // The core module that every bridge uses.
+    const bridge = b.addModule("bridge", .{
+        .root_source_file = b.path("src/bridge.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "mcp", .module = mcp },
+            .{ .name = "build_options", .module = build_options },
+        },
+    });
+
+    // One module and one executable for each product. The name of the module is the key of
+    // the product.
+    const vscode = b.addModule("vscode", .{
+        .root_source_file = b.path("bridges/vscode/vscode.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "mcp", .module = mcp },
+            .{ .name = "bridge", .module = bridge },
+        },
+    });
+    const vscode_exe = b.addExecutable(.{
+        .name = "mcp-bridge-vscode",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bridges/vscode/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vscode", .module = vscode },
+                .{ .name = "bridge", .module = bridge },
+                .{ .name = "mcp", .module = mcp },
+            },
+        }),
+    });
+    b.installArtifact(vscode_exe);
+    const run_vscode = b.addRunArtifact(vscode_exe);
+    if (b.args) |args| run_vscode.addArgs(args);
+    b.step("run-vscode", "Run mcp-bridge-vscode").dependOn(&run_vscode.step);
+
+    // The upstream server of the tests: a zig-sdk server with the tools that the tests need.
+    const fixture_server = b.addExecutable(.{
+        .name = "bridge-fixture-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/fixture_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "mcp", .module = mcp }},
+        }),
+    });
+    const install_fixture = b.addInstallArtifact(fixture_server, .{});
+    b.step("fixture-server", "Build the upstream server of the tests").dependOn(&install_fixture.step);
+
+    // Unit tests. `-Dfuzz` prepares them for `zig build test -Dfuzz --fuzz` on Zig 0.16.0: a test
+    // runner whose fuzz path compiles, and the LLVM backend, because the self-hosted backend of
+    // Debug builds emits no `__sancov_pcs1` table and the fuzzer then sees no coverage.
+    const fuzz = b.option(bool, "fuzz", "Prepare the unit tests for --fuzz on Zig 0.16.0") orelse false;
+    const test_runner: ?std.Build.Step.Compile.TestRunner = if (fuzz) fuzzTestRunner(b) else null;
+    const use_llvm: ?bool = if (fuzz) true else null;
+
+    const test_step = b.step("test", "Run all tests");
+    const test_vscode_step = b.step("test-vscode", "Run the tests of the vscode bridge");
+
+    const bridge_tests = b.addTest(.{ .root_module = bridge, .test_runner = test_runner, .use_llvm = use_llvm });
+    test_step.dependOn(&b.addRunArtifact(bridge_tests).step);
+
+    const vscode_tests = b.addTest(.{ .root_module = vscode, .test_runner = test_runner, .use_llvm = use_llvm });
+    const run_vscode_tests = b.addRunArtifact(vscode_tests);
+    test_step.dependOn(&run_vscode_tests.step);
+    test_vscode_step.dependOn(&run_vscode_tests.step);
+
+    // The checks of the vendored schemas. The fixtures come in as anonymous imports, because
+    // Zig 0.16 does not embed a file outside the module root.
+    const schema_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("test/schema_fixtures_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "mcp", .module = mcp }},
+    }) });
+    addSchemaImports(b, schema_tests.root_module);
+    test_step.dependOn(&b.addRunArtifact(schema_tests).step);
+
+    // The tests of the repository tools.
+    for ([_][]const u8{
+        "tools/lint_docs/main.zig",
+        "tools/gen_dictionary.zig",
+        "tools/changelog_section.zig",
+        "tools/commit_policy.zig",
+        "tools/check_version.zig",
+    }) |tool_source| {
+        const tool_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path(tool_source),
+            .target = b.graph.host,
+        }) });
+        const run_tool_tests = b.addRunArtifact(tool_tests);
+        run_tool_tests.setCwd(b.path("."));
+        test_step.dependOn(&run_tool_tests.step);
+    }
+
+    // Formatting check.
+    const fmt_step = b.step("fmt", "Check formatting");
+    const fmt = b.addFmt(.{ .paths = &.{ "build.zig", "build.zig.zon", "src", "bridges", "tools", "test", "examples" }, .check = true });
+    fmt_step.dependOn(&fmt.step);
+
+    // Tools written in Zig and run through `zig build <step>`.
+    addTool(b, "lint-docs", "Check prose against the project STE profile", "tools/lint_docs/main.zig", &.{ "--strict", "--string-literals" });
+    addTool(b, "commit-policy", "Check commits for a sole signed author", "tools/commit_policy.zig", &.{});
+    addTool(b, "gen-dictionary", "Render the project dictionary", "tools/gen_dictionary.zig", &.{ "--out", "docs/generated/dictionary.md" });
+    addTool(b, "check-version", "Check that a release tag matches the package version", "tools/check_version.zig", &.{});
+    addTool(b, "changelog-section", "Print the changelog section of a version", "tools/changelog_section.zig", &.{});
+}
+
+/// Gives a test module the vendored schemas as the imports `schema_2025_11_25` and
+/// `schema_2026_07_28`.
+fn addSchemaImports(b: *std.Build, module: *std.Build.Module) void {
+    module.addAnonymousImport("schema_2025_11_25", .{ .root_source_file = b.path("test/fixtures/mcp_schema_2025_11_25/schema.json") });
+    module.addAnonymousImport("schema_2026_07_28", .{ .root_source_file = b.path("test/fixtures/mcp_schema_2026_07_28/schema.json") });
+}
+
+/// The fuzz path of the test runner of Zig 0.16.0 gives a `builtin.StackTrace` to
+/// `std.debug.writeStackTrace`, but that function takes a `debug.StackTrace`. Thus no test
+/// with a fuzz target compiles with `-ffuzz`. This makes a copy of the runner of the installed
+/// toolchain with `std.debug.writeErrorReturnTrace` in that call. The repository keeps no copy.
+fn fuzzTestRunner(b: *std.Build) std.Build.Step.Compile.TestRunner {
+    const sub_path = "compiler/test_runner.zig";
+    const source = b.graph.zig_lib_directory.handle.readFileAlloc(b.graph.io, sub_path, b.allocator, .limited(1 << 20)) catch |err|
+        std.debug.panic("cannot read {s} of the Zig library: {t}", .{ sub_path, err });
+    const needle = "std.debug.writeStackTrace(trace, stderr)";
+    if (std.mem.count(u8, source, needle) != 1)
+        std.debug.panic("{s} of the Zig library does not have one '{s}'; remove -Dfuzz", .{ sub_path, needle });
+    const fixed = std.mem.replaceOwned(u8, b.allocator, source, needle, "std.debug.writeErrorReturnTrace(trace, stderr)") catch @panic("OOM");
+    const files = b.addWriteFiles();
+    return .{ .path = files.add("fuzz_test_runner.zig", fixed), .mode = .server };
+}
+
+fn addTool(b: *std.Build, step_name: []const u8, description: []const u8, source: []const u8, default_args: []const []const u8) void {
+    const exe = b.addExecutable(.{
+        .name = step_name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(source),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    const run = b.addRunArtifact(exe);
+    run.setCwd(b.path("."));
+    if (b.args) |args| run.addArgs(args) else run.addArgs(default_args);
+    b.step(step_name, description).dependOn(&run.step);
+}
