@@ -14,6 +14,16 @@ pub const version: []const u8 = @import("build_options").version;
 /// The legacy protocol revision that the bridges speak to their client.
 pub const legacy_protocol_version = "2025-11-25";
 
+/// The part of revision 2025-11-25 that the bridges receive from their client.
+pub const legacy = @import("bridge/legacy.zig");
+/// The translation of capabilities, parameters, results and errors. It does no I/O.
+pub const translate = @import("bridge/translate.zig");
+
+test {
+    _ = legacy;
+    _ = translate;
+}
+
 /// The settings of one product. Each bridge module declares one `Profile`, and the core
 /// functions take it as `*const Profile`. The product is a property of the executable. The
 /// core never chooses a profile from the `clientInfo` of the client.
@@ -47,6 +57,10 @@ pub const Profile = struct {
     pub const Quirks = struct {
         /// Give `items: {}` to each array schema of a tool `inputSchema` that has no `items`.
         normalize_array_items: bool = false,
+        /// Remove each tool `outputSchema` whose root does not have `type: "object"`.
+        /// Revision 2025-11-25 allows only that root. A client that checks `tools/list`
+        /// against that revision refuses the whole list for one such schema.
+        drop_non_object_output_schema: bool = false,
         /// Change the results of revision 2026-07-28 that revision 2025-11-25 does not allow.
         strict_legacy_results: bool = false,
     };
