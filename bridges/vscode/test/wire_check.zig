@@ -111,6 +111,28 @@ pub fn resultDefinition(method: []const u8) ?[]const u8 {
     return map.get(method);
 }
 
+/// The definition of the 2025-11-25 schema for a request of the bridge to VS Code, or null.
+/// The bridge sends only the input requests of the upstream server.
+pub fn bridgeRequestDefinition(method: []const u8) ?[]const u8 {
+    const map: std.StaticStringMap([]const u8) = .initComptime(.{
+        .{ "elicitation/create", "ElicitRequest" },
+        .{ "sampling/createMessage", "CreateMessageRequest" },
+        .{ "roots/list", "ListRootsRequest" },
+    });
+    return map.get(method);
+}
+
+/// The definition of the 2025-11-25 schema for a notification of the bridge to VS Code, or
+/// null.
+pub fn notificationDefinition(method: []const u8) ?[]const u8 {
+    const map: std.StaticStringMap([]const u8) = .initComptime(.{
+        .{ "notifications/progress", "ProgressNotification" },
+        .{ "notifications/cancelled", "CancelledNotification" },
+        .{ "notifications/elicitation/complete", "ElicitationCompleteNotification" },
+    });
+    return map.get(method);
+}
+
 /// The definition of the 2026-07-28 schema for a request to the upstream server, or null.
 pub fn upstreamRequestDefinition(method: []const u8) ?[]const u8 {
     const map: std.StaticStringMap([]const u8) = .initComptime(.{
@@ -218,7 +240,9 @@ fn truthy(v: Value) bool {
 
 /// Fail when a request to the upstream server has `task` or a `_meta` key of VS Code. This
 /// version of the bridge must not send them. Also fail when the client capabilities declare
-/// an input kind or the Tasks extension.
+/// `tasks`, the Tasks extension, `roots.listChanged`, `sampling.tools` or `sampling.context`.
+/// The clients of the transcripts declare no sampling with tools or context, thus the bridge
+/// must not declare them upstream.
 pub fn expectUpstreamRequest(method: []const u8, frame: Value) !void {
     const params = frame.object.get("params") orelse return fail("the upstream {s} request has no params", .{method});
     if (params.object.get("task") != null) return fail("the upstream {s} request has a task", .{method});
@@ -230,8 +254,11 @@ pub fn expectUpstreamRequest(method: []const u8, frame: Value) !void {
     }
     const caps = meta.object.get("io.modelcontextprotocol/clientCapabilities") orelse
         return fail("the upstream {s} request has no client capabilities", .{method});
-    for ([_][]const u8{ "sampling", "elicitation", "roots", "tasks" }) |key| if (caps.object.get(key) != null)
-        return fail("the upstream {s} request declares {s}", .{ method, key });
+    if (caps.object.get("tasks") != null) return fail("the upstream {s} request declares tasks", .{method});
+    if (caps.object.get("roots")) |roots| if (roots.object.get("listChanged") != null)
+        return fail("the upstream {s} request declares roots.listChanged", .{method});
+    if (caps.object.get("sampling")) |sampling| for ([_][]const u8{ "tools", "context" }) |key| if (sampling.object.get(key) != null)
+        return fail("the upstream {s} request declares sampling.{s}", .{ method, key });
     if (caps.object.get("extensions")) |ext| if (ext.object.get(mcp.tasks.extension_id) != null)
         return fail("the upstream {s} request declares the Tasks extension", .{method});
 }
@@ -255,6 +282,27 @@ test "a definition rejects a frame that its union accepts" {
     defer verbose = true;
     try std.testing.expectError(error.TestSchemaMismatch, schemas.check(.legacy, "ListToolsResult", list, "test"));
     try std.testing.expectError(error.TestUnexpectedMember, expectLegacyResult("tools/list", list));
+}
+
+test "the definitions of the requests of the bridge refuse a frame without a required member" {
+    var schemas: Schemas = .init(std.testing.allocator);
+    defer schemas.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const url = "{\"jsonrpc\":\"2.0\",\"id\":\"b-1\",\"method\":\"elicitation/create\",\"params\":{\"mode\":\"url\",\"message\":\"Sign in.\",\"url\":\"https://example.com/auth\"";
+    const complete = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/elicitation/complete\",\"params\":{";
+    const sampling = "{\"jsonrpc\":\"2.0\",\"id\":\"b-2\",\"method\":\"sampling/createMessage\",\"params\":{\"messages\":[]";
+    try schemas.check(.legacy, "ElicitRequest", try mcp.json.parseTree(arena, url ++ ",\"elicitationId\":\"e-1\"}}"), "test");
+    try schemas.check(.legacy, "ElicitationCompleteNotification", try mcp.json.parseTree(arena, complete ++ "\"elicitationId\":\"e-1\"}}"), "test");
+    try schemas.check(.legacy, "CreateMessageRequest", try mcp.json.parseTree(arena, sampling ++ ",\"maxTokens\":5}}"), "test");
+    // VS Code needs the elicitationId of a URL elicitation and of its complete notification.
+    // Revision 2025-11-25 also needs maxTokens.
+    verbose = false;
+    defer verbose = true;
+    try std.testing.expectError(error.TestSchemaMismatch, schemas.check(.legacy, "ElicitRequest", try mcp.json.parseTree(arena, url ++ "}}"), "test"));
+    try std.testing.expectError(error.TestSchemaMismatch, schemas.check(.legacy, "ElicitationCompleteNotification", try mcp.json.parseTree(arena, complete ++ "}}"), "test"));
+    try std.testing.expectError(error.TestSchemaMismatch, schemas.check(.legacy, "CreateMessageRequest", try mcp.json.parseTree(arena, sampling ++ "}}"), "test"));
 }
 
 test "the Copilot check finds an array schema without items" {

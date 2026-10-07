@@ -3,6 +3,7 @@
 //! forwarded request, the results and the error table. The functions do no I/O. They take an
 //! arena, and that arena owns each value that they return.
 const std = @import("std");
+const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const ObjectMap = std.json.ObjectMap;
@@ -17,13 +18,14 @@ const Profile = bridge.Profile;
 // ---------------------------------------------------------------------------------------------
 
 /// The capabilities of the client that go to the upstream server. A false field removes that
-/// capability. The defaults remove sampling, elicitation and roots, because this version of
-/// the bridge cannot send an input request to the client. The bridge never declares the Tasks
-/// extension.
+/// capability. By default, the upstream server gets each capability as the client declared
+/// it. The front end sends the input requests of the upstream server to the client. Thus it
+/// declares sampling, elicitation and roots when the client declares them. The bridge never
+/// declares the Tasks extension.
 pub const CapabilityMask = struct {
-    sampling: bool = false,
-    elicitation: bool = false,
-    roots: bool = false,
+    sampling: bool = true,
+    elicitation: bool = true,
+    roots: bool = true,
     experimental: bool = true,
     extensions: bool = true,
 };
@@ -32,7 +34,8 @@ pub const CapabilityMask = struct {
 /// revision 2026-07-28, and apply `mask`. The parser drops the members that revision
 /// 2026-07-28 does not have, for example `tasks` and `roots.listChanged`. It also drops a
 /// member that does not have the shape of the schema. Thus the upstream server always gets
-/// capabilities that are valid.
+/// capabilities that are valid. The modes of `elicitation` and the members `context` and
+/// `tools` of `sampling` stay as the client declared them. The function never adds one.
 pub fn upstreamCapabilities(arena: Allocator, legacy_caps: Value, mask: CapabilityMask) Allocator.Error!types.ClientCapabilities {
     var out: types.ClientCapabilities = .{};
     if (legacy_caps != .object) return out;
@@ -556,7 +559,10 @@ pub const Cause = enum {
     invalid_request_shape,
     method_not_found,
     invalid_params,
-    input_required,
+    invalid_input_request,
+    too_many_input_requests,
+    input_timeout,
+    invalid_client_answer,
 };
 
 /// The error object of a JSON-RPC error response to the client. `jsonStringify` writes the
@@ -639,7 +645,10 @@ pub fn codeOf(cause: Cause) i64 {
         .discover_failed,
         .upstream_exited,
         .too_many_requests,
-        .input_required,
+        .invalid_input_request,
+        .too_many_input_requests,
+        .input_timeout,
+        .invalid_client_answer,
         => Code.internal_error.int(),
     };
 }
@@ -682,7 +691,10 @@ pub fn messageOf(cause: Cause) []const u8 {
         .invalid_request_shape => .{ .message = "The message is not a valid JSON-RPC 2.0 request." },
         .method_not_found => .{ .message = "The server does not have this method." },
         .invalid_params => .{ .message = "The parameters of the request are not valid." },
-        .input_required => .{ .message = "The upstream server needs input that this version of the bridge cannot ask for yet." },
+        .invalid_input_request => .{ .message = "The upstream server sent an input request that is not valid for the client. See the Output channel of the server." },
+        .too_many_input_requests => .{ .message = "The upstream server asked for more inputs at one time than the limit of the bridge." },
+        .input_timeout => .{ .message = "The client did not answer the input request of the upstream server in time." },
+        .invalid_client_answer => .{ .message = "The client sent an answer that is not valid for the input request of the upstream server." },
     };
     return text.message;
 }
@@ -738,6 +750,18 @@ pub fn discoverFailed(upstream: ?types.Error) RpcError {
     return out;
 }
 
+/// A time limit or a wait time as text, for `RpcError.detail` and for the log: whole seconds,
+/// else milliseconds. Thus a time below one second does not show as "0 s".
+pub const TimeLimit = struct {
+    duration: Io.Duration,
+
+    pub fn format(self: TimeLimit, w: *Io.Writer) Io.Writer.Error!void {
+        const ms = self.duration.toMilliseconds();
+        if (@rem(ms, std.time.ms_per_s) == 0) return w.print("{d} s", .{@divTrunc(ms, std.time.ms_per_s)});
+        try w.print("{d} ms", .{ms});
+    }
+};
+
 // ---------------------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------------------
@@ -756,24 +780,49 @@ fn expectJson(arena: Allocator, expected: []const u8, value: anytype) !void {
     try testing.expectEqualStrings(expected, try mcp.json.writeAlloc(arena, value));
 }
 
-test "upstream capabilities of VS Code without input requests" {
+/// The capabilities of the `initialize` request of VS Code 1.140.0.
+const vscode_capabilities =
+    \\{"roots":{"listChanged":true},"sampling":{},"elicitation":{"form":{},"url":{}},
+    \\"tasks":{"list":{},"cancel":{}},"experimental":{"x":{"a":1}},
+    \\"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]},"io.modelcontextprotocol/tasks":{}}}
+;
+
+test "upstream capabilities of VS Code with the default mask" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const caps = try parse(arena,
-        \\{"roots":{"listChanged":true},"sampling":{},"elicitation":{"form":{},"url":{}},
-        \\"tasks":{"list":{},"cancel":{}},"experimental":{"x":{"a":1}},
-        \\"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]},"io.modelcontextprotocol/tasks":{}}}
-    );
+    const caps = try parse(arena, vscode_capabilities);
     const out = try upstreamCapabilities(arena, caps, .{});
-    try testing.expect(out.sampling == null);
-    try testing.expect(out.elicitation == null);
-    try testing.expect(out.roots == null);
+    // The input kinds go upstream as VS Code declared them: roots without listChanged, and
+    // sampling without context and tools.
+    try testing.expect(out.hasElicitation(.form));
+    try testing.expect(out.hasElicitation(.url));
+    try testing.expect(out.sampling.?.tools == null);
+    try testing.expect(out.sampling.?.context == null);
+    try testing.expect(out.roots != null);
     try testing.expect(!out.hasExtension(mcp.tasks.extension_id));
     try testing.expect(out.hasExtension(mcp.protocol.apps.extension_id));
     try expectJson(arena,
+        \\{"experimental":{"x":{"a":1}},"roots":{},"sampling":{},"elicitation":{"form":{},"url":{}},"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]}}}
+    , out);
+}
+
+test "upstream capabilities without the input kinds" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const caps = try parse(arena, vscode_capabilities);
+    const out = try upstreamCapabilities(arena, caps, .{ .sampling = false, .elicitation = false, .roots = false });
+    try testing.expect(out.sampling == null);
+    try testing.expect(out.elicitation == null);
+    try testing.expect(out.roots == null);
+    try expectJson(arena,
         \\{"experimental":{"x":{"a":1}},"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]}}}
     , out);
+    // A client that declares only the form mode.
+    const form_only = try upstreamCapabilities(arena, try parse(arena, "{\"elicitation\":{}}"), .{});
+    try testing.expect(form_only.hasElicitation(.form));
+    try testing.expect(!form_only.hasElicitation(.url));
 }
 
 test "upstream capabilities with all input requests" {
@@ -798,10 +847,11 @@ test "upstream capabilities of the Copilot harness" {
     const caps = try parse(arena,
         \\{"sampling":{},"elicitation":{"form":{},"url":{}}}
     );
-    try expectJson(arena, "{}", try upstreamCapabilities(arena, caps, .{}));
+    // The harness declares no roots.
     try expectJson(arena,
         \\{"sampling":{},"elicitation":{"form":{},"url":{}}}
-    , try upstreamCapabilities(arena, caps, .{ .sampling = true, .elicitation = true, .roots = true }));
+    , try upstreamCapabilities(arena, caps, .{}));
+    try expectJson(arena, "{}", try upstreamCapabilities(arena, caps, .{ .sampling = false, .elicitation = false, .roots = false }));
 }
 
 test "upstream capabilities drop the members that are not valid" {
@@ -825,8 +875,8 @@ test "upstream capabilities drop the members that are not valid" {
     try expectJson(arena, "{}", try upstreamCapabilities(arena, .null, all));
     try expectJson(arena, "{}", try upstreamCapabilities(arena, .{ .object = .empty }, all));
     const no_extra = try upstreamCapabilities(arena, try parse(arena,
-        \\{"experimental":{"x":{}},"extensions":{"y":{}}}
-    ), .{ .experimental = false, .extensions = false });
+        \\{"experimental":{"x":{}},"extensions":{"y":{}},"roots":{}}
+    ), .{ .experimental = false, .extensions = false, .roots = false });
     try expectJson(arena, "{}", no_extra);
 }
 
@@ -1397,7 +1447,9 @@ test "error table" {
     try testing.expectEqual(@as(i64, -32601), errorFor(.method_not_found, null).code);
     try testing.expectEqual(@as(i64, -32602), errorFor(.invalid_params, null).code);
     try testing.expectEqual(@as(i64, -32603), errorFor(.discover_failed, null).code);
-    try testing.expectEqual(@as(i64, -32603), errorFor(.input_required, null).code);
+    try testing.expectEqual(@as(i64, -32603), errorFor(.undeclared_input_request, null).code);
+    try testing.expectEqual(@as(i64, -32603), errorFor(.too_many_input_requests, null).code);
+    try testing.expectEqual(@as(i64, -32603), errorFor(.invalid_client_answer, null).code);
     // Each cause has a code, a message that ends with a period and its name in data.cause.
     for (std.enums.values(Cause)) |cause| {
         const e = errorFor(cause, null);
@@ -1476,4 +1528,11 @@ test "discover failure keeps the upstream code" {
     try testing.expectEqual(@as(i64, -32603), discoverFailed(null).code);
     try testing.expect(discoverFailed(null).detail == null);
     try testing.expectEqual(@as(i64, -32603), discoverFailed(.{ .code = -32042, .message = "x" }).code);
+}
+
+test "a time limit as text" {
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("60 s", try std.fmt.bufPrint(&buf, "{f}", .{TimeLimit{ .duration = .fromSeconds(60) }}));
+    try testing.expectEqualStrings("300 ms", try std.fmt.bufPrint(&buf, "{f}", .{TimeLimit{ .duration = .fromMilliseconds(300) }}));
+    try testing.expectEqualStrings("1500 ms", try std.fmt.bufPrint(&buf, "{f}", .{TimeLimit{ .duration = .fromMilliseconds(1500) }}));
 }

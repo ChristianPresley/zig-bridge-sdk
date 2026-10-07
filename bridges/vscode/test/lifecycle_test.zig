@@ -61,15 +61,18 @@ test "the initialize of VS Code gives the result that VS Code needs" {
         try testing.expect(result.object.get(key) == null);
     }
 
-    // The upstream client has the client information of VS Code. This version declares no
-    // input kind and never the Tasks extension. The MCP Apps extension goes upstream.
+    // The upstream client has the client information of VS Code. It declares the input kinds
+    // of VS Code: the two elicitation modes, sampling without tools and roots. It never
+    // declares the Tasks extension. The MCP Apps extension goes upstream.
     const client = try t.upstreamClient();
     try testing.expectEqualStrings("Visual Studio Code", client.options.info.name);
     try testing.expectEqualStrings("1.140.0", client.options.info.version);
     const upstream_caps = client.options.capabilities;
-    try testing.expect(upstream_caps.sampling == null);
-    try testing.expect(upstream_caps.elicitation == null);
-    try testing.expect(upstream_caps.roots == null);
+    try testing.expect(upstream_caps.hasElicitation(.form));
+    try testing.expect(upstream_caps.hasElicitation(.url));
+    try testing.expect(upstream_caps.sampling.?.tools == null);
+    try testing.expect(upstream_caps.sampling.?.context == null);
+    try testing.expect(upstream_caps.roots != null);
     try testing.expect(upstream_caps.hasExtension(mcp.apps.extension_id));
     try testing.expect(!upstream_caps.hasExtension(mcp.tasks.extension_id));
 
@@ -334,8 +337,11 @@ test "the Copilot harness: discover first, then initialize, then requests with p
     try testing.expectEqualStrings(fixture.server_name, result.object.get("serverInfo").?.object.get("name").?.string);
     const client = try t.upstreamClient();
     try testing.expectEqualStrings("copilot-cli", client.options.info.name);
-    try testing.expect(client.options.capabilities.sampling == null);
-    try testing.expect(client.options.capabilities.elicitation == null);
+    // The input kinds of the harness go upstream: sampling and the two elicitation modes, and
+    // no roots.
+    try testing.expect(client.options.capabilities.sampling != null);
+    try testing.expect(client.options.capabilities.hasElicitation(.url));
+    try testing.expect(client.options.capabilities.roots == null);
     try t.send(h.initialized);
 
     // The harness sends `_meta.progressToken: 0` with each request.

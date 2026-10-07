@@ -14,6 +14,11 @@
 //!   end answers each request in flight with -32603 and stops.
 //! - At the end of the input, the front end cancels the requests in flight and waits for them
 //!   for at most `shutdown_grace`.
+//! - The front end sends the input requests of the upstream server to the client as requests
+//!   with the string ids `<request_id_prefix><n>` (`input.zig` has the rules). A table keeps
+//!   each such request until its answer. The reader puts each answer into the table at once,
+//!   also at the limit of requests in flight. It drops an answer whose id is not in the table,
+//!   because VS Code ignores a cancellation of the bridge and answers late.
 //!
 //! A canceled request gets no response. Each task writes its frames under one lock, thus the
 //! frames do not mix.
@@ -31,8 +36,10 @@ const CancelToken = mcp.transport.CancelToken;
 const bridge = @import("../bridge.zig");
 const legacy = @import("legacy.zig");
 const translate = @import("translate.zig");
+const input = @import("input.zig");
 const Upstream = @import("Upstream.zig");
 const Profile = bridge.Profile;
+const TimeLimit = translate.TimeLimit;
 
 const log = std.log.scoped(.bridge);
 
@@ -61,6 +68,14 @@ stop_event: Io.Event = .unset,
 upstream_lost: std.atomic.Value(bool) = .init(false),
 /// True after `shutdown`. Only the task of `run` and `deinit` read and write it.
 shut_down: bool = false,
+/// The requests of the bridge to the client that wait for their answers. Guarded by
+/// `pending_lock`.
+pending: std.ArrayList(*Pending) = .empty,
+pending_lock: Io.Mutex = .init,
+/// The number in the id of the next request of the bridge to the client.
+next_request: std.atomic.Value(u64) = .init(1),
+/// The number in the next `elicitationId` of a URL elicitation.
+next_elicitation: std.atomic.Value(u64) = .init(1),
 
 /// The lifecycle of the connection.
 pub const State = enum(u8) {
@@ -118,16 +133,26 @@ pub const Hooks = struct {
 pub const Timeouts = struct {
     /// The list requests and `completion/complete`.
     list: Io.Duration = .fromSeconds(120),
-    /// `prompts/get` and `resources/read`.
+    /// The first round of `prompts/get` and `resources/read`.
     read: Io.Duration = .fromSeconds(120),
-    /// `tools/call`. The client can cancel a call earlier.
+    /// Each round of `tools/call`. The client can cancel a call earlier.
     call: Io.Duration = .fromSeconds(3600),
+    /// The wait for the answers of the client to the input requests of one round. This limit
+    /// also applies to each round after the first round of `prompts/get` and
+    /// `resources/read`. A person gives these answers, thus the limit is long.
+    input: Io.Duration = .fromSeconds(3600),
 
-    /// The limit of `method`.
+    /// The limit of the first round of `method`.
     pub fn forMethod(self: Timeouts, method: []const u8) Io.Duration {
         if (std.mem.eql(u8, method, "tools/call")) return self.call;
         if (std.mem.eql(u8, method, "prompts/get") or std.mem.eql(u8, method, "resources/read")) return self.read;
         return self.list;
+    }
+
+    /// The limit of the round `round` of `method`. The first round has the number 0.
+    pub fn forRound(self: Timeouts, method: []const u8, round: u32) Io.Duration {
+        if (round == 0 or std.mem.eql(u8, method, "tools/call")) return self.forMethod(method);
+        return self.input;
     }
 };
 
@@ -158,6 +183,9 @@ pub const Options = struct {
     reply_mask: translate.ReplyMask = .{},
     /// How often the watcher examines the upstream server.
     watch_interval: Io.Duration = .fromMilliseconds(200),
+    /// The maximum number of input requests in one round. A round with more input requests
+    /// fails with -32603, and the client gets none of them.
+    max_input_requests_per_round: u32 = input.default_max_requests_per_round,
     hooks: Hooks = .{},
 };
 
@@ -167,6 +195,14 @@ const default_limits: mcp.Limits = .{};
 const client_cancel_reason = "the client canceled the request";
 /// The cancellation reason at the end of the input.
 const eof_cancel_reason = "the client closed the connection";
+/// The cancellation reason after the upstream server stopped.
+const upstream_exit_reason = "the upstream server stopped";
+/// The cancellation reason of a request of the bridge whose answer did not come in time.
+const input_timeout_reason = "no answer in time";
+
+/// A task that waits for the answers of the client also wakes after this time. The reader
+/// and a cancellation wake it earlier.
+const pending_poll_interval: Io.Duration = .fromMilliseconds(100);
 
 /// The first log line about a request in flight comes after this time, and the next lines
 /// come after each `report_interval_s`.
@@ -191,6 +227,34 @@ const Slot = struct {
     /// The time of the next log line about this request, in seconds after `started`. Only the
     /// watcher reads and writes it.
     next_report_s: i64 = first_report_s,
+    /// Wakes the task while it waits for the answers of the client: the reader sets it after
+    /// an answer, and a cancellation sets it.
+    wake: Io.Event = .unset,
+    /// True while the task waits for the answers of the client and not for the upstream
+    /// server. The watcher reads it for its log line.
+    waiting_for_client: std.atomic.Value(bool) = .init(false),
+};
+
+/// A request of the bridge to the client that waits for its answer. This is the pending table
+/// of `mcp.transport.stdio.Client`, for the requests in the other direction. The task of the
+/// request registers the entry before it writes the request, and it unregisters the entry on
+/// each path out. Thus the reader never sees an entry that is not valid.
+const Pending = struct {
+    /// The id, for example "b-1".
+    id: []const u8,
+    /// The `wake` event of the slot. The reader sets it after it resolved the entry.
+    wake: *Io.Event,
+    /// A copy of the response line in `gpa`. The reader sets it.
+    frame: ?[]u8 = null,
+    /// True after a line with the id of the entry that is not a valid message.
+    bad_line: bool = false,
+    /// True after the request went out. Only the task of the request reads and writes it. A
+    /// cancellation must only name a request that the client got.
+    sent: bool = false,
+
+    fn resolved(self: *const Pending) bool {
+        return self.frame != null or self.bad_line;
+    }
 };
 
 pub fn init(io: Io, gpa: Allocator, upstream: *Upstream, profile: *const Profile, sink: Sink, options: Options) Frontend {
@@ -202,6 +266,14 @@ pub fn init(io: Io, gpa: Allocator, upstream: *Upstream, profile: *const Profile
 pub fn deinit(self: *Frontend) void {
     self.shutdown();
     self.in_flight.deinit(self.gpa);
+    self.pending.deinit(self.gpa);
+}
+
+/// The number of requests of the bridge that wait for an answer of the client.
+pub fn pendingCount(self: *Frontend) usize {
+    self.pending_lock.lockUncancelable(self.io);
+    defer self.pending_lock.unlock(self.io);
+    return self.pending.items.len;
 }
 
 /// The lifecycle state.
@@ -220,6 +292,16 @@ pub fn inFlightCount(self: *Frontend) usize {
     self.in_flight_lock.lockUncancelable(self.io);
     defer self.in_flight_lock.unlock(self.io);
     return self.in_flight.items.len;
+}
+
+/// The number of requests in flight that wait for the answers of the client to their input
+/// requests.
+pub fn waitingForClientCount(self: *Frontend) usize {
+    self.in_flight_lock.lockUncancelable(self.io);
+    defer self.in_flight_lock.unlock(self.io);
+    var n: usize = 0;
+    for (self.in_flight.items) |slot| n += @intFromBool(slot.waiting_for_client.load(.acquire));
+    return n;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -308,7 +390,12 @@ fn dispatch(self: *Frontend, slot: *Slot, line: []const u8) !void {
                 self.badLine(line, if (too_deep) .too_deep else .parse_error);
             },
             error.Invalid => self.badLine(line, .invalid_request_shape),
-            error.InvalidId => self.writeError(null, translate.errorFor(.invalid_request_shape, null)),
+            error.InvalidId => {
+                // A response with the id null, or with an id that is not a string or an
+                // integer, belongs to no request of the bridge. It gets no answer.
+                if (isResponse(arena, line)) return log.debug("dropped a response of the client with an id that is not valid", .{});
+                self.writeError(null, translate.errorFor(.invalid_request_shape, null));
+            },
         }
         return;
     };
@@ -318,13 +405,105 @@ fn dispatch(self: *Frontend, slot: *Slot, line: []const u8) !void {
             defer self.destroySlot(slot);
             self.handleNotification(arena, n);
         },
-        .response, .error_response => {
+        .response => |r| {
             defer self.destroySlot(slot);
-            // This version sends no request to the client, thus no response belongs to a
-            // request of the bridge.
-            log.debug("dropped a response of the client", .{});
+            self.routeAnswer(r.id, .{ .frame = line });
+        },
+        .error_response => |e| {
+            defer self.destroySlot(slot);
+            const id = e.id orelse return log.debug("dropped an error response of the client without an id", .{});
+            self.routeAnswer(id, .{ .frame = line });
         },
     }
+}
+
+/// True when `line` is a JSON object with `result` or `error` and without `method`.
+fn isResponse(arena: Allocator, line: []const u8) bool {
+    const v = mcp.json.parseTree(arena, line) catch return false;
+    if (v != .object or v.object.get("method") != null) return false;
+    return v.object.get("result") != null or v.object.get("error") != null;
+}
+
+/// An answer of the client for the pending table.
+const Resolution = union(enum) {
+    /// The line of a response or an error response.
+    frame: []const u8,
+    /// A line with the id that is not a valid message.
+    bad_line,
+};
+
+/// Give the answer of the client to the request of the bridge with the id `id`. The function
+/// drops an answer whose id is not a string with the prefix of the profile. It also drops an
+/// answer for an id that is not in the table, and a second answer. The reader calls it,
+/// thus it never waits for a slot.
+fn routeAnswer(self: *Frontend, id: RequestId, resolution: Resolution) void {
+    if (id != .string or !std.mem.startsWith(u8, id.string, self.profile.request_id_prefix)) {
+        log.debug("dropped a response of the client with the id {f}: the bridge sent no request with this id", .{id});
+        return;
+    }
+    if (!self.resolvePending(id.string, resolution)) {
+        log.debug("dropped a response of the client with the id {f}: the request is not in flight or has an answer", .{id});
+    }
+}
+
+/// Resolve the entry with the id `id`, and wake its task. Returns false when the table has no
+/// such entry without an answer.
+fn resolvePending(self: *Frontend, id: []const u8, resolution: Resolution) bool {
+    self.pending_lock.lockUncancelable(self.io);
+    defer self.pending_lock.unlock(self.io);
+    for (self.pending.items) |p| {
+        if (!std.mem.eql(u8, p.id, id)) continue;
+        if (p.resolved()) return false;
+        switch (resolution) {
+            .frame => |line| p.frame = self.gpa.dupe(u8, line) catch {
+                // Without memory, the answer counts as a line that is not valid.
+                p.bad_line = true;
+                p.wake.set(self.io);
+                return true;
+            },
+            .bad_line => p.bad_line = true,
+        }
+        p.wake.set(self.io);
+        return true;
+    }
+    return false;
+}
+
+/// Put all entries into the table, or none of them.
+fn registerPending(self: *Frontend, entries: []Pending) Allocator.Error!void {
+    self.pending_lock.lockUncancelable(self.io);
+    defer self.pending_lock.unlock(self.io);
+    try self.pending.ensureUnusedCapacity(self.gpa, entries.len);
+    for (entries) |*p| self.pending.appendAssumeCapacity(p);
+}
+
+/// Remove the entries from the table. After this step, the reader does not change them.
+fn unregisterPending(self: *Frontend, entries: []Pending) void {
+    self.pending_lock.lockUncancelable(self.io);
+    defer self.pending_lock.unlock(self.io);
+    for (entries) |*p| {
+        for (self.pending.items, 0..) |item, i| if (item == p) {
+            _ = self.pending.swapRemove(i);
+            break;
+        };
+    }
+}
+
+/// True when each entry has an answer.
+fn allResolved(self: *Frontend, entries: []const Pending) bool {
+    self.pending_lock.lockUncancelable(self.io);
+    defer self.pending_lock.unlock(self.io);
+    for (entries) |*p| if (!p.resolved()) return false;
+    return true;
+}
+
+/// The number of entries without an answer.
+fn unresolvedCount(self: *Frontend, entries: []const Pending) usize {
+    self.pending_lock.lockUncancelable(self.io);
+    defer self.pending_lock.unlock(self.io);
+    var n: usize = 0;
+    for (entries) |*p| n += @intFromBool(!p.resolved());
+    return n;
 }
 
 /// Answer a line that is not a valid message. The function finds the id of the request in
@@ -343,11 +522,13 @@ fn tooLong(self: *Frontend, long: LongLine) void {
     self.answerBadLine(recoverLongLineId(fba.allocator(), long), .line_too_long);
 }
 
-/// Answer a line that is not valid with the id `id`, or with the id null. A response of the
-/// client to a request of the bridge gets no answer.
+/// Answer a line that is not valid with the id `id`, or with the id null. A line with the id
+/// of a request of the bridge is an answer of the client that is not valid. It gets no
+/// answer, and the request of the bridge gets it as its answer.
 fn answerBadLine(self: *Frontend, id: ?RequestId, cause: translate.Cause) void {
     if (id) |i| if (i == .string and std.mem.startsWith(u8, i.string, self.profile.request_id_prefix)) {
-        log.debug("dropped a line with the id of a request of the bridge", .{});
+        log.debug("the client answered request {f} with a line that is not valid: {t}", .{ i, cause });
+        self.routeAnswer(i, .bad_line);
         return;
     };
     var detail_buf: [64]u8 = undefined;
@@ -433,7 +614,7 @@ fn handleNotification(self: *Frontend, arena: Allocator, n: Message.Notification
             for (self.in_flight.items) |slot| {
                 if (!slot.id.eql(id)) continue;
                 log.debug("the client canceled request {f} ({s})", .{ slot.id, slot.method });
-                slot.token.cancel(self.io, client_cancel_reason);
+                cancelSlot(self.io, slot, client_cancel_reason);
                 return;
             }
         },
@@ -555,37 +736,124 @@ fn failInitialize(self: *Frontend, slot: *Slot, err: translate.RpcError) void {
     self.respondError(slot, err);
 }
 
+/// Send a request of the client to the upstream server and answer the client. When the
+/// upstream server asks for input, the task asks the client (`input.Session`) and sends the
+/// request again with the answers. It does so until a complete result or an error, at most
+/// `Upstream.maxRounds` rounds. The progress of each round goes to the token of the client.
+///
+/// Each path out calls `Session.finish` or `Session.observe` before the response. Thus the
+/// client gets `notifications/elicitation/complete` for each URL that the user accepted.
 fn runForward(self: *Frontend, slot: *Slot) void {
     const arena = slot.arena.allocator();
     const fwd = translate.forwardParams(arena, slot.params, self.profile) catch
         return self.respondError(slot, translate.errorFor(.out_of_memory, null));
     slot.progress_token = fwd.progress_token;
-    var diag: mcp.Client.Diagnostics = .{};
-    const timeout = self.options.timeouts.forMethod(slot.method);
-    const raw = self.upstream.request(arena, slot.method, fwd.params, .{
-        .cancel = &slot.token,
-        .timeout = timeout,
-        .progress = if (fwd.progress_token != null) .{ .context = slot, .call = onProgress } else null,
-        .diagnostics = &diag,
-        .client_id = slot.id,
-    }) catch |e| {
-        const cause = translate.causeOf(e);
-        self.logOutcome(slot, @errorName(e));
-        if (!translate.hasResponse(cause)) return;
-        const err: translate.RpcError = switch (cause) {
-            .rpc => if (diag.rpc_error) |rpc| translate.fromUpstream(rpc) else translate.errorFor(.rpc, null),
-            .timeout => translate.errorFor(.timeout, std.fmt.allocPrint(arena, "{s}: no response in {f}", .{ slot.method, TimeLimit{ .duration = timeout } }) catch null),
-            .closed => translate.errorFor(if (self.upstream.gone()) .upstream_exited else .closed, null),
-            else => translate.errorFor(cause, null),
-        };
-        if (cause == .timeout) log.warn("request {f} ({s}): no response in {f}", .{ slot.id, slot.method, TimeLimit{ .duration = timeout } });
-        return self.respondError(slot, err);
+    var session: input.Session = .{
+        .arena = arena,
+        .io = self.io,
+        .capabilities = self.upstream.clientCapabilities() orelse .{},
+        .peer = .{ .context = slot, .vtable = &peer_vtable },
+        .options = .{
+            .max_requests_per_round = self.options.max_input_requests_per_round,
+            .timeout = self.options.timeouts.input,
+            .schema_limits = self.upstream.schemaLimits(),
+        },
     };
-    if (translate.isInputRequired(raw)) {
-        // A later version asks the client and sends the answers to the upstream server.
-        log.warn("request {f} ({s}): the upstream server asked for input", .{ slot.id, slot.method });
-        return self.respondError(slot, translate.errorFor(.input_required, null));
+    const max_rounds = self.upstream.maxRounds();
+    var params = fwd.params;
+    var has_state = false;
+    var round: u32 = 0;
+    while (true) : (round += 1) {
+        var diag: mcp.Client.Diagnostics = .{};
+        const timeout = self.options.timeouts.forRound(slot.method, round);
+        const raw = self.upstream.request(arena, slot.method, params, .{
+            .cancel = &slot.token,
+            .timeout = timeout,
+            .progress = if (fwd.progress_token != null) .{ .context = slot, .call = onProgress } else null,
+            .diagnostics = &diag,
+            .client_id = slot.id,
+        }) catch |e| {
+            if (e == error.Rpc and has_state) if (diag.rpc_error) |rpc| if (input.isRejectedState(rpc)) {
+                return self.rejectedState(slot, &session, rpc);
+            };
+            return self.failForward(slot, &session, e, diag, timeout);
+        };
+        // The client gets the complete notification of an accepted URL before the response.
+        session.observe(raw);
+        if (!translate.isInputRequired(raw)) return self.finishForward(slot, raw);
+        if (round + 1 >= max_rounds) {
+            log.warn("request {f} ({s}): the upstream server asked for input in {d} rounds", .{ slot.id, slot.method, round + 1 });
+            self.logOutcome(slot, "TooManyRounds");
+            return self.failRounds(slot, &session, translate.errorFor(.too_many_rounds, null));
+        }
+        const outcome = session.round(raw) catch
+            return self.failRounds(slot, &session, translate.errorFor(.out_of_memory, null));
+        switch (outcome) {
+            .retry => |retry| {
+                params = input.retryParams(arena, fwd.params, retry) catch
+                    return self.failRounds(slot, &session, translate.errorFor(.out_of_memory, null));
+                has_state = retry.request_state != null;
+                log.debug("request {f} ({s}): round {d} has the answers of the client after {d} ms", .{ slot.id, slot.method, round + 1, session.last_wait.toMilliseconds() });
+            },
+            .fail => |err| {
+                if (err.cause == null) {
+                    // The error of the client goes to the original request, for example the
+                    // refusal of a sampling request by the user. This is not a fault.
+                    log.info("request {f} ({s}): the client answered an input request with an error: {s}", .{ slot.id, slot.method, err.message });
+                } else {
+                    log.warn("request {f} ({s}): the input requests of the upstream server failed: {s}", .{ slot.id, slot.method, err.detail orelse err.message });
+                }
+                self.logOutcome(slot, "input failed");
+                return self.failRounds(slot, &session, err);
+            },
+            .canceled => {
+                session.finish();
+                return self.logOutcome(slot, "Canceled");
+            },
+        }
     }
+}
+
+/// Answer the client with `err` after the rounds stopped.
+fn failRounds(self: *Frontend, slot: *Slot, session: *input.Session, err: translate.RpcError) void {
+    session.finish();
+    self.respondError(slot, err);
+}
+
+/// Answer the client after a failed upstream request.
+fn failForward(self: *Frontend, slot: *Slot, session: *input.Session, e: Upstream.RequestError, diag: mcp.Client.Diagnostics, timeout: Io.Duration) void {
+    const arena = slot.arena.allocator();
+    const cause = translate.causeOf(e);
+    self.logOutcome(slot, @errorName(e));
+    session.finish();
+    if (!translate.hasResponse(cause)) return;
+    const err: translate.RpcError = switch (cause) {
+        .rpc => if (diag.rpc_error) |rpc| translate.fromUpstream(rpc) else translate.errorFor(.rpc, null),
+        .timeout => translate.errorFor(.timeout, std.fmt.allocPrint(arena, "{s}: no response in {f}", .{ slot.method, TimeLimit{ .duration = timeout } }) catch null),
+        .closed => translate.errorFor(if (self.upstream.gone()) .upstream_exited else .closed, null),
+        else => translate.errorFor(cause, null),
+    };
+    if (cause == .timeout) log.warn("request {f} ({s}): no response in {f}", .{ slot.id, slot.method, TimeLimit{ .duration = timeout } });
+    self.respondError(slot, err);
+}
+
+/// Answer the client after the upstream server refused the `requestState` of a round.
+fn rejectedState(self: *Frontend, slot: *Slot, session: *input.Session, rpc: types.Error) void {
+    const arena = slot.arena.allocator();
+    log.warn("request {f} ({s}): the upstream server refused the request state after an input wait of {f}", .{ slot.id, slot.method, TimeLimit{ .duration = session.last_wait } });
+    self.logOutcome(slot, "request state refused");
+    session.finish();
+    const rejected = input.rejectedState(arena, slot.method, rpc) catch
+        return self.respondError(slot, translate.errorFor(.out_of_memory, null));
+    switch (rejected) {
+        .result => |result| self.respond(slot, result),
+        .rpc_error => |err| self.respondError(slot, err),
+    }
+}
+
+/// Answer the client with the complete result `raw` of the upstream server.
+fn finishForward(self: *Frontend, slot: *Slot, raw: Value) void {
+    const arena = slot.arena.allocator();
     const shaped = translate.shapeResult(arena, slot.method, raw, self.profile) catch
         return self.respondError(slot, translate.errorFor(.out_of_memory, null));
     for (shaped.fixes) |fix| switch (fix.kind) {
@@ -595,18 +863,6 @@ fn runForward(self: *Frontend, slot: *Slot) void {
     self.logOutcome(slot, "ok");
     self.respond(slot, shaped.result);
 }
-
-/// A time limit as text: whole seconds, else milliseconds. Thus a limit below one second does
-/// not show as "0 s".
-const TimeLimit = struct {
-    duration: Io.Duration,
-
-    pub fn format(self: TimeLimit, w: *Io.Writer) Io.Writer.Error!void {
-        const ms = self.duration.toMilliseconds();
-        if (@rem(ms, std.time.ms_per_s) == 0) return w.print("{d} s", .{@divTrunc(ms, std.time.ms_per_s)});
-        try w.print("{d} ms", .{ms});
-    }
-};
 
 fn logOutcome(self: *Frontend, slot: *Slot, outcome: []const u8) void {
     const elapsed = slot.started.durationTo(Io.Clock.Timestamp.now(self.io, .awake)).raw.toMilliseconds();
@@ -634,7 +890,141 @@ fn onProgress(context: ?*anyopaque, params: types.ProgressNotificationParams) vo
         .params = .{ .progressToken = token, .progress = params.progress, .total = params.total, .message = params.message },
     }) catch return;
     defer self.gpa.free(frame);
-    self.writeForSlot(slot, frame, .notification);
+    _ = self.writeForSlot(slot, frame, .notification);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Requests of the bridge to the client
+// ---------------------------------------------------------------------------------------------
+
+/// The functions of the front end for `input.Session`. The context is the slot of the original
+/// request.
+const peer_vtable: input.Peer.VTable = .{ .ask = askClient, .notify = notifyClient, .newElicitationId = newElicitationId };
+
+/// Send each question to the client as a request with a new id, and wait for all answers.
+/// All entries go into the pending table before the first request goes out. Thus a failure
+/// before the requests go out leaves no request without an entry.
+///
+/// The task wakes when the reader resolves an entry, when the client cancels the request, and
+/// after `pending_poll_interval`. On a cancellation, at the end of the input and at the end of
+/// `timeout`, the task first removes its entries from the table. Then it sends
+/// `notifications/cancelled` for each request that went out and has no answer. VS Code
+/// ignores this notification, and the reader drops its late answer.
+fn askClient(context: *anyopaque, arena: Allocator, questions: []const input.Question, answers: []input.Answer, timeout: Io.Duration) input.AskError!void {
+    const slot: *Slot = @ptrCast(@alignCast(context));
+    const self = slot.owner;
+    const io = self.io;
+    const entries = try arena.alloc(Pending, questions.len);
+    const frames = try arena.alloc([]const u8, questions.len);
+    for (questions, entries, frames) |q, *p, *frame| {
+        const n = self.next_request.fetchAdd(1, .monotonic);
+        p.* = .{ .id = try std.fmt.allocPrint(arena, "{s}{d}", .{ self.profile.request_id_prefix, n }), .wake = &slot.wake };
+        frame.* = try mcp.json.writeAlloc(arena, mcp.jsonrpc.message.OutRequest(?Value){ .id = .{ .string = p.id }, .method = q.method, .params = q.params });
+    }
+    // The client can cancel the request during the checks of the round. Then no request
+    // goes out.
+    if (slot.token.isCancelled()) return error.Canceled;
+    try self.registerPending(entries);
+    defer self.releasePending(entries);
+    // A cancellation, or the error after the loss of the upstream server, can come between
+    // two writes. Then `writeForSlot` drops the frames from that point, and their entries are
+    // not `sent`.
+    for (questions, entries, frames) |q, *p, frame| {
+        p.sent = self.writeForSlot(slot, frame, .notification);
+        if (p.sent) log.debug("request {f} ({s}): sent {s} to the client as request \"{s}\"", .{ slot.id, slot.method, q.method, p.id });
+    }
+    slot.waiting_for_client.store(true, .release);
+    defer slot.waiting_for_client.store(false, .release);
+    const deadline = Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = timeout, .clock = .awake });
+    while (true) {
+        slot.wake.reset();
+        if (self.allResolved(entries)) break;
+        if (slot.token.isCancelled()) {
+            self.cancelPending(entries, slot.token.reason orelse client_cancel_reason);
+            return error.Canceled;
+        }
+        const left = Io.Clock.Timestamp.now(io, .awake).durationTo(deadline).raw;
+        if (left.nanoseconds <= 0) {
+            log.warn("request {f} ({s}): no answers of the client in {f} (input requests without an answer: {d} of {d})", .{ slot.id, slot.method, TimeLimit{ .duration = timeout }, self.unresolvedCount(entries), entries.len });
+            self.cancelPending(entries, input_timeout_reason);
+            return error.Timeout;
+        }
+        const wait: Io.Duration = if (left.nanoseconds < pending_poll_interval.nanoseconds) left else pending_poll_interval;
+        slot.wake.waitTimeout(io, .{ .duration = .{ .raw = wait, .clock = .awake } }) catch |e| switch (e) {
+            error.Timeout => {},
+            error.Canceled => {
+                self.cancelPending(entries, eof_cancel_reason);
+                return error.Canceled;
+            },
+        };
+    }
+    self.unregisterPending(entries);
+    for (entries, answers) |*p, *answer| answer.* = try parseAnswer(arena, p);
+}
+
+/// The answer of the client in a resolved entry, parsed in `arena`.
+fn parseAnswer(arena: Allocator, p: *const Pending) Allocator.Error!input.Answer {
+    const frame = p.frame orelse return .bad_line;
+    const msg = Message.parse(arena, frame) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return .bad_line,
+    };
+    return switch (msg) {
+        .response => |r| .{ .result = r.result },
+        .error_response => |e| .{ .rpc_error = .{ .code = e.code, .message = e.message, .data = e.data } },
+        .request, .notification => .bad_line,
+    };
+}
+
+/// Remove the entries from the table, then send `notifications/cancelled` for each entry
+/// that went out and has no answer. The notification goes out also after a cancellation of
+/// the original request.
+fn cancelPending(self: *Frontend, entries: []Pending, reason: []const u8) void {
+    self.unregisterPending(entries);
+    for (entries) |*p| {
+        if (p.resolved() or !p.sent) continue;
+        log.debug("canceled request \"{s}\" to the client: {s}", .{ p.id, reason });
+        const frame = mcp.json.writeAlloc(self.gpa, mcp.jsonrpc.message.OutNotification(CancelledParams){
+            .method = "notifications/cancelled",
+            .params = .{ .requestId = p.id, .reason = reason },
+        }) catch continue;
+        defer self.gpa.free(frame);
+        self.writeFrame(frame);
+    }
+}
+
+/// The `params` of a `notifications/cancelled` to the client.
+const CancelledParams = struct {
+    requestId: []const u8,
+    reason: []const u8,
+};
+
+/// Remove the entries from the table and free the copies of the answers. Each path out of
+/// `askClient` calls it. After `unregisterPending`, it only frees the copies.
+fn releasePending(self: *Frontend, entries: []Pending) void {
+    self.unregisterPending(entries);
+    for (entries) |*p| if (p.frame) |f| {
+        self.gpa.free(f);
+        p.frame = null;
+    };
+}
+
+/// Send a notification of the input requests of the slot. After a cancellation, the
+/// notification still goes out, as `notifications/cancelled` does. Thus the client can
+/// close the parts of the request that it shows, for example an accepted URL.
+fn notifyClient(context: *anyopaque, method: []const u8, params: Value) void {
+    const slot: *Slot = @ptrCast(@alignCast(context));
+    const self = slot.owner;
+    const frame = mcp.json.writeAlloc(self.gpa, mcp.jsonrpc.message.OutNotification(Value){ .method = method, .params = params }) catch return;
+    defer self.gpa.free(frame);
+    if (slot.token.isCancelled()) return self.writeFrame(frame);
+    _ = self.writeForSlot(slot, frame, .notification);
+}
+
+fn newElicitationId(context: *anyopaque, arena: Allocator) Allocator.Error![]const u8 {
+    const slot: *Slot = @ptrCast(@alignCast(context));
+    const n = slot.owner.next_elicitation.fetchAdd(1, .monotonic);
+    return std.fmt.allocPrint(arena, "elicitation-{d}", .{n});
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -649,27 +1039,32 @@ const FrameKind = enum {
 };
 
 /// Write a frame of a request. All frames of a request go out under `out_lock`, thus the
-/// check of `answered` and the write are one step. A canceled request gets no frame.
-fn writeForSlot(self: *Frontend, slot: *Slot, frame: []const u8, kind: FrameKind) void {
+/// check of `answered` and the write are one step. A canceled request gets no frame. Returns
+/// true when the sink took the frame.
+fn writeForSlot(self: *Frontend, slot: *Slot, frame: []const u8, kind: FrameKind) bool {
     self.out_lock.lockUncancelable(self.io);
     defer self.out_lock.unlock(self.io);
-    if (self.closed.load(.acquire) or slot.answered or slot.token.isCancelled()) return;
+    if (self.closed.load(.acquire) or slot.answered or slot.token.isCancelled()) return false;
     if (kind == .response) slot.answered = true;
-    self.sink.write(self.sink.ptr, frame) catch |e| log.debug("cannot write a frame: {t}", .{e});
+    self.sink.write(self.sink.ptr, frame) catch |e| {
+        log.debug("cannot write a frame: {t}", .{e});
+        return false;
+    };
+    return true;
 }
 
 fn respond(self: *Frontend, slot: *Slot, result: Value) void {
     const frame = mcp.json.writeAlloc(self.gpa, mcp.jsonrpc.message.OutResponse(Value){ .id = slot.id, .result = result }) catch
         return self.respondError(slot, translate.errorFor(.out_of_memory, null));
     defer self.gpa.free(frame);
-    self.writeForSlot(slot, frame, .response);
+    _ = self.writeForSlot(slot, frame, .response);
 }
 
 fn respondError(self: *Frontend, slot: *Slot, err: translate.RpcError) void {
     var buf: [1024]u8 = undefined;
     const frame = self.errorFrame(&buf, slot.id, err) orelse return;
     defer frame.deinit(self.gpa);
-    self.writeForSlot(slot, frame.text, .response);
+    _ = self.writeForSlot(slot, frame.text, .response);
 }
 
 /// Write a frame that belongs to no slot task.
@@ -760,6 +1155,12 @@ fn reportWaits(self: *Frontend) void {
         const waited_s = slot.started.durationTo(now).raw.toSeconds();
         if (waited_s < slot.next_report_s) continue;
         slot.next_report_s = waited_s + report_interval_s;
+        // While the client has the input requests of a round, no upstream request is in
+        // flight. A person can take a long time to answer.
+        if (slot.waiting_for_client.load(.acquire)) {
+            log.info("still waiting for the answers of the client to the input requests of {s} (request {f}, {d} s)", .{ slot.method, slot.id, waited_s });
+            continue;
+        }
         const method = if (slot.kind == .initialize) "server/discover" else slot.method;
         log.info("still waiting for the upstream server: {s} (request {f}, {d} s)", .{ method, slot.id, waited_s });
     }
@@ -796,8 +1197,15 @@ fn failInFlight(self: *Frontend) void {
     for (self.in_flight.items) |slot| {
         if (slot.token.isCancelled()) continue;
         self.respondError(slot, translate.errorFor(.upstream_exited, null));
-        slot.token.cancel(self.io, eof_cancel_reason);
+        cancelSlot(self.io, slot, upstream_exit_reason);
     }
+}
+
+/// Cancel the request of `slot`, and wake its task when it waits for the answers of the
+/// client.
+fn cancelSlot(io: Io, slot: *Slot, reason: []const u8) void {
+    slot.token.cancel(io, reason);
+    slot.wake.set(io);
 }
 
 /// Send no more frames. A frame that is in progress completes first, because the function
@@ -825,7 +1233,7 @@ fn stopAdmission(self: *Frontend) void {
 fn cancelAll(self: *Frontend, reason: []const u8) void {
     self.in_flight_lock.lockUncancelable(self.io);
     defer self.in_flight_lock.unlock(self.io);
-    for (self.in_flight.items) |slot| slot.token.cancel(self.io, reason);
+    for (self.in_flight.items) |slot| cancelSlot(self.io, slot, reason);
 }
 
 /// Wait until no request is in flight, at most `grace`. Returns false at the end of `grace`.
@@ -1273,13 +1681,6 @@ test "recoverTrailingId finds the id at the end of the top-level object" {
     try testing.expect(recoverTrailingId("") == null);
 }
 
-test "a time limit as text" {
-    var buf: [32]u8 = undefined;
-    try testing.expectEqualStrings("60 s", try std.fmt.bufPrint(&buf, "{f}", .{TimeLimit{ .duration = .fromSeconds(60) }}));
-    try testing.expectEqualStrings("300 ms", try std.fmt.bufPrint(&buf, "{f}", .{TimeLimit{ .duration = .fromMilliseconds(300) }}));
-    try testing.expectEqualStrings("1500 ms", try std.fmt.bufPrint(&buf, "{f}", .{TimeLimit{ .duration = .fromMilliseconds(1500) }}));
-}
-
 test "the timeouts by method" {
     const t: Timeouts = .{};
     try testing.expectEqual(@as(i64, 3600), t.forMethod("tools/call").toSeconds());
@@ -1287,6 +1688,14 @@ test "the timeouts by method" {
     try testing.expectEqual(@as(i64, 120), t.forMethod("prompts/get").toSeconds());
     try testing.expectEqual(@as(i64, 120), t.forMethod("tools/list").toSeconds());
     try testing.expectEqual(@as(i64, 120), t.forMethod("completion/complete").toSeconds());
+    // The rounds after the first round of a read wait for a person, thus they get the limit
+    // of the input.
+    const short: Timeouts = .{ .read = .fromSeconds(5), .call = .fromSeconds(7), .input = .fromSeconds(9) };
+    try testing.expectEqual(@as(i64, 5), short.forRound("prompts/get", 0).toSeconds());
+    try testing.expectEqual(@as(i64, 9), short.forRound("prompts/get", 1).toSeconds());
+    try testing.expectEqual(@as(i64, 9), short.forRound("resources/read", 3).toSeconds());
+    try testing.expectEqual(@as(i64, 7), short.forRound("tools/call", 0).toSeconds());
+    try testing.expectEqual(@as(i64, 7), short.forRound("tools/call", 2).toSeconds());
 }
 
 /// Collects the frames of a front end.
@@ -1348,7 +1757,53 @@ const TestSink = struct {
         for (self.frames.items) |f| if (std.mem.indexOf(u8, f, needle) != null) return true;
         return false;
     }
+
+    /// The frames with the method `method`, parsed in `arena`. A request has an id, a
+    /// notification has none.
+    fn withMethod(self: *TestSink, arena: Allocator, method: []const u8) ![]Value {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        var out: std.ArrayList(Value) = .empty;
+        for (self.frames.items) |f| {
+            const v = try mcp.json.parseTree(arena, f);
+            const m = mcp.json.getString(v, "method") orelse continue;
+            if (std.mem.eql(u8, m, method)) try out.append(arena, v);
+        }
+        return out.items;
+    }
+
+    /// Wait until there are `n` frames with the method `method`, at most five seconds. Return
+    /// the last of them.
+    fn waitMethod(self: *TestSink, arena: Allocator, method: []const u8, n: usize) !Value {
+        var i: usize = 0;
+        while (true) : (i += 1) {
+            const found = try self.withMethod(arena, method);
+            if (found.len >= n) return found[n - 1];
+            if (i > 5000) return error.TestTimeout;
+            try self.io.sleep(.fromMilliseconds(1), .awake);
+        }
+    }
 };
+
+/// The response line of the client for the request `request` of the bridge.
+fn answerLine(arena: Allocator, request: Value, result: []const u8) ![]u8 {
+    return std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":\"{s}\",\"result\":{s}}}", .{ request.object.get("id").?.string, result });
+}
+
+/// The error response line of the client for the request `request` of the bridge.
+fn errorLine(arena: Allocator, request: Value, err: []const u8) ![]u8 {
+    return std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":\"{s}\",\"error\":{s}}}", .{ request.object.get("id").?.string, err });
+}
+
+/// Wait until the bridge has no request to the client that waits for an answer, at most five
+/// seconds.
+fn waitNoPending(frontend: *Frontend) !void {
+    var i: usize = 0;
+    while (frontend.pendingCount() > 0) : (i += 1) {
+        if (i > 5000) return error.TestTimeout;
+        try testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
 
 /// Wait until no request is in flight, at most five seconds.
 fn waitUntilIdle(frontend: *Frontend) !void {
@@ -1402,6 +1857,103 @@ const HoldTransport = struct {
         }
     }
 };
+
+/// A client transport of an upstream server that the test scripts. It answers
+/// `server/discover` with a fixed result, and each other request with the next item of
+/// `script`. An item is a result object as JSON text, or an error object with the prefix
+/// "error:". After the last item, a request fails with `error.Closed`.
+const ScriptTransport = struct {
+    script: []const []const u8,
+    lock: Io.Mutex = .init,
+    /// The number of requests after `server/discover`. Guarded by `lock`.
+    requests: usize = 0,
+
+    const Transport = mcp.transport.Transport;
+    const vtable: Transport.ClientTransport.VTable = .{ .kind = .memory, .exchange = exchange, .notify = notify };
+    const discover_result =
+        \\{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"prompts":{}}}
+    ;
+
+    fn transport(self: *ScriptTransport) Transport.ClientTransport {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn count(self: *ScriptTransport) usize {
+        self.lock.lockUncancelable(testing.io);
+        defer self.lock.unlock(testing.io);
+        return self.requests;
+    }
+
+    fn exchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
+        const self: *ScriptTransport = @ptrCast(@alignCast(ptr));
+        const item = if (std.mem.eql(u8, ex.method, "server/discover")) discover_result else item: {
+            self.lock.lockUncancelable(io);
+            defer self.lock.unlock(io);
+            if (self.requests >= self.script.len) return error.Closed;
+            defer self.requests += 1;
+            break :item self.script[self.requests];
+        };
+        const is_error = std.mem.startsWith(u8, item, "error:");
+        const body = if (is_error) item["error:".len..] else item;
+        const id = mcp.json.writeAlloc(testing.allocator, ex.id) catch return error.OutOfMemory;
+        defer testing.allocator.free(id);
+        const frame = std.fmt.allocPrint(testing.allocator, "{{\"jsonrpc\":\"2.0\",\"id\":{s},\"{s}\":{s}}}", .{ id, if (is_error) "error" else "result", body }) catch return error.OutOfMemory;
+        defer testing.allocator.free(frame);
+        ex.deliver(io, frame) catch return error.InvalidFrame;
+    }
+
+    fn notify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
+        _ = .{ ptr, io, frame };
+    }
+};
+
+/// A front end with a scripted upstream server.
+const ScriptBridge = struct {
+    script: ScriptTransport,
+    upstream: *Upstream,
+    out: TestSink,
+    frontend: Frontend,
+    arena_state: std.heap.ArenaAllocator,
+
+    fn create(script: []const []const u8, options: Options) !*ScriptBridge {
+        const io = testing.io;
+        const gpa = testing.allocator;
+        const self = try gpa.create(ScriptBridge);
+        errdefer gpa.destroy(self);
+        self.script = .{ .script = script };
+        self.upstream = try Upstream.init(io, gpa, .{ .transport = self.script.transport() });
+        self.out = .{ .io = io };
+        self.frontend = .init(io, gpa, self.upstream, &TestBridge.profile, self.out.sink(), options);
+        self.arena_state = .init(gpa);
+        try self.frontend.receive(vscode_initialize);
+        try self.out.waitFor(1);
+        try waitUntilIdle(&self.frontend);
+        try testing.expectEqual(State.ready, self.frontend.state());
+        return self;
+    }
+
+    fn destroy(self: *ScriptBridge) void {
+        self.frontend.deinit();
+        self.upstream.deinit();
+        self.out.deinit();
+        self.arena_state.deinit();
+        testing.allocator.destroy(self);
+    }
+
+    fn arena(self: *ScriptBridge) Allocator {
+        return self.arena_state.allocator();
+    }
+};
+
+/// Wait for the response with the id `id`, at most five seconds.
+fn waitResponse(out: *TestSink, arena: Allocator, id: i64) !Value {
+    var i: usize = 0;
+    while (true) : (i += 1) {
+        if (out.byId(arena, id)) |v| return v else |e| if (e != error.TestFrameMissing) return e;
+        if (i > 5000) return error.TestTimeout;
+        try testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
 
 /// A front end with an upstream server in this process.
 const TestBridge = struct {
@@ -1468,12 +2020,19 @@ const vscode_initialize =
 fn testServer(gpa: Allocator, io: Io) !*mcp.Server {
     const server = try gpa.create(mcp.Server);
     errdefer gpa.destroy(server);
-    server.* = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "frontend-test", .version = "2.0.0" } });
+    server.* = try mcp.Server.init(gpa, io, .{
+        .info = .{ .name = "frontend-test", .version = "2.0.0" },
+        .mrtr = .{ .sampling = true, .roots = true },
+    });
     errdefer server.deinit();
     try server.addTool(.{ .name = "add", .description = "Add two integers" }, testAdd);
     try server.addTool(.{ .name = "block", .description = "Wait for the cancellation" }, testBlock);
     try server.addTool(.{ .name = "steps", .description = "Send progress, then a result" }, testSteps);
     try server.addToolJson(.{ .name = "ask", .description = "Ask for a name" }, testAsk);
+    try server.addToolJson(.{ .name = "url", .description = "Ask the user to open a URL" }, testUrl);
+    try server.addToolJson(.{ .name = "url_twice", .description = "Ask for the same URL in two rounds" }, testUrlTwice);
+    try server.addToolJson(.{ .name = "sample", .description = "Ask the model of the client" }, testSample);
+    try server.addToolJson(.{ .name = "roots", .description = "List the roots of the client" }, testRoots);
     try server.addToolJson(.{
         .name = "bare",
         .description = "An array without items",
@@ -1508,10 +2067,68 @@ fn testSteps(ctx: *mcp.RequestContext, args: struct { count: u32 }) anyerror!mcp
     return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "{d} steps", .{args.count}) };
 }
 
+/// Ask for a name in a form. Each round sends one progress notification.
 fn testAsk(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
     _ = args;
+    const answer = try ctx.elicitResponse("name");
+    try ctx.progress(if (answer == null) 1 else 2, 2, null);
+    if (answer) |a| {
+        if (a.action != .accept) return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "action: {t}", .{a.action}) };
+        const name = mcp.json.getString(a.content orelse .null, "name") orelse "nobody";
+        return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "Hello, {s}.", .{name}) };
+    }
     var ir: mcp.InputRequired = .init(ctx.arena);
     try ir.elicitForm("name", "Name?", try mcp.InputRequired.stringSchema(ctx.arena, "name", null, true));
+    return .{ .input_required = ir };
+}
+
+const test_url = "https://example.com/auth";
+
+fn testUrl(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    _ = args;
+    if (try ctx.elicitResponse("auth")) |a| return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "url: {t}", .{a.action}) };
+    var ir: mcp.InputRequired = .init(ctx.arena);
+    try ir.elicitUrl("auth", "Sign in", test_url);
+    return .{ .input_required = ir };
+}
+
+/// Ask for the same URL in round 1 and round 2. A server does that when it does not wait for
+/// the end of the step in the browser. Round 3 gives the result.
+fn testUrlTwice(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    _ = args;
+    const round = try ctx.state(u32) orelse 0;
+    if (round == 2) {
+        const a = (try ctx.elicitResponse("auth")).?;
+        return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "url twice: {t}", .{a.action}) };
+    }
+    var ir: mcp.InputRequired = .init(ctx.arena);
+    try ir.elicitUrl("auth", "Sign in", test_url);
+    try ir.setStateFmt("{d}", .{round + 1});
+    return .{ .input_required = ir };
+}
+
+fn testSample(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    _ = args;
+    if (try ctx.sampleResponse("model")) |r| {
+        const block = r.content.blocks()[0];
+        return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "model: {s}", .{if (block == .text) block.text.text else "?"}) };
+    }
+    const messages = try ctx.arena.alloc(types.SamplingMessage, 1);
+    messages[0] = .{ .role = .user, .content = .{ .single = .{ .text = .{ .text = "Say hello" } } } };
+    var ir: mcp.InputRequired = .init(ctx.arena);
+    try ir.sample("model", .{ .messages = messages, .maxTokens = 20 });
+    return .{ .input_required = ir };
+}
+
+fn testRoots(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    _ = args;
+    if (try ctx.rootsResponse("where")) |r| {
+        var text: std.ArrayList(u8) = .empty;
+        for (r.roots) |root| try text.print(ctx.arena, "{s};", .{root.uri});
+        return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "roots: {s}", .{text.items}) };
+    }
+    var ir: mcp.InputRequired = .init(ctx.arena);
+    try ir.listRoots("where");
     return .{ .input_required = ir };
 }
 
@@ -1557,12 +2174,13 @@ test "the initialize result for VS Code, and a second initialize" {
     try testing.expectEqualStrings("frontend-test", result.object.get("serverInfo").?.object.get("name").?.string);
     for ([_][]const u8{ "resultType", "ttlMs", "cacheScope", "_meta" }) |key| try testing.expect(result.object.get(key) == null);
     try testing.expectEqual(State.ready, b.frontend.state());
-    // The upstream server got the client information of VS Code and no input capabilities.
+    // The upstream server got the client information and the input capabilities of VS Code.
     const upstream_options = b.upstream.conn.?.client.options;
     try testing.expectEqualStrings("Visual Studio Code", upstream_options.info.name);
-    try testing.expect(upstream_options.capabilities.sampling == null);
-    try testing.expect(upstream_options.capabilities.elicitation == null);
-    try testing.expect(upstream_options.capabilities.roots == null);
+    try testing.expect(upstream_options.capabilities.sampling != null);
+    try testing.expect(upstream_options.capabilities.hasElicitation(.form));
+    try testing.expect(upstream_options.capabilities.hasElicitation(.url));
+    try testing.expect(upstream_options.capabilities.roots != null);
     try testing.expect(upstream_options.capabilities.hasExtension("io.modelcontextprotocol/ui"));
 
     try expectError(try b.call(2, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}"), -32600, "already_initialized");
@@ -1612,8 +2230,370 @@ test "forwarded requests, results and errors" {
     try expectError(try b.call(4, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"none\"}}"), -32602, null);
     // The upstream server declares no completions.
     try expectError(try b.call(5, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"completion/complete\",\"params\":{\"ref\":{\"type\":\"ref/prompt\",\"name\":\"x\"},\"argument\":{\"name\":\"a\",\"value\":\"\"}}}"), -32601, null);
-    // An input request of the upstream server gets -32603 in this version.
-    try expectError(try b.call(6, "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}"), -32603, "input_required");
+}
+
+/// The text of the first content block of a `tools/call` response.
+fn resultText(v: Value) ![]const u8 {
+    const result = v.object.get("result") orelse return error.TestExpectedResult;
+    return result.object.get("content").?.array.items[0].object.get("text").?.string;
+}
+
+test "a form elicitation goes to the client, and its answer goes upstream" {
+    const b = try TestBridge.create(.{});
+    defer b.destroy();
+    try b.initialize();
+    const arena = b.arena_state.allocator();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\",\"_meta\":{\"progressToken\":\"p-1\"}}}");
+    const request = try b.out.waitMethod(arena, "elicitation/create", 1);
+    // A request of the bridge has a string id with the prefix of the profile.
+    try testing.expectEqualStrings("b-1", request.object.get("id").?.string);
+    const params = request.object.get("params").?;
+    try testing.expectEqualStrings("Name?", params.object.get("message").?.string);
+    try testing.expect(params.object.get("requestedSchema").?.object.get("properties").?.object.get("name") != null);
+    try testing.expectEqual(@as(usize, 1), b.frontend.pendingCount());
+    try b.send(try answerLine(arena, request, "{\"action\":\"accept\",\"content\":{\"name\":\"Ada\"}}"));
+    const response = try waitResponse(&b.out, arena, 2);
+    try testing.expectEqualStrings("Hello, Ada.", try resultText(response));
+    try b.waitIdle();
+    try testing.expectEqual(@as(usize, 0), b.frontend.pendingCount());
+    // The progress of both rounds goes to the token of the client.
+    const progress = try b.out.withMethod(arena, "notifications/progress");
+    try testing.expectEqual(@as(usize, 2), progress.len);
+    for (progress) |p| try testing.expectEqualStrings("p-1", p.object.get("params").?.object.get("progressToken").?.string);
+    // A declined form: the content does not go upstream.
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}");
+    const second = try b.out.waitMethod(arena, "elicitation/create", 2);
+    try testing.expectEqualStrings("b-2", second.object.get("id").?.string);
+    try b.send(try answerLine(arena, second, "{\"action\":\"decline\",\"content\":{\"name\":\"x\"}}"));
+    try testing.expectEqualStrings("action: decline", try resultText(try waitResponse(&b.out, arena, 3)));
+}
+
+test "accepted content that does not agree with the schema fails the original request" {
+    const saved = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = saved;
+    const b = try TestBridge.create(.{});
+    defer b.destroy();
+    try b.initialize();
+    const arena = b.arena_state.allocator();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}");
+    const request = try b.out.waitMethod(arena, "elicitation/create", 1);
+    try b.send(try answerLine(arena, request, "{\"action\":\"accept\",\"content\":{\"name\":7}}"));
+    try expectError(try waitResponse(&b.out, arena, 2), -32603, "invalid_client_answer");
+}
+
+test "the client cancels the original request while a request of the bridge waits" {
+    const b = try TestBridge.create(.{});
+    defer b.destroy();
+    try b.initialize();
+    const arena = b.arena_state.allocator();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}");
+    const request = try b.out.waitMethod(arena, "elicitation/create", 1);
+    try b.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":2,\"reason\":\"stop\"}}");
+    try b.waitIdle();
+    // The bridge cancels its request, and sends no response for the canceled request.
+    const cancelled = try b.out.waitMethod(arena, "notifications/cancelled", 1);
+    try testing.expectEqualStrings("b-1", cancelled.object.get("params").?.object.get("requestId").?.string);
+    try testing.expectError(error.TestFrameMissing, b.out.byId(arena, 2));
+    try testing.expectEqual(@as(usize, 0), b.frontend.pendingCount());
+    // VS Code ignores the cancellation and answers late. The bridge drops the answer.
+    const before = b.out.count();
+    try b.send(try answerLine(arena, request, "{\"action\":\"cancel\"}"));
+    try testing.expectEqual(before, b.out.count());
+    try testing.expect((try b.call(3, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"ping\"}")).object.get("result") != null);
+}
+
+test "at the limit of requests in flight, the answers of the client still reach their requests" {
+    const saved = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = saved;
+    const b = try TestBridge.create(.{ .max_in_flight_requests = 1 });
+    defer b.destroy();
+    try b.initialize();
+    const arena = b.arena_state.allocator();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}");
+    const request = try b.out.waitMethod(arena, "elicitation/create", 1);
+    // The reader does not wait: a second request gets -32603 at once.
+    const before = b.out.count();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"add\",\"arguments\":{\"a\":1,\"b\":1}}}");
+    try testing.expectEqual(before + 1, b.out.count());
+    try expectError(try b.out.byId(arena, 3), -32603, "too_many_requests");
+    try b.send(try answerLine(arena, request, "{\"action\":\"accept\",\"content\":{\"name\":\"Bo\"}}"));
+    try testing.expectEqualStrings("Hello, Bo.", try resultText(try waitResponse(&b.out, arena, 2)));
+
+    // A cancellation of the client also reaches its request at the limit.
+    try b.waitIdle();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}");
+    const second = try b.out.waitMethod(arena, "elicitation/create", 2);
+    try testing.expectEqualStrings("b-2", second.object.get("id").?.string);
+    const count = b.out.count();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"add\",\"arguments\":{\"a\":1,\"b\":1}}}");
+    try testing.expectEqual(count + 1, b.out.count());
+    try expectError(try b.out.byId(arena, 5), -32603, "too_many_requests");
+    try b.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":4,\"reason\":\"stop\"}}");
+    const cancelled = try b.out.waitMethod(arena, "notifications/cancelled", 1);
+    try testing.expectEqualStrings("b-2", cancelled.object.get("params").?.object.get("requestId").?.string);
+    try b.waitIdle();
+    try testing.expectError(error.TestFrameMissing, b.out.byId(arena, 4));
+    try testing.expectEqual(@as(usize, 1), (try b.out.withMethod(arena, "notifications/cancelled")).len);
+    try testing.expectEqual(@as(usize, 0), b.frontend.pendingCount());
+    try testing.expectEqual(@as(usize, 0), b.frontend.inFlightCount());
+}
+
+test "the bridge cancels only the requests to the client that went out" {
+    const saved = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = saved;
+    const b = try TestBridge.create(.{});
+    defer b.destroy();
+    try b.initialize();
+    const before = b.out.count();
+    const slot = try b.frontend.newSlot();
+    defer b.frontend.destroySlot(slot);
+    slot.id = .{ .integer = 9 };
+    slot.method = "tools/call";
+    const arena = slot.arena.allocator();
+    const questions = [_]input.Question{ .{ .method = "roots/list", .params = null }, .{ .method = "roots/list", .params = null } };
+    var answers: [questions.len]input.Answer = undefined;
+    // The original request has its response, as after the loss of the upstream server. Thus
+    // the requests do not go out, and at the end of the time limit no cancellation goes out.
+    slot.answered = true;
+    try testing.expectError(error.Timeout, askClient(slot, arena, &questions, &answers, .fromMilliseconds(50)));
+    // A canceled request sends nothing.
+    slot.answered = false;
+    slot.token.cancel(testing.io, "stop");
+    try testing.expectError(error.Canceled, askClient(slot, arena, &questions, &answers, .fromSeconds(5)));
+    try testing.expectEqual(before, b.out.count());
+    try testing.expectEqual(@as(usize, 0), b.frontend.pendingCount());
+}
+
+test "the loss of the upstream server while a request of the bridge waits for the client" {
+    const b = try TestBridge.create(.{});
+    defer b.destroy();
+    try b.initialize();
+    const arena = b.arena_state.allocator();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}");
+    _ = try b.out.waitMethod(arena, "elicitation/create", 1);
+    b.frontend.failInFlight();
+    try b.waitIdle();
+    try expectError(try b.out.byId(arena, 2), -32603, "upstream_exited");
+    // The cancellation of the request of the bridge tells the true reason.
+    const cancelled = try b.out.withMethod(arena, "notifications/cancelled");
+    try testing.expectEqual(@as(usize, 1), cancelled.len);
+    const params = cancelled[0].object.get("params").?;
+    try testing.expectEqualStrings("b-1", params.object.get("requestId").?.string);
+    try testing.expectEqualStrings(upstream_exit_reason, params.object.get("reason").?.string);
+    try testing.expectEqual(@as(usize, 0), b.frontend.pendingCount());
+}
+
+test "the end of the input stops a request that waits for the client" {
+    const b = try TestBridge.create(.{});
+    defer b.destroy();
+    try b.initialize();
+    const arena = b.arena_state.allocator();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}");
+    _ = try b.out.waitMethod(arena, "elicitation/create", 1);
+    const started = Io.Clock.Timestamp.now(testing.io, .awake);
+    b.frontend.shutdown();
+    // The task wakes at once, much earlier than `shutdown_grace`.
+    try testing.expect(started.durationTo(Io.Clock.Timestamp.now(testing.io, .awake)).raw.toMilliseconds() < 1000);
+    try testing.expectEqual(@as(usize, 0), b.frontend.inFlightCount());
+    try testing.expectEqual(@as(usize, 0), b.frontend.pendingCount());
+    try testing.expectError(error.TestFrameMissing, b.out.byId(arena, 2));
+}
+
+test "answers of the client without a request, and an answer that is not valid" {
+    const b = try TestBridge.create(.{});
+    defer b.destroy();
+    try b.initialize();
+    const arena = b.arena_state.allocator();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}");
+    _ = try b.out.waitMethod(arena, "elicitation/create", 1);
+    // An unknown id, a numeric id and an error without an id: the bridge drops them, and the
+    // request still waits.
+    const before = b.out.count();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":\"b-99\",\"result\":{\"action\":\"accept\"}}");
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"action\":\"accept\"}}");
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32700,\"message\":\"Parse error\"}}");
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":null,\"result\":{\"action\":\"accept\"}}");
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":1.5,\"result\":{\"action\":\"accept\"}}");
+    try testing.expectEqual(before, b.out.count());
+    try testing.expectEqual(@as(usize, 1), b.frontend.pendingCount());
+    // An answer with a lone surrogate, which std.json refuses. The id resolves the request
+    // as an error, thus the elicitation gets cancel upstream.
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":\"b-1\",\"result\":{\"action\":\"accept\",\"content\":{\"name\":\"\\ud800\"}}}");
+    try testing.expectEqualStrings("action: cancel", try resultText(try waitResponse(&b.out, arena, 2)));
+    // A second answer for the same id gets nothing.
+    const after = b.out.count();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":\"b-1\",\"result\":{\"action\":\"accept\"}}");
+    try testing.expectEqual(after, b.out.count());
+}
+
+test "an error of the client: elicitation gives cancel, sampling fails the original request" {
+    const saved = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = saved;
+    const b = try TestBridge.create(.{});
+    defer b.destroy();
+    try b.initialize();
+    const arena = b.arena_state.allocator();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}");
+    const form = try b.out.waitMethod(arena, "elicitation/create", 1);
+    try b.send(try errorLine(arena, form, "{\"code\":-32603,\"message\":\"The form failed.\"}"));
+    try testing.expectEqualStrings("action: cancel", try resultText(try waitResponse(&b.out, arena, 2)));
+
+    // VS Code refuses a sampling request with -32000. The original request gets that error.
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"sample\"}}");
+    const sample = try b.out.waitMethod(arena, "sampling/createMessage", 1);
+    try testing.expectEqualStrings("Say hello", sample.object.get("params").?.object.get("messages").?.array.items[0].object.get("content").?.object.get("text").?.string);
+    try b.send(try errorLine(arena, sample, "{\"code\":-32000,\"message\":\"The user refused the request.\",\"data\":{\"x\":1}}"));
+    const refused = try waitResponse(&b.out, arena, 3);
+    const err = refused.object.get("error").?;
+    try testing.expectEqual(@as(i64, -32000), err.object.get("code").?.integer);
+    try testing.expectEqualStrings("The user refused the request.", err.object.get("message").?.string);
+    try testing.expectEqual(@as(i64, 1), err.object.get("data").?.object.get("x").?.integer);
+
+    // A sampling answer goes upstream.
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"sample\"}}");
+    const again = try b.out.waitMethod(arena, "sampling/createMessage", 2);
+    try b.send(try answerLine(arena, again, "{\"role\":\"assistant\",\"content\":{\"type\":\"text\",\"text\":\"Hello!\"},\"model\":\"m\"}"));
+    try testing.expectEqualStrings("model: Hello!", try resultText(try waitResponse(&b.out, arena, 4)));
+}
+
+test "roots: only file URIs go upstream" {
+    const b = try TestBridge.create(.{});
+    defer b.destroy();
+    try b.initialize();
+    const arena = b.arena_state.allocator();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"roots\"}}");
+    const request = try b.out.waitMethod(arena, "roots/list", 1);
+    try b.send(try answerLine(arena, request, "{\"roots\":[{\"uri\":\"file:///work\",\"name\":\"work\"},{\"uri\":\"vscode-vfs://github/x\"}]}"));
+    try testing.expectEqualStrings("roots: file:///work;", try resultText(try waitResponse(&b.out, arena, 2)));
+}
+
+test "a URL elicitation gets an elicitationId, and the complete notification comes before the result" {
+    const b = try TestBridge.create(.{});
+    defer b.destroy();
+    try b.initialize();
+    const arena = b.arena_state.allocator();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"url\"}}");
+    const request = try b.out.waitMethod(arena, "elicitation/create", 1);
+    const params = request.object.get("params").?;
+    try testing.expectEqualStrings("url", params.object.get("mode").?.string);
+    try testing.expectEqualStrings(test_url, params.object.get("url").?.string);
+    const elicitation_id = params.object.get("elicitationId").?.string;
+    try b.send(try answerLine(arena, request, "{\"action\":\"accept\"}"));
+    try testing.expectEqualStrings("url: accept", try resultText(try waitResponse(&b.out, arena, 2)));
+    const complete = try b.out.waitMethod(arena, "notifications/elicitation/complete", 1);
+    try testing.expectEqualStrings(elicitation_id, complete.object.get("params").?.object.get("elicitationId").?.string);
+    // The notification comes before the response.
+    b.out.lock.lockUncancelable(testing.io);
+    defer b.out.lock.unlock(testing.io);
+    const last = b.out.frames.items[b.out.frames.items.len - 1];
+    try testing.expect(std.mem.indexOf(u8, last, "\"id\":2") != null);
+}
+
+test "a second round with the same accepted URL gets the Continue form" {
+    const b = try TestBridge.create(.{});
+    defer b.destroy();
+    try b.initialize();
+    const arena = b.arena_state.allocator();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"url_twice\"}}");
+    const first = try b.out.waitMethod(arena, "elicitation/create", 1);
+    try testing.expectEqualStrings("url", first.object.get("params").?.object.get("mode").?.string);
+    try b.send(try answerLine(arena, first, "{\"action\":\"accept\"}"));
+    const second = try b.out.waitMethod(arena, "elicitation/create", 2);
+    const form = second.object.get("params").?;
+    try testing.expectEqualStrings("form", form.object.get("mode").?.string);
+    try testing.expect(form.object.get("url") == null);
+    try testing.expect(form.object.get("requestedSchema").?.object.get("properties").?.object.get(input.continue_property) != null);
+    // No complete notification while the server asks for the URL.
+    try testing.expectEqual(@as(usize, 0), (try b.out.withMethod(arena, "notifications/elicitation/complete")).len);
+    try b.send(try answerLine(arena, second, "{\"action\":\"accept\",\"content\":{\"continue\":\"Continue\"}}"));
+    try testing.expectEqualStrings("url twice: accept", try resultText(try waitResponse(&b.out, arena, 2)));
+    try testing.expectEqual(@as(usize, 1), (try b.out.withMethod(arena, "notifications/elicitation/complete")).len);
+}
+
+test "the client does not answer in time" {
+    const saved = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = saved;
+    const b = try TestBridge.create(.{ .timeouts = .{ .input = .fromMilliseconds(200) } });
+    defer b.destroy();
+    try b.initialize();
+    const arena = b.arena_state.allocator();
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}");
+    const request = try b.out.waitMethod(arena, "elicitation/create", 1);
+    try expectError(try waitResponse(&b.out, arena, 2), -32603, "input_timeout");
+    const cancelled = try b.out.waitMethod(arena, "notifications/cancelled", 1);
+    try testing.expectEqualStrings("b-1", cancelled.object.get("params").?.object.get("requestId").?.string);
+    // The late answer gets nothing.
+    try b.waitIdle();
+    const before = b.out.count();
+    try b.send(try answerLine(arena, request, "{\"action\":\"cancel\"}"));
+    try testing.expectEqual(before, b.out.count());
+}
+
+/// An `InputRequiredResult` of a scripted server with a form and a request state.
+const scripted_form =
+    \\{"resultType":"input_required","inputRequests":{"name":{"method":"elicitation/create","params":{"message":"Name?","requestedSchema":{"type":"object","properties":{"name":{"type":"string"}}}}}},"requestState":"sealed-1"}
+;
+const scripted_refusal =
+    \\error:{"code":-32602,"message":"Invalid or expired requestState","data":{"reason":"invalid_request_state"}}
+;
+
+test "a refused requestState gives an isError result for tools/call and an error for prompts/get" {
+    const saved = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = saved;
+    const b = try ScriptBridge.create(&.{ scripted_form, scripted_refusal, scripted_form, scripted_refusal }, .{});
+    defer b.destroy();
+    const arena = b.arena();
+    try b.frontend.receive("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"t\"}}");
+    const first = try b.out.waitMethod(arena, "elicitation/create", 1);
+    try b.frontend.receive(try answerLine(arena, first, "{\"action\":\"accept\",\"content\":{\"name\":\"Ada\"}}"));
+    const tool = (try waitResponse(&b.out, arena, 2)).object.get("result").?;
+    try testing.expect(tool.object.get("isError").?.bool);
+    const text = tool.object.get("content").?.array.items[0].object.get("text").?.string;
+    try testing.expect(std.mem.indexOf(u8, text, "Invalid or expired requestState") != null);
+    try testing.expect(std.mem.endsWith(u8, text, "Run the tool again."));
+
+    try b.frontend.receive("{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"prompts/get\",\"params\":{\"name\":\"p\"}}");
+    const second = try b.out.waitMethod(arena, "elicitation/create", 2);
+    try b.frontend.receive(try answerLine(arena, second, "{\"action\":\"decline\"}"));
+    const err = (try waitResponse(&b.out, arena, 3)).object.get("error").?;
+    try testing.expectEqual(@as(i64, -32602), err.object.get("code").?.integer);
+    try testing.expect(std.mem.endsWith(u8, err.object.get("message").?.string, "Send the request again."));
+    try testing.expectEqualStrings("invalid_request_state", err.object.get("data").?.object.get("reason").?.string);
+    try testing.expectEqual(@as(usize, 4), b.script.count());
+}
+
+test "the rounds stop at the limit of the upstream client" {
+    const saved = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = saved;
+    const state_only = "{\"resultType\":\"input_required\",\"requestState\":\"again\"}";
+    const max = (mcp.Limits{}).mrtr_max_rounds_client;
+    const script = [_][]const u8{state_only} ** (max + 2);
+    const b = try ScriptBridge.create(&script, .{});
+    defer b.destroy();
+    const arena = b.arena();
+    try b.frontend.receive("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"t\"}}");
+    try expectError(try waitResponse(&b.out, arena, 2), -32603, "too_many_rounds");
+    try testing.expectEqual(@as(usize, max), b.script.count());
+}
+
+test "a round with more input requests than the limit sends nothing to the client" {
+    const saved = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = saved;
+    const many = "{\"resultType\":\"input_required\",\"inputRequests\":{\"a\":{\"method\":\"roots/list\"},\"b\":{\"method\":\"roots/list\"},\"c\":{\"method\":\"roots/list\"}}}";
+    const b = try ScriptBridge.create(&.{many}, .{ .max_input_requests_per_round = 2 });
+    defer b.destroy();
+    const arena = b.arena();
+    try b.frontend.receive("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"t\"}}");
+    try expectError(try waitResponse(&b.out, arena, 2), -32603, "too_many_input_requests");
+    try testing.expectEqual(@as(usize, 0), (try b.out.withMethod(arena, "roots/list")).len);
 }
 
 test "progress goes to the token of the client, and only with a token" {

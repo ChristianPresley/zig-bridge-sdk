@@ -23,6 +23,24 @@ fn input(smith: *Smith, buf: *[max_input]u8, hash: u32) []u8 {
     return buf[0..n];
 }
 
+/// The corpus of a target that reads one slice with `input`. `Smith` reads the length of a
+/// slice as a 32-bit little-endian integer before its bytes. Thus each entry gets its length
+/// as a prefix. Without the prefix, `Smith` reads the first four bytes of the entry as the
+/// length.
+fn corpus(comptime entries: []const []const u8) []const []const u8 {
+    const out = comptime out: {
+        var list: [entries.len][]const u8 = undefined;
+        for (entries, &list) |entry, *item| {
+            var prefix: [4]u8 = undefined;
+            std.mem.writeInt(u32, &prefix, entry.len, .little);
+            const prefixed = prefix ++ entry[0..entry.len].*;
+            item.* = &prefixed;
+        }
+        break :out list;
+    };
+    return &out;
+}
+
 // ---------------------------------------------------------------------------------------------
 // The parsers of the legacy requests
 // ---------------------------------------------------------------------------------------------
@@ -38,17 +56,27 @@ fn legacyParams(_: void, smith: *Smith) anyerror!void {
     const params: ?Value = mcp.json.parseTree(arena, bytes) catch null;
     _ = legacy.hasModernMeta(params);
     if (legacy.parseInitializeParams(arena, params)) |p| {
-        // The parsed capabilities go upstream. The mask of the bridge never adds a kind.
+        // The parsed capabilities go upstream. The bridge never adds a kind or a member of
+        // sampling that the client did not declare.
         const caps = try translate.upstreamCapabilities(arena, p.capabilities, .{});
-        try std.testing.expect(caps.sampling == null and caps.elicitation == null and caps.roots == null);
-        _ = try translate.upstreamCapabilities(arena, p.capabilities, .{ .sampling = true, .elicitation = true, .roots = true });
+        const declared: ?Value = if (p.capabilities == .object) p.capabilities else null;
+        const sampling: ?Value = if (declared) |d| d.object.get("sampling") else null;
+        if (sampling == null) try std.testing.expect(caps.sampling == null);
+        if (caps.sampling) |s| {
+            if (s.tools != null) try std.testing.expect(mcp.json.hasKey(sampling.?, "tools"));
+            if (s.context != null) try std.testing.expect(mcp.json.hasKey(sampling.?, "context"));
+        }
+        if (declared == null or declared.?.object.get("elicitation") == null) try std.testing.expect(caps.elicitation == null);
+        if (declared == null or declared.?.object.get("roots") == null) try std.testing.expect(caps.roots == null);
+        const none = try translate.upstreamCapabilities(arena, p.capabilities, .{ .sampling = false, .elicitation = false, .roots = false });
+        try std.testing.expect(none.sampling == null and none.elicitation == null and none.roots == null);
     } else |_| {}
     _ = legacy.parseSetLevelParams(arena, params) catch {};
     _ = legacy.parseCancelledParams(arena, params) catch {};
 }
 
 test "fuzz: the parsers of the legacy requests" {
-    try std.testing.fuzz({}, legacyParams, .{ .corpus = &.{
+    try std.testing.fuzz({}, legacyParams, .{ .corpus = corpus(&.{
         \\{"protocolVersion":"2025-11-25","capabilities":{"roots":{"listChanged":true},"sampling":{},"elicitation":{"form":{},"url":{}},"tasks":{"list":{}},"extensions":{"io.modelcontextprotocol/ui":{}}},"clientInfo":{"name":"Visual Studio Code","version":"1.140.0"}}
         ,
         \\{"level":"debug"}
@@ -58,7 +86,7 @@ test "fuzz: the parsers of the legacy requests" {
         \\{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28"}}
         ,
         "tools/call",
-    } });
+    }) });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -102,7 +130,7 @@ fn translateValues(_: void, smith: *Smith) anyerror!void {
 }
 
 test "fuzz: the translation of results" {
-    try std.testing.fuzz({}, translateValues, .{ .corpus = &.{
+    try std.testing.fuzz({}, translateValues, .{ .corpus = corpus(&.{
         \\{"resultType":"complete","ttlMs":5,"tools":[{"name":"t","inputSchema":{"type":"object","properties":{"a":{"type":"array"},"b":{"type":"array","prefixItems":[{}],"items":false}}}}],"nextCursor":null,"_meta":{"io.modelcontextprotocol/serverInfo":{"name":"s","version":"1"}}}
         ,
         \\{"supportedVersions":["2026-07-28"],"capabilities":{"tools":{"listChanged":true},"resources":{"subscribe":true},"logging":{},"extensions":{"io.modelcontextprotocol/tasks":{}}},"instructions":"x"}
@@ -112,7 +140,66 @@ test "fuzz: the translation of results" {
         \\{"resultType":"input_required","inputRequests":{},"requestState":"s"}
         ,
         "[]",
-    } });
+    }) });
+}
+
+// ---------------------------------------------------------------------------------------------
+// The input requests
+// ---------------------------------------------------------------------------------------------
+
+const inputs = bridge.input;
+
+/// The bytes are an input request, an answer of the client and a URL. The checks never send a
+/// `task`, an accepted URL never gives content upstream, and a failure is always -32603 or an
+/// error of the client.
+fn inputValues(_: void, smith: *Smith) anyerror!void {
+    var buf: [max_input]u8 = undefined;
+    const bytes = input(smith, &buf, 0x3005);
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // A web browser reads a backslash as the end of the host. Thus an allowed URL has none.
+    if (inputs.urlAllowed(bytes)) try std.testing.expect(std.mem.indexOfScalar(u8, bytes, '\\') == null);
+    const value = mcp.json.parseTree(arena, bytes) catch return;
+    const caps = try translate.upstreamCapabilities(arena, try mcp.json.parseTree(arena,
+        \\{"roots":{},"sampling":{},"elicitation":{"form":{},"url":{}}}
+    ), .{});
+    _ = inputs.asksForUrl(value, "https://example.com/");
+    _ = try mcp.json.writeAlloc(arena, try inputs.continueAnswer(arena, .{ .result = value }));
+    _ = try mcp.json.writeAlloc(arena, try inputs.retryParams(arena, value, .{ .input_responses = value, .request_state = "s" }));
+    const checked = switch (try inputs.check(arena, caps, "k", value, .{})) {
+        .fail => |e| return std.testing.expectEqual(@as(i64, -32603), e.code),
+        .ok => |c| c,
+    };
+    if (checked.params) |p| try std.testing.expect(p.object.get("task") == null);
+    const answers = [_]inputs.Answer{ .{ .result = value }, .bad_line, .{ .rpc_error = .{ .code = -32000, .message = "refused" } } };
+    for (answers) |answer| switch (try inputs.shapeAnswer(arena, "k", &checked, answer)) {
+        .fail => |e| try std.testing.expect(e.code == -32603 or e.code == -32000),
+        .value => |v| {
+            if (checked.kind == .elicitation_url) try std.testing.expect(v.object.get("content") == null);
+            _ = try mcp.json.writeAlloc(arena, v);
+        },
+    };
+}
+
+test "fuzz: the checks of the input requests and of the answers" {
+    try std.testing.fuzz({}, inputValues, .{
+        .corpus = corpus(&.{
+            \\{"method":"elicitation/create","params":{"mode":"form","message":"m","requestedSchema":{"type":"object","properties":{"a":{"type":"string"},"b":{"type":"integer","minimum":0},"c":{"type":"boolean"},"d":{"type":"string","enum":["x","y"]}},"required":["a"]}},"action":"accept","content":{"a":"v"}}
+            ,
+            \\{"method":"elicitation/create","params":{"mode":"url","message":"m","url":"https://example.com/"},"action":"accept","content":{"x":1}}
+            ,
+            \\{"method":"sampling/createMessage","params":{"messages":[{"role":"user","content":{"type":"text","text":"t"}}],"maxTokens":5,"tools":[]},"role":"assistant","content":{"type":"text","text":"t"},"model":"m"}
+            ,
+            \\{"method":"roots/list","task":{},"roots":[{"uri":"file:///a"},{"uri":"x:/b"}]}
+            ,
+            "http://[::ffff:127.0.0.1]:80/",
+            "file://localhost/etc/passwd",
+            // A web browser reads the host evil.com.
+            "http://evil.com\\@localhost/",
+            "http://evil.com\\@127.0.0.1/",
+        }),
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -153,13 +240,13 @@ fn lineReader(_: void, smith: *Smith) anyerror!void {
 
 test "fuzz: the line reader and the id recovery" {
     try std.testing.fuzz({}, lineReader, .{
-        .corpus = &.{
+        .corpus = corpus(&.{
             "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\",\"params\":{\"x\":\"" ++ "y" ** 80 ++ "\"}}\n{\"id\":\"b-1\"}\r\n\n",
             "{\"params\":{\"id\":5},\"id\":\"a\\\"b\"}\n\xff\xfe\nlast",
             "{\"id\":123456789012345678901234567890",
             // The order of the members of the TypeScript SDK 1.x: the id comes last.
             "{\"method\":\"tools/call\",\"params\":{\"x\":\"" ++ "y" ** 80 ++ "\"},\"jsonrpc\":\"2.0\",\"id\":7}\r\n",
-        },
+        }),
     });
 }
 
@@ -167,9 +254,10 @@ test "fuzz: the line reader and the id recovery" {
 // The front end
 // ---------------------------------------------------------------------------------------------
 
-/// The `initialize` request of the front end target.
+/// The `initialize` request of the front end target. The client declares the form mode, thus
+/// the tool `ask` sends its form to the client.
 const initialize_line =
-    \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"fuzz","version":"1"}}}
+    \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{"form":{}}},"clientInfo":{"name":"fuzz","version":"1"}}}
 ;
 
 /// The limits of the front end target. They are small, thus the target reaches the errors.
@@ -179,7 +267,7 @@ const fuzz_options: Frontend.Options = .{
     .max_in_flight_requests = 4,
     .shutdown_grace = .fromSeconds(2),
     .discover_timeout = .fromSeconds(5),
-    .timeouts = .{ .list = .fromSeconds(5), .read = .fromSeconds(5), .call = .fromSeconds(5) },
+    .timeouts = .{ .list = .fromSeconds(5), .read = .fromSeconds(5), .call = .fromSeconds(5), .input = .fromSeconds(5) },
 };
 
 /// Collects the frames of the front end.
@@ -211,6 +299,30 @@ const EchoArgs = struct { text: []const u8 };
 fn echo(ctx: *mcp.RequestContext, args: EchoArgs) anyerror!mcp.Outcome(mcp.CallToolResult) {
     try ctx.checkCancel();
     return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "{s}", .{args.text}) };
+}
+
+/// Ask for a name in a form, then send the action and the name back. The bridge sends the
+/// form to the client as a request with a `b-` id, thus the lines of the client can answer
+/// it.
+fn ask(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    _ = args;
+    if (try ctx.elicitResponse("name")) |a| {
+        const name = if (a.content) |c| mcp.json.getString(c, "name") orelse "nobody" else "nobody";
+        return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "{t}: {s}", .{ a.action, name }) };
+    }
+    var ir: mcp.InputRequired = .init(ctx.arena);
+    try ir.elicitForm("name", "Name?", try mcp.InputRequired.stringSchema(ctx.arena, "name", null, true));
+    return .{ .input_required = ir };
+}
+
+/// Wait until each request in flight waits for the answers of the client, at most one
+/// second. Then the requests of the bridge for the last line are in the pending table, and
+/// the next line of the client can answer them.
+fn settle(io: Io, frontend: *Frontend) Io.Cancelable!void {
+    var waits: usize = 0;
+    while (frontend.inFlightCount() > frontend.waitingForClientCount() and waits < 1000) : (waits += 1) {
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
 }
 
 /// The JSON text of an id. Equal ids have equal texts.
@@ -251,9 +363,13 @@ fn bump(arena: Allocator, counts: *std.StringHashMapUnmanaged(usize), key: []con
 /// stop of the front end, the target examines the frames:
 ///
 /// - Each frame is one JSON-RPC message.
-/// - The bridge sends no request.
+/// - The only request of the bridge is the form of the tool `ask`, with a `b-` id.
+/// - The bridge cancels only a request that it sent before.
 /// - An id gets no more responses than requests with that id. Thus a response of the client,
 ///   for example to a `b-` id, gets no frame.
+///
+/// After each line, the target waits until each request in flight waits for the client
+/// (`settle`). Thus an answer of the client can reach the pending table.
 fn frontendLines(_: void, smith: *Smith) anyerror!void {
     var buf: [max_input]u8 = undefined;
     const bytes = input(smith, &buf, 0x3004);
@@ -277,6 +393,7 @@ fn frontendLines(_: void, smith: *Smith) anyerror!void {
     server.* = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "fuzz-upstream", .version = "1.0.0" } });
     defer server.deinit();
     try server.addTool(.{ .name = "echo", .description = "Send the text back" }, echo);
+    try server.addToolJson(.{ .name = "ask", .description = "Ask for a name" }, ask);
     const upstream = try Upstream.init(io, gpa, .{ .memory = server });
     defer upstream.deinit();
     var frames: Frames = .{ .io = io, .gpa = gpa };
@@ -302,10 +419,13 @@ fn frontendLines(_: void, smith: *Smith) anyerror!void {
             if (line.len == 0) continue;
             try frontend.receive(line);
             if (try expectedId(arena, line)) |id| try bump(arena, &requests, try idKey(arena, id));
+            try settle(io, &frontend);
         }
     }
 
     var responses: std.StringHashMapUnmanaged(usize) = .empty;
+    // The ids of the requests of the bridge, in the order of the frames.
+    var asked: std.StringHashMapUnmanaged(void) = .empty;
     for (frames.list.items) |frame| {
         try std.testing.expect(std.mem.indexOfAny(u8, frame, "\r\n") == null);
         const msg = mcp.jsonrpc.Message.parse(arena, frame) catch |e| {
@@ -313,8 +433,23 @@ fn frontendLines(_: void, smith: *Smith) anyerror!void {
             return e;
         };
         const id: ?mcp.RequestId = switch (msg) {
-            .request => return error.TestBridgeSentRequest,
+            .request => |r| {
+                if (r.id != .string or !std.mem.startsWith(u8, r.id.string, profile.request_id_prefix)) return error.TestBridgeRequestId;
+                try std.testing.expectEqualStrings("elicitation/create", r.method);
+                const entry = try asked.getOrPut(arena, r.id.string);
+                if (entry.found_existing) return error.TestBridgeRequestIdTwice;
+                continue;
+            },
             .notification => |n| {
+                if (std.mem.eql(u8, n.method, "notifications/cancelled")) {
+                    const params = n.params orelse return error.TestCancelWithoutParams;
+                    const request_id = mcp.json.getString(params, "requestId") orelse return error.TestCancelWithoutStringId;
+                    if (!asked.contains(request_id)) {
+                        std.debug.print("\nthe bridge canceled a request that it did not send: {s}\n", .{frame});
+                        return error.TestCancelOfUnsentRequest;
+                    }
+                    continue;
+                }
                 try std.testing.expectEqualStrings("notifications/progress", n.method);
                 continue;
             },
@@ -333,7 +468,7 @@ fn frontendLines(_: void, smith: *Smith) anyerror!void {
 
 test "fuzz: the lines of the client through the front end" {
     try std.testing.fuzz({}, frontendLines, .{
-        .corpus = &.{
+        .corpus = corpus(&.{
             "\x01{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n" ++
                 "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{\"_meta\":{\"progressToken\":0}}}\n" ++
                 "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"a\"}}}\n" ++
@@ -351,6 +486,17 @@ test "fuzz: the lines of the client through the front end" {
             "\x00{\"jsonrpc\":\"2.0\",\"id\":\"\xb3\xe3\x1c\xb6rpc\",\"method\":\"x\"}\n{\"id\":\"a\x01\"}",
             // A line that is too long, with the id last as the TypeScript SDK 1.x writes it.
             "\x01{\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"" ++ "a" ** 300 ++ "\"}},\"jsonrpc\":\"2.0\",\"id\":9}",
-        },
+            // The pending table: an answer, a second answer, an answer with a lone surrogate,
+            // a late answer after a cancellation, and a form without an answer at the end.
+            "\x01{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}\n" ++
+                "{\"jsonrpc\":\"2.0\",\"id\":\"b-1\",\"result\":{\"action\":\"accept\",\"content\":{\"name\":\"Ada\"}}}\n" ++
+                "{\"jsonrpc\":\"2.0\",\"id\":\"b-1\",\"result\":{\"action\":\"accept\",\"content\":{\"name\":\"Bo\"}}}\n" ++
+                "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}\n" ++
+                "{\"jsonrpc\":\"2.0\",\"id\":\"b-2\",\"result\":{\"action\":\"accept\",\"content\":{\"name\":\"\\ud800\"}}}\n" ++
+                "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}\n" ++
+                "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/cancelled\",\"params\":{\"requestId\":4}}\n" ++
+                "{\"jsonrpc\":\"2.0\",\"id\":\"b-3\",\"result\":{\"action\":\"cancel\"}}\n" ++
+                "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}",
+        }),
     });
 }

@@ -25,6 +25,9 @@ pub const log = @import("bridge/log.zig");
 pub const Frontend = @import("bridge/Frontend.zig");
 /// The upstream server of revision 2026-07-28 and the client of zig-sdk for it.
 pub const Upstream = @import("bridge/Upstream.zig");
+/// The input requests of the upstream server: the checks, the rounds and the answers of the
+/// client.
+pub const input = @import("bridge/input.zig");
 
 test {
     _ = legacy;
@@ -32,6 +35,7 @@ test {
     _ = log;
     _ = Frontend;
     _ = Upstream;
+    _ = input;
     _ = @import("bridge/fuzz_test.zig");
 }
 

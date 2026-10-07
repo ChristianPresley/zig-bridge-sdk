@@ -193,8 +193,10 @@ pub fn discover(self: *Upstream, arena: Allocator, opts: RequestOpts) RequestErr
 }
 
 /// Send a request and return the raw result. The client does not answer an input request of
-/// the upstream server. It returns the `InputRequiredResult` as the result. `params` must be
-/// an object, and the client adds its own `_meta`.
+/// the upstream server. It returns the `InputRequiredResult` as the result, and the front end
+/// asks the client. Thus each call is one round. `params` must be an object, and the client
+/// adds its own `_meta`. For the next round, `params` has `inputResponses` and
+/// `requestState`.
 pub fn request(self: *Upstream, arena: Allocator, method: []const u8, params: Value, opts: RequestOpts) RequestError!Value {
     const conn = self.conn orelse return error.NotConnected;
     var options = requestOptions(opts);
@@ -217,6 +219,26 @@ fn requestOptions(opts: RequestOpts) mcp.Client.RequestOptions {
         .cache_mode = .bypass,
         .diagnostics = opts.diagnostics,
     };
+}
+
+/// The capabilities that the client declares to the upstream server, or null without a
+/// connection.
+pub fn clientCapabilities(self: *const Upstream) ?types.ClientCapabilities {
+    const conn = self.conn orelse return null;
+    return conn.client.options.capabilities;
+}
+
+/// The maximum number of rounds of one request: `mrtr_max_rounds_client` of the limits of the
+/// client.
+pub fn maxRounds(self: *const Upstream) u32 {
+    const conn = self.conn orelse return (mcp.Limits{}).mrtr_max_rounds_client;
+    return conn.client.options.limits.mrtr_max_rounds_client;
+}
+
+/// The limits of the schema validator of the client.
+pub fn schemaLimits(self: *const Upstream) mcp.Limits.Schema {
+    const conn = self.conn orelse return .{};
+    return conn.client.options.limits.schema;
 }
 
 /// True when the child process stopped its stdout. Then each request fails. The other

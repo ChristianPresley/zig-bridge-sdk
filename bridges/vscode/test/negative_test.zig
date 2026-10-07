@@ -142,7 +142,7 @@ const closed_message = "The upstream server process stopped. See the Output chan
 const transport_message = "The connection to the upstream server failed. See the Output channel of the server.";
 const invalid_message = "The upstream server sent a response that is not valid. See the Output channel of the server.";
 const rounds_message = "The upstream server asked for input too many times. See the Output channel of the server.";
-const input_message = "The upstream server needs input that this version of the bridge cannot ask for yet.";
+const undeclared_message = "The upstream server asked for input that the client did not declare.";
 
 const echo_params = "{\"name\":\"echo\",\"arguments\":{\"text\":\"a\"}}";
 
@@ -255,9 +255,16 @@ test "the results of a scripted upstream server lose the members of revision 202
     try testing.expectEqual(@as(usize, 1), meta.object.count());
     try testing.expect(meta.object.get("example.com/k") != null);
 
-    // An input request never goes to VS Code in this version.
-    tap.setScript(.{ .result = "{\"resultType\":\"input_required\",\"inputRequests\":{\"name\":{\"method\":\"elicitation/create\",\"params\":{\"mode\":\"form\",\"message\":\"Name?\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"]}}}},\"requestState\":\"s-1\"}" });
-    try h.expectError(try t.request(5, "tools/call", echo_params), -32603, input_message, "input_required");
+    // A server that does not obey the specification asks for sampling with tools. VS Code
+    // declares no sampling.tools, thus the bridge refuses the round, and VS Code gets no
+    // request of the round. Also the form before it does not go to VS Code.
+    tap.setScript(.{ .result = "{\"resultType\":\"input_required\",\"inputRequests\":{\"name\":{\"method\":\"elicitation/create\",\"params\":{\"mode\":\"form\",\"message\":\"Name?\",\"requestedSchema\":{\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"]}}}," ++
+        "\"plan\":{\"method\":\"sampling/createMessage\",\"params\":{\"messages\":[{\"role\":\"user\",\"content\":{\"type\":\"text\",\"text\":\"Plan\"}}],\"maxTokens\":50,\"tools\":[{\"name\":\"search\",\"inputSchema\":{\"type\":\"object\"}}]}}},\"requestState\":\"s-1\"}" });
+    const refused = try t.request(5, "tools/call", echo_params);
+    try h.expectError(refused, -32603, undeclared_message, "undeclared_input_request");
+    try testing.expectEqualStrings("input request 'plan': sampling with tools needs sampling.tools, and the client did not declare it", h.errorDetail(refused).?);
+    for (try t.parsedFrames()) |frame| try testing.expect(frame.object.get("method") == null);
+    try testing.expectEqual(@as(usize, 0), t.frontend.pendingCount());
 
     // Structured content that is not an object goes to VS Code unchanged, with a text copy.
     tap.setScript(.{ .result = "{\"resultType\":\"complete\",\"content\":[],\"structuredContent\":[1,2,3]}" });
