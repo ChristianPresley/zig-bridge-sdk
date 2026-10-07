@@ -4,3 +4,8 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+  # The pinned TypeScript SDK and Ajv of the interop job of CI.
+  - package-ecosystem: "npm"
+    directory: "/.github/interop"
+    schedule:
+      interval: "weekly"

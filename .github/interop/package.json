@@ -1,0 +1,12 @@
+{
+  "name": "zig-bridge-sdk-interop",
+  "version": "0.0.0",
+  "private": true,
+  "description": "The pinned npm packages of the interop job of CI. The job installs them with npm ci --ignore-scripts.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "ajv": "8.20.0"
+  }
+}

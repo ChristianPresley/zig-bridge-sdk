@@ -77,6 +77,28 @@ jobs:
       - uses: ./.github/actions/setup-zig
       - run: zig build -Dtarget=${{ matrix.target }}
 
+  # The legacy TypeScript SDK (MCP revision 2025-11-25) starts the bridge over stdio, like VS Code.
+  # The lockfile pins the npm tree, and npm ci runs no install scripts.
+  interop:
+    name: interop
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup-zig
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24.21.0
+      - run: npm ci --ignore-scripts --no-audit --no-fund --prefix .github/interop
+      - run: zig build -Doptimize=ReleaseSafe
+      - run: zig build fixture-server -Doptimize=ReleaseSafe
+      # With 150 more tools, tools/list has two pages (the page size of zig-sdk is 100).
+      - name: Connect the TypeScript SDK client to the bridge
+        run: >-
+          node .github/interop/legacy_stdio_client.mjs zig-out/bin/mcp-bridge-vscode --
+          zig-out/bin/bridge-fixture-server --many-tools 150
+
   # The stub of milestone M0. In milestone M5, the consumer also serves a server through the bridge.
   consumer:
     name: consumer
