@@ -16,8 +16,16 @@
 //! because VS Code reads JSON of all depths. Thus the schema rules of `translate` see each
 //! tool, and a deep schema does not make the whole `tools/list` fail.
 //!
-//! The upstream server sends no notification to the client in this version. The progress of a
-//! request goes to `RequestOpts.progress`. The client drops each other notification.
+//! The notifications of the upstream server go to these functions:
+//!
+//! - The progress of a request goes to `Callbacks.progress` of the request.
+//! - A log message goes to `Callbacks.log` of its request when the transport routes it to the
+//!   request. The memory link does that. On stdio, a log message has no progress token and no
+//!   subscription id, thus the reader task of the client gives it to `on_log`.
+//! - The events of a listen stream go to `ListenOpts.on_notification` of the stream.
+//!
+//! The client drops each other notification, also a `notifications/cancelled` of the upstream
+//! server.
 const Upstream = @This();
 
 const std = @import("std");
@@ -40,6 +48,11 @@ conn: ?*Connection = null,
 /// The process id of the child process on POSIX, or 0. Another thread can read it, thus it is
 /// atomic.
 child_pid: std.atomic.Value(i32) = .init(0),
+/// Receives the log messages of a stdio upstream server that the client cannot give to a
+/// request. Set it before `connect`. The function runs on the reader task of the client. It
+/// must only translate the message and write it, because the reader task reads no frame while
+/// the function runs.
+on_log: ?LogSink = null,
 
 /// The upstream server of a bridge.
 pub const Config = union(enum) {
@@ -86,22 +99,63 @@ pub const RequestOpts = struct {
     cancel: *CancelToken,
     /// The time limit of the request, with all its rounds. It must be finite.
     timeout: Io.Duration,
-    /// Receives each progress notification of the request. Null drops them.
-    progress: ?ProgressSink = null,
+    /// Receive the progress and the log messages of the request. Null drops them.
+    callbacks: ?Callbacks = null,
     /// Receives the JSON-RPC error of the upstream server after `error.Rpc`.
     diagnostics: ?*mcp.Client.Diagnostics = null,
     /// The id of the request of the client, for the debug log lines. The value must stay
     /// valid during the request.
     client_id: ?mcp.RequestId = null,
+    /// The log level of the client. The upstream server sends the log messages of the request
+    /// at this level and above. Null asks for no log messages.
+    log_level: ?types.LoggingLevel = null,
+    /// The `_meta` entries of the client for the upstream server, for example `traceparent`.
+    /// The client of zig-sdk refuses a key that `mcp.protocol.meta.validateKey` refuses and a
+    /// key of zig-sdk. The request then fails with `error.InvalidMeta`, and nothing goes out.
+    /// `translate.passMeta` removes these keys.
+    meta: ?std.json.ObjectMap = null,
 };
 
-/// Receives the progress notifications of one request. The client calls `call` in the task of
-/// the request, before the response. In each round of the request, the upstream server sends
-/// the progress with the id of that round as its token. Thus `call` gets the progress of all
-/// rounds of the request. The params are valid only during the call.
-pub const ProgressSink = struct {
+/// Receives the notifications of one request. The client calls the functions in the task of
+/// the request, before the response. The params are valid only during the call.
+pub const Callbacks = struct {
     context: *anyopaque,
-    call: *const fn (context: ?*anyopaque, params: types.ProgressNotificationParams) void,
+    /// Receives each progress notification. In each round of the request, the upstream server
+    /// sends the progress with the id of that round as its token. Thus the function gets the
+    /// progress of all rounds of the request. Null drops the progress.
+    progress: ?*const fn (context: ?*anyopaque, params: types.ProgressNotificationParams) void = null,
+    /// Receives each log message that the transport routes to the request. The memory link
+    /// routes each log message of a request. On stdio, `on_log` of the `Upstream` gets the log
+    /// messages. Null drops them.
+    log: ?*const fn (context: ?*anyopaque, params: types.LoggingMessageNotificationParams) void = null,
+};
+
+/// Receives the log messages of a stdio upstream server. The params are valid only during
+/// the call.
+pub const LogSink = struct {
+    context: *anyopaque,
+    call: *const fn (context: *anyopaque, params: types.LoggingMessageNotificationParams) void,
+};
+
+/// The settings of a listen stream (`listen`).
+pub const ListenOpts = struct {
+    /// The stream stops when this token fires. The client then sends `notifications/cancelled`
+    /// to the upstream server and returns `error.Canceled`.
+    cancel: *CancelToken,
+    /// Receives each notification of the stream, also the acknowledgment. On stdio, the
+    /// function runs on the reader task of the client, before the reader task reads the next
+    /// frame. Thus an event gets to the function before a response that the upstream server
+    /// wrote after the event. On the memory link, the function runs on the task that publishes
+    /// the event, and the server holds its locks. Thus the function must only translate the
+    /// notification and write it. It must not wait, and it must not send a request.
+    ///
+    /// `method` and `params` are valid only during the call.
+    on_notification: *const fn (context: ?*anyopaque, method: []const u8, params: ?Value) void,
+    context: *anyopaque,
+    /// The log level of the client, as for each request.
+    log_level: ?types.LoggingLevel = null,
+    /// Receives the JSON-RPC error of the upstream server after `error.Rpc`.
+    diagnostics: ?*mcp.Client.Diagnostics = null,
 };
 
 pub const ConnectError = error{
@@ -152,14 +206,17 @@ pub fn connect(self: *Upstream, info: types.Implementation, capabilities: types.
         .stdio => |s| {
             // The client never starts the child process again. When it stops, the bridge
             // answers the requests in flight and exits, and VS Code starts the bridge again.
-            // A notification that belongs to no request goes to `on_notification`. It is null,
-            // thus the client drops each such notification, also a `notifications/cancelled`
-            // of the upstream server.
+            // A notification without a progress token and without a subscription id goes to
+            // the `on_notification` spawn option. `onStdioNotification` gives only the log
+            // messages to `on_log`, and drops each other such notification, also a
+            // `notifications/cancelled` of the upstream server.
             const child = mcp.transport.stdio.Client.spawn(self.io, self.gpa, .{
                 .argv = s.argv,
                 .cwd = if (s.cwd) |p| .{ .path = p } else .inherit,
                 .limits = limits,
                 .max_restarts = 0,
+                .on_notification = onStdioNotification,
+                .userdata = self,
             }) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => {
@@ -186,7 +243,7 @@ pub fn connect(self: *Upstream, info: types.Implementation, capabilities: types.
 /// the shape of a `DiscoverResult`.
 pub fn discover(self: *Upstream, arena: Allocator, opts: RequestOpts) RequestError!Value {
     const conn = self.conn orelse return error.NotConnected;
-    try conn.tracer.register(opts);
+    try conn.tracer.register(opts.cancel, opts.client_id);
     defer conn.tracer.unregister(opts.cancel);
     const response = try conn.client.request(arena, .@"server/discover", .{ .object = .empty }, requestOptions(opts));
     return response.raw;
@@ -201,24 +258,76 @@ pub fn request(self: *Upstream, arena: Allocator, method: []const u8, params: Va
     const conn = self.conn orelse return error.NotConnected;
     var options = requestOptions(opts);
     options.allow_input_required = true;
-    try conn.tracer.register(opts);
+    try conn.tracer.register(opts.cancel, opts.client_id);
     defer conn.tracer.unregister(opts.cancel);
     const response = try conn.client.requestAs(arena, Value, method, params, options);
     return response.raw;
 }
 
 fn requestOptions(opts: RequestOpts) mcp.Client.RequestOptions {
+    const callbacks = opts.callbacks orelse Callbacks{ .context = undefined };
     return .{
         .timeout = opts.timeout,
         // A request has only its own limit. The default maximum of zig-sdk is shorter than the
         // limit of `tools/call`.
         .max_total_timeout = opts.timeout,
         .cancel = opts.cancel,
-        .on_progress = if (opts.progress) |p| p.call else null,
-        .userdata = if (opts.progress) |p| p.context else null,
+        .on_progress = callbacks.progress,
+        .on_log = callbacks.log,
+        .userdata = if (opts.callbacks) |c| c.context else null,
         .cache_mode = .bypass,
         .diagnostics = opts.diagnostics,
+        .log_level = opts.log_level,
+        .meta = opts.meta,
     };
+}
+
+/// Open a `subscriptions/listen` stream with the filter `notifications`, and return the raw
+/// result at the end of the stream. The upstream server ends a stream with a result, for
+/// example at its stop. The function returns `error.Canceled` after the cancellation of the
+/// stream.
+///
+/// The stream has no time limit, but its acknowledgment must arrive in
+/// `limits.listen_ack_timeout` (stdio). When the stream stops because the connection failed,
+/// the client opens it again at once, at most `limits.max_lost_stream_retries` times
+/// (`Retry.force`). Thus `on_notification` can get more than one acknowledgment in one call.
+/// The events can go to `on_notification` while the stream task waits. See `ListenOpts`.
+pub fn listen(self: *Upstream, arena: Allocator, notifications: Value, opts: ListenOpts) RequestError!Value {
+    const conn = self.conn orelse return error.NotConnected;
+    var params: std.json.ObjectMap = .empty;
+    try params.put(arena, "notifications", notifications);
+    try conn.tracer.register(opts.cancel, null);
+    defer conn.tracer.unregister(opts.cancel);
+    const response = try conn.client.requestAs(arena, Value, "subscriptions/listen", .{ .object = params }, .{
+        .cancel = opts.cancel,
+        .retry = .force,
+        .inline_notifications = true,
+        .on_notification = opts.on_notification,
+        .userdata = opts.context,
+        .log_level = opts.log_level,
+        .cache_mode = .bypass,
+        .diagnostics = opts.diagnostics,
+    });
+    return response.raw;
+}
+
+/// The `on_notification` spawn option of the stdio client. It runs on the reader task. It
+/// gives each valid log message to `on_log`, and drops each other notification.
+fn onStdioNotification(userdata: ?*anyopaque, method: []const u8, params: ?Value) void {
+    const self: *Upstream = @ptrCast(@alignCast(userdata.?));
+    if (!std.mem.eql(u8, method, "notifications/message")) {
+        log.debug("dropped the notification {s} of the upstream server: it belongs to no request", .{method});
+        return;
+    }
+    const sink = self.on_log orelse return;
+    var fallback = std.heap.stackFallback(4096, self.gpa);
+    var scratch: std.heap.ArenaAllocator = .init(fallback.get());
+    defer scratch.deinit();
+    const p = mcp.json.parseValue(types.LoggingMessageNotificationParams, scratch.allocator(), params orelse .null) catch {
+        log.debug("dropped a log message of the upstream server that is not valid", .{});
+        return;
+    };
+    sink.call(sink.context, p);
 }
 
 /// The capabilities that the client declares to the upstream server, or null without a
@@ -350,10 +459,10 @@ const Tracer = struct {
         }.vtable;
     }
 
-    fn register(self: *Tracer, opts: RequestOpts) Allocator.Error!void {
+    fn register(self: *Tracer, token: *const CancelToken, client_id: ?mcp.RequestId) Allocator.Error!void {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
-        try self.requests.append(self.gpa, .{ .token = opts.cancel, .client_id = opts.client_id });
+        try self.requests.append(self.gpa, .{ .token = token, .client_id = client_id });
     }
 
     fn unregister(self: *Tracer, token: *const CancelToken) void {
@@ -500,7 +609,7 @@ test "discover and a request through the memory transport" {
     const result = try upstream.request(arena, "tools/call", params, .{
         .cancel = &token,
         .timeout = .fromSeconds(5),
-        .progress = .{ .context = &recorder, .call = Recorder.record },
+        .callbacks = .{ .context = &recorder, .progress = Recorder.record },
     });
     try testing.expectEqual(@as(usize, 3), recorder.count);
     try testing.expectEqual(@as(f64, 3), recorder.values[2]);
@@ -564,14 +673,97 @@ test "reap gives the exit code of a child process that exits by itself" {
     try testing.expectEqual(@as(?std.process.Child.Term, null), upstream.reap());
 }
 
+test "the stdio callback gives only the valid log messages to on_log" {
+    const io = testing.io;
+    const argv = [_][]const u8{"unused"};
+    const upstream = try init(io, testing.allocator, .{ .stdio = .{ .argv = &argv } });
+    defer upstream.deinit();
+    const Recorder = struct {
+        levels: [4]types.LoggingLevel = undefined,
+        count: usize = 0,
+        fn record(context: *anyopaque, params: types.LoggingMessageNotificationParams) void {
+            const r: *@This() = @ptrCast(@alignCast(context));
+            if (r.count < r.levels.len) r.levels[r.count] = params.level;
+            r.count += 1;
+        }
+    };
+    var recorder: Recorder = .{};
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    // Without `on_log`, the callback drops the message.
+    onStdioNotification(upstream, "notifications/message", try mcp.json.parseTree(arena, "{\"level\":\"info\",\"data\":1}"));
+    upstream.on_log = .{ .context = &recorder, .call = Recorder.record };
+    onStdioNotification(upstream, "notifications/message", try mcp.json.parseTree(arena, "{\"level\":\"error\",\"logger\":\"db\",\"data\":{\"x\":1}}"));
+    // The cancellation of the upstream server at its stop, and other notifications that
+    // belong to no request.
+    onStdioNotification(upstream, "notifications/cancelled", try mcp.json.parseTree(arena, "{\"requestId\":2,\"reason\":\"server shutdown\"}"));
+    onStdioNotification(upstream, "notifications/tools/list_changed", null);
+    // A log message that is not valid.
+    onStdioNotification(upstream, "notifications/message", try mcp.json.parseTree(arena, "{\"level\":\"loud\",\"data\":1}"));
+    onStdioNotification(upstream, "notifications/message", null);
+    try testing.expectEqual(@as(usize, 1), recorder.count);
+    try testing.expectEqual(types.LoggingLevel.@"error", recorder.levels[0]);
+}
+
+test "a listen stream through the memory transport gets the acknowledgment and the events" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const server = try testServer(gpa, io);
+    defer destroyServer(server);
+    const upstream = try init(io, gpa, .{ .memory = server });
+    defer upstream.deinit();
+    try upstream.connect(.{ .name = "x", .version = "1" }, .{});
+    const Events = struct {
+        io: Io,
+        lock: Io.Mutex = .init,
+        acknowledged: std.atomic.Value(bool) = .init(false),
+        changes: usize = 0,
+        fn on(context: ?*anyopaque, method: []const u8, params: ?Value) void {
+            _ = params;
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (std.mem.eql(u8, method, "notifications/subscriptions/acknowledged")) return self.acknowledged.store(true, .release);
+            self.lock.lockUncancelable(self.io);
+            defer self.lock.unlock(self.io);
+            if (std.mem.eql(u8, method, "notifications/tools/list_changed")) self.changes += 1;
+        }
+        fn run(up: *Upstream, events: *@This(), token: *CancelToken, result: *RequestError!void) Io.Cancelable!void {
+            var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer arena_state.deinit();
+            const arena = arena_state.allocator();
+            const filter = mcp.json.parseTree(arena, "{\"toolsListChanged\":true}") catch unreachable;
+            if (up.listen(arena, filter, .{ .cancel = token, .on_notification = on, .context = events })) |_| {
+                result.* = {};
+            } else |e| result.* = e;
+        }
+    };
+    var events: Events = .{ .io = io };
+    var token: CancelToken = .{};
+    var result: RequestError!void = {};
+    var group: Io.Group = .init;
+    try group.concurrent(io, Events.run, .{ upstream, &events, &token, &result });
+    var i: usize = 0;
+    while (!events.acknowledged.load(.acquire)) : (i += 1) {
+        if (i > 5000) return error.TestTimeout;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    server.notifyToolsListChanged(io);
+    token.cancel(io, "test");
+    try group.await(io);
+    try testing.expectError(error.Canceled, result);
+    try testing.expectEqual(@as(usize, 1), events.changes);
+    // The tracer forgets the stream at its end.
+    try testing.expectEqual(@as(usize, 0), upstream.conn.?.tracer.requests.items.len);
+}
+
 test "the tracer counts the rounds of each request" {
     const io = testing.io;
     var tracer: Tracer = .{ .io = io, .gpa = testing.allocator, .inner = undefined };
     defer tracer.deinit();
     var a: CancelToken = .{};
     var b: CancelToken = .{};
-    try tracer.register(.{ .cancel = &a, .timeout = .fromSeconds(1), .client_id = .{ .integer = 7 } });
-    try tracer.register(.{ .cancel = &b, .timeout = .fromSeconds(1) });
+    try tracer.register(&a, .{ .integer = 7 });
+    try tracer.register(&b, null);
     _ = tracer.nextRound(&a);
     const id, const round = tracer.nextRound(&a);
     try testing.expectEqual(@as(i64, 7), id.?.integer);

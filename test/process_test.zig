@@ -98,7 +98,7 @@ test "a session gives one JSON-RPC message for each line, and the bridge stops a
     const exit = try b.finish(start);
     try expectExit(exit, 0);
     try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin while idle");
-    try testing.expectEqual(@as(usize, 3), try expectFrames(arena, b.out.items));
+    try testing.expectEqual(@as(usize, 3 + list_changes.len), try expectFrames(arena, b.out.items));
 }
 
 test "the bridge stops at the end of stdin during a slow tools/call, and the child process stops" {
@@ -137,7 +137,7 @@ test "the bridge stops at the end of stdin during a slow tools/call, and the chi
     try expectExit(exit, 0);
     try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin during a tools/call");
     // The responses of initialize, ping and add. A canceled request gets no response.
-    try testing.expectEqual(@as(usize, 3), try expectFrames(arena, b.out.items));
+    try testing.expectEqual(@as(usize, 3 + list_changes.len), try expectFrames(arena, b.out.items));
 }
 
 test "VS Code answers the form of a tool over the pipe, and the result of the tool has the answer" {
@@ -192,7 +192,7 @@ test "VS Code answers the form of a tool over the pipe, and the result of the to
     try expectExit(exit, 0);
     try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin after the answered forms");
     // The initialize result, and for each tool call the elicitation request and the result.
-    try testing.expectEqual(@as(usize, 5), try expectFrames(arena, b.out.items));
+    try testing.expectEqual(@as(usize, 5 + list_changes.len), try expectFrames(arena, b.out.items));
 }
 
 test "the bridge stops at the end of stdin while its requests to VS Code wait for answers" {
@@ -228,7 +228,7 @@ test "the bridge stops at the end of stdin while its requests to VS Code wait fo
     try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin with requests of the bridge");
     // The initialize result, the two requests of the bridge and their cancellations. The
     // canceled tools/call requests get no response.
-    try testing.expectEqual(@as(usize, 5), try expectFrames(arena, b.out.items));
+    try testing.expectEqual(@as(usize, 5 + list_changes.len), try expectFrames(arena, b.out.items));
     const frames = try sortFrames(arena, b.out.items);
     try expectStrings(&.{ "b-1", "b-2" }, frames.cancelled);
     try testing.expectEqual(@as(usize, 1), frames.responses.len);
@@ -265,7 +265,7 @@ test "a crash of the upstream server while a request of the bridge waits fails t
     try expectWithin(exit.elapsed, exit_bound, "the exit after the crash of the upstream server with a request of the bridge");
     // The initialize result, the elicitation request, the two errors and the cancellation of
     // the request of the bridge.
-    try testing.expectEqual(@as(usize, 5), try expectFrames(arena, b.out.items));
+    try testing.expectEqual(@as(usize, 5 + list_changes.len), try expectFrames(arena, b.out.items));
     const frames = try sortFrames(arena, b.out.items);
     try expectStrings(&.{"b-1"}, frames.cancelled);
     try expectStrings(&.{"the upstream server stopped"}, frames.cancel_reasons);
@@ -315,7 +315,7 @@ test "a crash of the upstream server fails the call in flight with -32603, and t
     const exit = try b.finish(start);
     try expectExit(exit, 1);
     try expectWithin(exit.elapsed, exit_bound, "the exit after the crash of the upstream server");
-    try testing.expectEqual(@as(usize, 2), try expectFrames(arena, b.out.items));
+    try testing.expectEqual(@as(usize, 2 + list_changes.len), try expectFrames(arena, b.out.items));
     // The bridge tells the reason on stderr.
     try expectStderr(b, crash_line);
 }
@@ -348,7 +348,7 @@ test "a crash of the upstream server while no request is in flight makes the bri
     const exit = try b.finish(start);
     try expectExit(exit, 1);
     try expectWithin(exit.elapsed, exit_bound, "the exit after the crash of the upstream server while idle");
-    try testing.expectEqual(@as(usize, 2), try expectFrames(arena, b.out.items));
+    try testing.expectEqual(@as(usize, 2 + list_changes.len), try expectFrames(arena, b.out.items));
     try expectStderr(b, crash_line);
 }
 
@@ -406,7 +406,7 @@ test "with --log-level debug, stdout has only JSON-RPC messages, and each stderr
     b.closeStdin();
     const exit = try b.finish(start);
     try expectExit(exit, 0);
-    try testing.expectEqual(@as(usize, 2), try expectFrames(arena, b.out.items));
+    try testing.expectEqual(@as(usize, 2 + list_changes.len), try expectFrames(arena, b.out.items));
 
     // The lines of the bridge have its tag. The fixture server writes to the same stderr with
     // its own tag. No other line is on stderr.
@@ -511,7 +511,17 @@ test "--version and --help write to stdout and exit with code 0" {
 // Helpers
 // ---------------------------------------------------------------------------------------------
 
+/// The list changes after the acknowledgment of the first listen stream, in their order. The
+/// fixture server declares the list changes of its tools, prompts and resources.
+const list_changes = [_][]const u8{
+    "notifications/tools/list_changed",
+    "notifications/prompts/list_changed",
+    "notifications/resources/list_changed",
+};
+
 /// Send `initialize` and `notifications/initialized`, and examine the `initialize` result.
+/// Then read the list changes after the acknowledgment of the first listen stream. Thus the
+/// number of frames of a test does not depend on the time of the acknowledgment.
 fn initialize(b: *Bridge, arena: Allocator) !void {
     b.watchdog.arm("initialize", exchange_limit);
     try b.send(vscode_initialize);
@@ -523,8 +533,10 @@ fn initialize(b: *Bridge, arena: Allocator) !void {
     try testing.expect(capabilities == .object);
     try testing.expect(capabilities.object.get("tools") != null);
     try testing.expect(capabilities.object.get("tasks") == null);
+    try testing.expect(capabilities.object.get("logging") != null);
     try testing.expect(result.object.get("resultType") == null);
     try b.send(initialized);
+    for (list_changes) |method| _ = try b.notification(arena, method);
 }
 
 /// The paths of the two executables.
@@ -710,6 +722,19 @@ const Bridge = struct {
             };
             if (msg_id) |i| if (i == .integer and i.integer == id) return msg;
             return fail("the bridge sent a message that is not the response {d}: {s}", .{ id, line });
+        }
+    }
+
+    /// Read the next message of stdout, and check that it is a notification with the method
+    /// `method`. Returns its params, or null.
+    fn notification(self: *Bridge, arena: Allocator, method: []const u8) !?Value {
+        const line = try self.nextLine(arena);
+        switch (try parseFrame(arena, line)) {
+            .notification => |n| {
+                if (std.mem.eql(u8, n.method, method)) return n.params;
+                return fail("the bridge sent the notification {s}, not {s}", .{ n.method, method });
+            },
+            else => return fail("the bridge sent a message that is not the notification {s}: {s}", .{ method, line }),
         }
     }
 

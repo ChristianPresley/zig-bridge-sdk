@@ -4,6 +4,8 @@
 //! (`Upstream.Config.transport`) and `mcp.transport.memory.ClientLink`. The tap can also give
 //! scripted responses, also for `server/discover`.
 //!
+//! A listen stream goes to the fixture server, and the tap keeps it in its own list.
+//!
 //! `Transcript.verify` checks each frame of the bridge against the schema of revision
 //! 2025-11-25. It also checks each request to the upstream server that the tap saw against
 //! the schema of revision 2026-07-28.
@@ -48,6 +50,9 @@ pub const readme_text = "The text of the fixture.";
 
 /// The time that a test waits for a frame or for the end of the requests in flight.
 const wait_limit: Io.Duration = .fromSeconds(10);
+
+/// True for the notifications of a listen stream that the bridge sends to VS Code.
+pub const isListenEvent = wire.isListenEvent;
 
 /// A front end, the fixture server and the frames of one transcript.
 pub const Transcript = struct {
@@ -178,12 +183,24 @@ pub const Transcript = struct {
     }
 
     /// Send the `initialize` request of VS Code and `notifications/initialized`. Returns the
-    /// `initialize` result.
+    /// `initialize` result. When the result declares list changes or subscriptions, the
+    /// function waits for the acknowledgment of the first listen stream. Thus the list changes
+    /// after it are in the frames.
     pub fn initialize(self: *Transcript) !Value {
         const result = try expectResult(try self.call(1, vscode_initialize));
         try self.send(initialized);
         try testing.expectEqual(Frontend.State.ready, self.frontend.state());
+        try self.waitListening(1);
         return result;
+    }
+
+    /// Wait until the listen streams have `n` acknowledgments. The function does not wait when
+    /// the bridge declares no list change, because then no stream starts at once.
+    pub fn waitListening(self: *Transcript, n: u64) !void {
+        const d = self.frontend.declared;
+        if (!d.tools_list_changed and !d.prompts_list_changed and !d.resources_list_changed) return;
+        const until = self.deadline();
+        while (self.frontend.listener.acknowledgments.load(.acquire) < n) try self.pause(until, "an acknowledgment of a listen stream");
     }
 
     /// Give `data` to `Frontend.run` through a reader with a buffer of `buffer_len` bytes.
@@ -499,8 +516,11 @@ pub const Tap = struct {
     lock: Io.Mutex = .init,
     /// Guarded by `lock`.
     script: Script = .forward,
-    /// The requests in the order of their start. Guarded by `lock`.
+    /// The requests in the order of their start, without the listen streams. Guarded by
+    /// `lock`.
     exchanges: std.ArrayList(Exchange) = .empty,
+    /// The listen streams in the order of their start. Guarded by `lock`.
+    listens: std.ArrayList(Exchange) = .empty,
     /// The index in `exchanges` of the request with the index 0 of `count`, `exchange` and
     /// `request`. Guarded by `lock`.
     base: usize = 0,
@@ -531,6 +551,27 @@ pub const Tap = struct {
     fn deinit(self: *Tap) void {
         for (self.exchanges.items) |e| self.gpa.free(e.frame);
         self.exchanges.deinit(self.gpa);
+        for (self.listens.items) |e| self.gpa.free(e.frame);
+        self.listens.deinit(self.gpa);
+    }
+
+    /// The number of listen streams that started.
+    pub fn listenCount(self: *Tap) usize {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        return self.listens.items.len;
+    }
+
+    /// The listen stream at `index`, parsed in `a`.
+    pub fn listenRequest(self: *Tap, a: Allocator, index: usize) !Value {
+        return mcp.json.parseTree(a, self.listenExchange(index).frame);
+    }
+
+    /// A copy of the listen stream at `index`.
+    pub fn listenExchange(self: *Tap, index: usize) Exchange {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        return self.listens.items[index];
     }
 
     pub fn setScript(self: *Tap, script: Script) void {
@@ -584,20 +625,25 @@ pub const Tap = struct {
     fn onExchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
         const self: *Tap = @ptrCast(@alignCast(ptr));
         const copy = self.gpa.dupe(u8, ex.frame) catch return error.OutOfMemory;
+        // A listen stream goes to the fixture server. Thus a script for the requests of a test
+        // does not end it, and it does not count as a request of the test.
+        const is_listen = std.mem.eql(u8, ex.method, "subscriptions/listen");
         const index, const script = begin: {
             self.lock.lockUncancelable(self.io);
             defer self.lock.unlock(self.io);
-            self.exchanges.append(self.gpa, .{ .frame = copy }) catch {
+            const list = if (is_listen) &self.listens else &self.exchanges;
+            list.append(self.gpa, .{ .frame = copy }) catch {
                 self.gpa.free(copy);
                 return error.OutOfMemory;
             };
-            break :begin .{ self.exchanges.items.len - 1, self.script };
+            break :begin .{ list.items.len - 1, if (is_listen) Script.forward else self.script };
         };
         const result = self.run(io, ex, script);
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
-        self.exchanges.items[index].outcome = if (result) |_| null else |e| e;
-        self.exchanges.items[index].done = true;
+        const list = if (is_listen) &self.listens else &self.exchanges;
+        list.items[index].outcome = if (result) |_| null else |e| e;
+        list.items[index].done = true;
         return result;
     }
 
@@ -631,14 +677,16 @@ pub const Tap = struct {
     fn verify(self: *Tap, schemas: *wire.Schemas, a: Allocator) !void {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
-        for (self.exchanges.items, 0..) |e, i| {
-            const context = try std.fmt.allocPrint(a, "upstream request {d}", .{i});
-            errdefer std.debug.print("{s}: {s}\n", .{ context, e.frame });
-            const v = try mcp.json.parseTree(a, e.frame);
-            const method = mcp.json.getString(v, "method") orelse return failCheck("an upstream request without a method", .{});
-            const definition = wire.upstreamRequestDefinition(method) orelse return failCheck("an upstream request {s}", .{method});
-            try schemas.check(.modern, definition, v, context);
-            try wire.expectUpstreamRequest(method, v);
+        for ([_][]const Exchange{ self.exchanges.items, self.listens.items }, [_][]const u8{ "upstream request", "listen stream" }) |list, kind| {
+            for (list, 0..) |e, i| {
+                const context = try std.fmt.allocPrint(a, "{s} {d}", .{ kind, i });
+                errdefer std.debug.print("{s}: {s}\n", .{ context, e.frame });
+                const v = try mcp.json.parseTree(a, e.frame);
+                const method = mcp.json.getString(v, "method") orelse return failCheck("an upstream request without a method", .{});
+                const definition = wire.upstreamRequestDefinition(method) orelse return failCheck("an upstream request {s}", .{method});
+                try schemas.check(.modern, definition, v, context);
+                try wire.expectUpstreamRequest(method, v);
+            }
         }
     }
 };

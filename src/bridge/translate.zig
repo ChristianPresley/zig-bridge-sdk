@@ -88,16 +88,57 @@ fn objectsOnly(arena: Allocator, member: ?Value, drop: ?[]const u8) Allocator.Er
 // ---------------------------------------------------------------------------------------------
 
 /// The server capabilities that the `initialize` result keeps. A false field removes that
-/// capability. The defaults remove the capabilities that need notifications to the client,
-/// because this version of the bridge sends no notification from the upstream server.
+/// capability. By default, the result keeps each capability as the upstream server declared
+/// it. The front end sends the list changes and the resource updates of a listen stream to the
+/// client (`notify.zig`). It also sends the log messages of the upstream server.
 pub const ReplyMask = struct {
     /// Keep `listChanged` of `tools`, `prompts` and `resources`.
-    list_changed: bool = false,
+    list_changed: bool = true,
     /// Keep `subscribe` of `resources`.
-    subscribe: bool = false,
+    subscribe: bool = true,
     /// Keep `logging`.
-    logging: bool = false,
+    logging: bool = true,
 };
+
+/// The notifications that the `initialize` result declares to the client. A field is true
+/// when the upstream server declared the capability and the mask keeps it.
+pub const Declared = struct {
+    tools_list_changed: bool = false,
+    prompts_list_changed: bool = false,
+    resources_list_changed: bool = false,
+    resources_subscribe: bool = false,
+    logging: bool = false,
+
+    /// True when the client can get a notification of a listen stream: a list change or a
+    /// resource update.
+    pub fn listens(self: Declared) bool {
+        return self.tools_list_changed or self.prompts_list_changed or self.resources_list_changed or self.resources_subscribe;
+    }
+};
+
+/// The notifications that `initializeResult` declares for `discover_raw` and `mask`. A
+/// capability flag counts only when its value is `true`.
+pub fn declared(discover_raw: Value, mask: ReplyMask) Declared {
+    if (discover_raw != .object) return .{};
+    const caps = discover_raw.object.get("capabilities") orelse return .{};
+    if (caps != .object) return .{};
+    const c = caps.object;
+    return .{
+        .tools_list_changed = mask.list_changed and flagOf(c.get("tools"), "listChanged"),
+        .prompts_list_changed = mask.list_changed and flagOf(c.get("prompts"), "listChanged"),
+        .resources_list_changed = mask.list_changed and flagOf(c.get("resources"), "listChanged"),
+        .resources_subscribe = mask.subscribe and flagOf(c.get("resources"), "subscribe"),
+        .logging = mask.logging and if (c.get("logging")) |v| v == .object else false,
+    };
+}
+
+/// True when `member` is an object and its `key` is `true`.
+fn flagOf(member: ?Value, key: []const u8) bool {
+    const v = member orelse return false;
+    if (v != .object) return false;
+    const flag = v.object.get(key) orelse return false;
+    return flag == .bool and flag.bool;
+}
 
 /// The settings of `initializeResult`.
 pub const InitOpts = struct {
@@ -194,37 +235,61 @@ fn validServerInfo(arena: Allocator, info: Value) Allocator.Error!bool {
 // Forwarded requests
 // ---------------------------------------------------------------------------------------------
 
-/// The parameters of a forwarded request and the progress token of the client.
+/// The parameters of a forwarded request, the progress token of the client and the `_meta`
+/// keys of the client for the upstream server.
 pub const Forward = struct {
     /// An object without `_meta` and without `task`. The upstream client adds its own `_meta`.
     params: Value,
     /// The `_meta.progressToken` of the client, or null. Each JSON scalar except null is a
     /// token, also the integer 0. The front end keys progress by request, never by token.
     progress_token: ?Value,
+    /// The `_meta` entries of the client that go to the upstream server, or null. See
+    /// `passMeta`.
+    meta: ?ObjectMap = null,
 };
 
 /// Make the parameters of a forwarded request from the parameters of the client. Missing
 /// parameters give `{}`. The function removes `task`, because the bridge declares no tasks.
-/// It removes `_meta` and returns the progress token of the client. In this version, no key
-/// of `_meta` goes to the upstream server, also when the profile allows it. The function does
-/// not change `params`.
+/// It removes `_meta`, and returns the progress token of the client and the `_meta` entries
+/// that `passMeta` keeps. The function does not change `params`.
 pub fn forwardParams(arena: Allocator, params: ?Value, profile: *const Profile) Allocator.Error!Forward {
-    _ = profile;
     var out: ObjectMap = .empty;
     var token: ?Value = null;
+    var meta: ?ObjectMap = null;
     if (params) |p| if (p == .object) {
         var it = p.object.iterator();
         while (it.next()) |kv| {
             const key = kv.key_ptr.*;
             if (std.mem.eql(u8, key, "_meta")) {
                 token = progressToken(kv.value_ptr.*);
+                meta = try passMeta(arena, kv.value_ptr.*, profile);
                 continue;
             }
             if (std.mem.eql(u8, key, "task")) continue;
             try out.put(arena, key, kv.value_ptr.*);
         }
     };
-    return .{ .params = .{ .object = out }, .progress_token = token };
+    return .{ .params = .{ .object = out }, .progress_token = token, .meta = meta };
+}
+
+/// The `_meta` entries of the client that go to the upstream server. A key goes upstream when
+/// the profile allows it (`Profile.meta_passthrough`) and `mcp.protocol.meta.validateKey`
+/// accepts it. A key that zig-sdk owns, or a key with a prefix of the protocol, stays with the
+/// bridge. Thus one key that is not valid does not make the request fail with
+/// `error.InvalidMeta`. The values stay as they are. Null when no key goes upstream.
+pub fn passMeta(arena: Allocator, meta: Value, profile: *const Profile) Allocator.Error!?ObjectMap {
+    if (meta != .object) return null;
+    var out: ObjectMap = .empty;
+    var it = meta.object.iterator();
+    while (it.next()) |kv| {
+        const key = kv.key_ptr.*;
+        if (!profile.meta_passthrough.allows(key)) continue;
+        mcp.protocol.meta.validateKey(key) catch continue;
+        if (mcp.protocol.meta.isSdkOwnedRequestKey(key) or mcp.protocol.meta.isReservedPrefix(key)) continue;
+        try out.put(arena, key, kv.value_ptr.*);
+    }
+    if (out.count() == 0) return null;
+    return out;
 }
 
 fn progressToken(meta: Value) ?Value {
@@ -525,6 +590,84 @@ const Walker = struct {
         w.path.shrinkRetainingCapacity(mark);
     }
 };
+
+// ---------------------------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------------------------
+
+/// The methods of a listen stream that go to the client. Revision 2025-11-25 has the same
+/// notifications. No other notification of a listen stream goes to the client.
+pub const forwarded_events = [_][]const u8{
+    "notifications/tools/list_changed",
+    "notifications/prompts/list_changed",
+    "notifications/resources/list_changed",
+    "notifications/resources/updated",
+};
+
+/// The first notification of each listen stream. The client does not get it.
+pub const acknowledged_method = "notifications/subscriptions/acknowledged";
+
+/// What the front end does with one notification of a listen stream.
+pub const Event = union(enum) {
+    /// Send the notification to the client with these params. Null sends no params.
+    forward: ?Value,
+    /// The acknowledgment of the stream. The client does not get it.
+    acknowledged,
+    /// The client does not get the notification. This is the result for each method that is
+    /// not in `forwarded_events`, also for `notifications/cancelled`. The ids of the upstream
+    /// server can be equal to the ids of the client. Thus a cancellation of the upstream server
+    /// can cancel a request of the client.
+    drop,
+};
+
+/// Translate one notification of a listen stream. A forwarded notification loses the
+/// subscription id in its `_meta`, and an empty `_meta` goes away. Empty params go away. The
+/// result is `.drop` for params that are not an object, and for `resources/updated` without a
+/// string `uri`. The function does not change `params`. The result can point into `params`.
+pub fn listenEvent(arena: Allocator, method: []const u8, params: ?Value) Allocator.Error!Event {
+    if (std.mem.eql(u8, method, acknowledged_method)) return .acknowledged;
+    for (forwarded_events) |m| {
+        if (std.mem.eql(u8, m, method)) break;
+    } else return .drop;
+    const p = params orelse return if (isUpdated(method)) .drop else .{ .forward = null };
+    if (p != .object) return .drop;
+    if (isUpdated(method)) {
+        const uri = p.object.get("uri") orelse return .drop;
+        if (uri != .string) return .drop;
+    }
+    var out: ObjectMap = .empty;
+    var it = p.object.iterator();
+    while (it.next()) |kv| {
+        if (!std.mem.eql(u8, kv.key_ptr.*, "_meta")) {
+            try out.put(arena, kv.key_ptr.*, kv.value_ptr.*);
+            continue;
+        }
+        // A `_meta` that is not an object is not valid in revision 2025-11-25.
+        if (kv.value_ptr.* != .object) continue;
+        const meta = try withoutKeys(arena, kv.value_ptr.*, &.{mcp.protocol.meta.key_subscription_id});
+        if (meta.object.count() > 0) try out.put(arena, "_meta", meta);
+    }
+    if (out.count() == 0) return .{ .forward = null };
+    return .{ .forward = .{ .object = out } };
+}
+
+fn isUpdated(method: []const u8) bool {
+    return std.mem.eql(u8, method, "notifications/resources/updated");
+}
+
+/// The params of `notifications/message` for the client. Revision 2025-11-25 has the same
+/// members. The `_meta` of the upstream server does not go to the client.
+pub const LogMessage = struct {
+    level: types.LoggingLevel,
+    logger: ?[]const u8 = null,
+    data: Value,
+};
+
+/// The params of `notifications/message` for the client from the params of the upstream
+/// server. The result points into `params`.
+pub fn logMessage(params: types.LoggingMessageNotificationParams) LogMessage {
+    return .{ .level = params.level, .logger = params.logger, .data = params.data };
+}
 
 // ---------------------------------------------------------------------------------------------
 // Errors
@@ -902,8 +1045,9 @@ test "initialize result from a full discover result" {
     const arena = arena_state.allocator();
     const discover = try parse(arena, full_discover);
     const result = try initializeResult(arena, discover, .{ .profile = &test_profile, .fallback_name = "fixture-server" });
+    // The default mask keeps the notifications that the upstream server declares.
     try expectJson(arena,
-        \\{"protocolVersion":"2025-11-25","capabilities":{"experimental":{"e":{}},"completions":{},"prompts":{},"resources":{},"tools":{},"extensions":{"io.modelcontextprotocol/ui":{}}},
+        \\{"protocolVersion":"2025-11-25","capabilities":{"experimental":{"e":{}},"logging":{},"completions":{},"prompts":{"listChanged":true},"resources":{"subscribe":true,"listChanged":true},"tools":{"listChanged":true},"extensions":{"io.modelcontextprotocol/ui":{}}},
     ++
         \\"serverInfo":{"name":"fixture","title":"Fixture","version":"1.2.3","icons":[{"src":"data:image/png;base64,AA==","mimeType":"image/png"}],"description":"A server.","websiteUrl":"https://example.com"},
     ++
@@ -916,27 +1060,49 @@ test "initialize result from a full discover result" {
     try testing.expect(result.object.get("capabilities").?.object.get("tasks") == null);
 }
 
-test "initialize result with notifications in the reply mask" {
+test "initialize result without the notifications of the reply mask" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
     const discover = try parse(arena, full_discover);
-    const all = try initializeResult(arena, discover, .{
+    const none = try initializeResult(arena, discover, .{
         .profile = &test_profile,
         .fallback_name = "x",
-        .mask = .{ .list_changed = true, .subscribe = true, .logging = true },
+        .mask = .{ .list_changed = false, .subscribe = false, .logging = false },
     });
     try expectJson(arena,
-        \\{"experimental":{"e":{}},"logging":{},"completions":{},"prompts":{"listChanged":true},"resources":{"subscribe":true,"listChanged":true},"tools":{"listChanged":true},"extensions":{"io.modelcontextprotocol/ui":{}}}
-    , all.object.get("capabilities").?);
-    const subscribe_only = try initializeResult(arena, discover, .{ .profile = &test_profile, .fallback_name = "x", .mask = .{ .subscribe = true } });
+        \\{"experimental":{"e":{}},"completions":{},"prompts":{},"resources":{},"tools":{},"extensions":{"io.modelcontextprotocol/ui":{}}}
+    , none.object.get("capabilities").?);
+    const subscribe_only = try initializeResult(arena, discover, .{ .profile = &test_profile, .fallback_name = "x", .mask = .{ .list_changed = false, .logging = false } });
     try expectJson(arena,
         \\{"subscribe":true}
     , subscribe_only.object.get("capabilities").?.object.get("resources").?);
-    const list_changed_only = try initializeResult(arena, discover, .{ .profile = &test_profile, .fallback_name = "x", .mask = .{ .list_changed = true } });
+    try testing.expect(subscribe_only.object.get("capabilities").?.object.get("logging") == null);
+    const list_changed_only = try initializeResult(arena, discover, .{ .profile = &test_profile, .fallback_name = "x", .mask = .{ .subscribe = false } });
     try expectJson(arena,
         \\{"listChanged":true}
     , list_changed_only.object.get("capabilities").?.object.get("resources").?);
+}
+
+test "the declared notifications follow the discover result and the mask" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const discover = try parse(arena, full_discover);
+    const all = declared(discover, .{});
+    try testing.expectEqual(Declared{ .tools_list_changed = true, .prompts_list_changed = true, .resources_list_changed = true, .resources_subscribe = true, .logging = true }, all);
+    try testing.expect(all.listens());
+    const masked = declared(discover, .{ .list_changed = false, .logging = false });
+    try testing.expectEqual(Declared{ .resources_subscribe = true }, masked);
+    try testing.expect(masked.listens());
+    try testing.expect(!declared(discover, .{ .list_changed = false, .subscribe = false }).listens());
+    // Only the value true counts, and only for an object.
+    const odd = try parse(arena,
+        \\{"capabilities":{"tools":{"listChanged":false},"prompts":{"listChanged":"yes"},"resources":{"subscribe":1},"logging":true}}
+    );
+    try testing.expectEqual(Declared{}, declared(odd, .{}));
+    try testing.expectEqual(Declared{}, declared(.null, .{}));
+    try testing.expectEqual(Declared{ .tools_list_changed = true }, declared(try parse(arena, "{\"capabilities\":{\"tools\":{\"listChanged\":true}}}"), .{}));
 }
 
 test "initialize result without server information uses the fallback name" {
@@ -993,7 +1159,10 @@ test "initialize result from a discover result that is not valid" {
     ;
     try expectJson(arena, expected, try initializeResult(arena, .null, opts));
     try expectJson(arena, expected, try initializeResult(arena, try parse(arena, "{\"capabilities\":[],\"instructions\":7}"), opts));
-    try expectJson(arena, expected, try initializeResult(arena, try parse(arena,
+    // Only `logging` is an object, thus the result keeps only it.
+    try expectJson(arena,
+        \\{"protocolVersion":"2025-11-25","capabilities":{"logging":{}},"serverInfo":{"name":"f","version":"1"}}
+    , try initializeResult(arena, try parse(arena,
         \\{"capabilities":{"tools":true,"prompts":[],"resources":1,"completions":"x","experimental":2,"logging":{},"extensions":{"a":1}}}
     ), opts));
 }
@@ -1012,8 +1181,91 @@ test "forward params remove _meta and task and keep the progress token" {
         \\{"name":"echo","arguments":{"text":"hi","_meta":1}}
     , f.params);
     try testing.expectEqualStrings("5c2e7a61-1f0e-4a43-9b38-6e0c2bdbd2f4", f.progress_token.?.string);
+    // The test profile allows no `_meta` key.
+    try testing.expect(f.meta == null);
     // The parameters of the client stay the same.
     try expectJson(arena, before, params);
+}
+
+const passthrough_profile: Profile = .{
+    .name = "mcp-bridge-passthrough",
+    .meta_passthrough = .{ .keys = &.{ "traceparent", "tracestate", "progressToken", "io.modelcontextprotocol/logLevel" }, .prefixes = &.{ "vscode.", "io.modelcontextprotocol/" } },
+};
+
+test "forward params keep the _meta keys that the profile allows, and only valid keys" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const params = try parse(arena,
+        \\{"name":"echo","_meta":{"progressToken":"p","vscode.conversationId":"c","vscode.requestId":"r",
+        \\"traceparent":"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01","tracestate":"x=1","other":"o",
+        \\"vscode.bad key":"k","vscode.":"e","io.modelcontextprotocol/logLevel":"debug","io.modelcontextprotocol/x":1,
+        \\"baggage":"b"}}
+    );
+    const f = try forwardParams(arena, params, &passthrough_profile);
+    try expectJson(arena, "{\"name\":\"echo\"}", f.params);
+    try testing.expectEqualStrings("p", f.progress_token.?.string);
+    // The keys of the profile go upstream. A key that `validateKey` refuses, a key of zig-sdk
+    // and a key with a prefix of the protocol stay with the bridge.
+    try expectJson(arena,
+        \\{"vscode.conversationId":"c","vscode.requestId":"r","traceparent":"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01","tracestate":"x=1"}
+    , Value{ .object = f.meta.? });
+    // No key that goes upstream, and a `_meta` that is not an object.
+    try testing.expect((try forwardParams(arena, try parse(arena, "{\"_meta\":{\"progressToken\":1,\"other\":2}}"), &passthrough_profile)).meta == null);
+    try testing.expect((try forwardParams(arena, try parse(arena, "{\"_meta\":3}"), &passthrough_profile)).meta == null);
+}
+
+test "listen events: the allowlist, the subscription id and the acknowledgment" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const sid = "\"io.modelcontextprotocol/subscriptionId\":7";
+    // A list change loses the subscription id, and then its empty `_meta` and empty params.
+    const changed = try listenEvent(arena, "notifications/tools/list_changed", try parse(arena, "{\"_meta\":{" ++ sid ++ "}}"));
+    try testing.expect(changed.forward == null);
+    try testing.expect((try listenEvent(arena, "notifications/prompts/list_changed", null)).forward == null);
+    // Other keys of `_meta` and the other params stay.
+    const kept = try listenEvent(arena, "notifications/resources/list_changed", try parse(arena, "{\"_meta\":{" ++ sid ++ ",\"k\":1},\"x\":2}"));
+    try expectJson(arena, "{\"_meta\":{\"k\":1},\"x\":2}", kept.forward.?);
+    const params = try parse(arena, "{\"uri\":\"file:///a\",\"_meta\":{" ++ sid ++ "}}");
+    const before = try mcp.json.writeAlloc(arena, params);
+    const updated = try listenEvent(arena, "notifications/resources/updated", params);
+    try expectJson(arena, "{\"uri\":\"file:///a\"}", updated.forward.?);
+    try expectJson(arena, before, params);
+    // A `_meta` that is not an object goes away.
+    try expectJson(arena, "{\"uri\":\"u\"}", (try listenEvent(arena, "notifications/resources/updated", try parse(arena, "{\"uri\":\"u\",\"_meta\":5}"))).forward.?);
+    // An update without a string URI, and params that are not an object.
+    try testing.expect(try listenEvent(arena, "notifications/resources/updated", null) == .drop);
+    try testing.expect(try listenEvent(arena, "notifications/resources/updated", try parse(arena, "{\"uri\":3}")) == .drop);
+    try testing.expect(try listenEvent(arena, "notifications/tools/list_changed", try parse(arena, "[1]")) == .drop);
+    // The acknowledgment, and each method that is not in the allowlist.
+    try testing.expect(try listenEvent(arena, "notifications/subscriptions/acknowledged", try parse(arena, "{\"_meta\":{" ++ sid ++ "}}")) == .acknowledged);
+    for ([_][]const u8{
+        "notifications/cancelled",
+        "notifications/message",
+        "notifications/progress",
+        "notifications/tasks/status",
+        "notifications/roots/list_changed",
+        "notifications/tools/list_changed/x",
+        "Notifications/tools/list_changed",
+        "",
+    }) |method| {
+        try testing.expect(try listenEvent(arena, method, try parse(arena, "{\"requestId\":1,\"_meta\":{" ++ sid ++ "}}")) == .drop);
+    }
+}
+
+test "a log message for the client has the level, the logger and the data" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const params = try mcp.json.parseValue(types.LoggingMessageNotificationParams, arena, try parse(arena,
+        \\{"level":"error","logger":"db","data":{"code":5},"_meta":{"io.modelcontextprotocol/subscriptionId":3}}
+    ));
+    try expectJson(arena,
+        \\{"level":"error","logger":"db","data":{"code":5}}
+    , logMessage(params));
+    const plain = try mcp.json.parseValue(types.LoggingMessageNotificationParams, arena, try parse(arena, "{\"level\":\"debug\",\"data\":\"x\"}"));
+    try expectJson(arena, "{\"level\":\"debug\",\"data\":\"x\"}", logMessage(plain));
 }
 
 test "forward params without params give an empty object" {

@@ -301,6 +301,23 @@ fn echo(ctx: *mcp.RequestContext, args: EchoArgs) anyerror!mcp.Outcome(mcp.CallT
     return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "{s}", .{args.text}) };
 }
 
+/// The text resource of the front end target. A line can subscribe to it, and the tool `touch`
+/// tells the listen streams that it changed.
+const fuzz_uri = "file:///fuzz.txt";
+
+fn readFuzz(ctx: *mcp.RequestContext, uri: []const u8) anyerror!mcp.Outcome(mcp.ReadResourceResult) {
+    const contents = try ctx.arena.alloc(mcp.types.ResourceContents, 1);
+    contents[0] = .{ .text = .{ .uri = uri, .text = "fuzz" } };
+    return .{ .complete = .{ .contents = contents } };
+}
+
+fn touch(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    _ = args;
+    ctx.server.notifyResourceUpdated(ctx.io, fuzz_uri);
+    _ = ctx.server.setToolEnabled(ctx.io, "echo", true);
+    return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "touched", .{}) };
+}
+
 /// Ask for a name in a form, then send the action and the name back. The bridge sends the
 /// form to the client as a request with a `b-` id, thus the lines of the client can answer
 /// it.
@@ -394,6 +411,8 @@ fn frontendLines(_: void, smith: *Smith) anyerror!void {
     defer server.deinit();
     try server.addTool(.{ .name = "echo", .description = "Send the text back" }, echo);
     try server.addToolJson(.{ .name = "ask", .description = "Ask for a name" }, ask);
+    try server.addToolJson(.{ .name = "touch", .description = "Change the resource" }, touch);
+    try server.addResource(.{ .uri = fuzz_uri, .name = "fuzz" }, readFuzz);
     const upstream = try Upstream.init(io, gpa, .{ .memory = server });
     defer upstream.deinit();
     var frames: Frames = .{ .io = io, .gpa = gpa };
@@ -450,7 +469,10 @@ fn frontendLines(_: void, smith: *Smith) anyerror!void {
                     }
                     continue;
                 }
-                try std.testing.expectEqualStrings("notifications/progress", n.method);
+                // After `notifications/initialized`, the listen stream sends the list changes.
+                for (translate.forwarded_events) |m| {
+                    if (std.mem.eql(u8, m, n.method)) break;
+                } else try std.testing.expectEqualStrings("notifications/progress", n.method);
                 continue;
             },
             .response => |r| r.id,
@@ -484,6 +506,15 @@ test "fuzz: the lines of the client through the front end" {
                 "\xff{\"id\":7}\n{\"jsonrpc\":\"2.0\",\"id\":8}\n{\"id\":9.5,\"method\":\"ping\"}",
             // A string id with bytes that are not UTF-8 and a control character.
             "\x00{\"jsonrpc\":\"2.0\",\"id\":\"\xb3\xe3\x1c\xb6rpc\",\"method\":\"x\"}\n{\"id\":\"a\x01\"}",
+            // The listen stream: the subscriptions, an update and a log level.
+            "\x01{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n" ++
+                "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/subscribe\",\"params\":{\"uri\":\"file:///fuzz.txt\"}}\n" ++
+                "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"resources/subscribe\",\"params\":{\"uri\":\"file:///fuzz.txt\"}}\n" ++
+                "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"logging/setLevel\",\"params\":{\"level\":\"debug\"}}\n" ++
+                "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"name\":\"touch\",\"_meta\":{\"traceparent\":\"t\",\"vscode.x\":1}}}\n" ++
+                "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"resources/unsubscribe\",\"params\":{\"uri\":\"file:///fuzz.txt\"}}\n" ++
+                "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"resources/unsubscribe\",\"params\":{\"uri\":1}}\n" ++
+                "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"resources/subscribe\"}",
             // A line that is too long, with the id last as the TypeScript SDK 1.x writes it.
             "\x01{\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"" ++ "a" ** 300 ++ "\"}},\"jsonrpc\":\"2.0\",\"id\":9}",
             // The pending table: an answer, a second answer, an answer with a lone surrogate,

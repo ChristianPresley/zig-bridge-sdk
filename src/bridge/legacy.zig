@@ -43,6 +43,17 @@ pub fn parseSetLevelParams(arena: Allocator, params: ?Value) ParamsError!SetLeve
     return parseParams(SetLevelParams, arena, params orelse return error.InvalidParams);
 }
 
+/// The parameters of `resources/subscribe` and `resources/unsubscribe`.
+pub const SubscribeParams = struct {
+    uri: []const u8,
+};
+
+/// Parse the parameters of a `resources/subscribe` or `resources/unsubscribe` request. All
+/// memory comes from `arena`.
+pub fn parseSubscribeParams(arena: Allocator, params: ?Value) ParamsError!SubscribeParams {
+    return parseParams(SubscribeParams, arena, params orelse return error.InvalidParams);
+}
+
 /// The parameters of `notifications/cancelled`. Revision 2025-11-25 makes `requestId`
 /// optional, because a client cancels a task with `tasks/cancel`. The bridges declare no
 /// tasks, thus a notification without `requestId` cancels nothing.
@@ -74,9 +85,9 @@ pub const MethodKind = enum {
     ping,
     /// `logging/setLevel`. The front end keeps the level and answers with `{}`.
     set_level,
-    /// `resources/subscribe`.
+    /// `resources/subscribe`. The listen stream of the front end gets the URI.
     subscribe,
-    /// `resources/unsubscribe`.
+    /// `resources/unsubscribe`. The listen stream of the front end loses the URI.
     unsubscribe,
     /// `server/discover` of revision 2026-07-28. The front end answers with -32601 at once,
     /// thus a client of two revisions continues with `initialize`.
@@ -231,6 +242,12 @@ test "setLevel and cancelled params" {
     try testing.expectEqual(mcp.types.LoggingLevel.warning, level.level);
     try testing.expectError(error.InvalidParams, parseSetLevelParams(arena, try parseTest(arena, "{\"level\":\"loud\"}")));
     try testing.expectError(error.InvalidParams, parseSetLevelParams(arena, null));
+
+    const subscribe = try parseSubscribeParams(arena, try parseTest(arena, "{\"uri\":\"file:///a.txt\",\"_meta\":{}}"));
+    try testing.expectEqualStrings("file:///a.txt", subscribe.uri);
+    try testing.expectError(error.InvalidParams, parseSubscribeParams(arena, try parseTest(arena, "{\"uri\":5}")));
+    try testing.expectError(error.InvalidParams, parseSubscribeParams(arena, try parseTest(arena, "{}")));
+    try testing.expectError(error.InvalidParams, parseSubscribeParams(arena, null));
 
     const numeric = try parseCancelledParams(arena, try parseTest(arena, "{\"requestId\":7,\"reason\":\"stop\"}"));
     try testing.expectEqual(@as(i64, 7), numeric.requestId.?.integer);

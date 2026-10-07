@@ -5,6 +5,14 @@
 //! The tools `ask_form`, `ask_url`, `ask_url_twice`, `ask_bad_url`, `sample`, `sample_tools`,
 //! `list_roots`, `multi` and `many_inputs`, and the prompt `ask_name`, ask the client for input
 //! with an `InputRequiredResult`. The round after the answers gives a text result.
+//!
+//! The tools `toggle`, `touch` and `log` send notifications during the call. `toggle` enables
+//! or disables the tool `toggled` or the prompt `toggled`. Thus the server writes a list change
+//! to each listen stream before the result of the call. This is an interoperability case for
+//! VS Code.
+//!
+//! `touch` tells the listen streams that a resource changed. `log` sends log messages at four
+//! levels. The server declares `logging`.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -22,6 +30,16 @@ pub const crash_exit_code: u8 = 3;
 /// after that time while it has no request.
 pub const crash_schema =
     \\{"type":"object","properties":{"after_ms":{"type":"integer","minimum":1,"maximum":60000,"description":"The time in milliseconds from the result to the stop"}},"additionalProperties":false}
+;
+
+/// The exit code of the process after a call of the tool `shutdown`.
+pub const shutdown_exit_code: u8 = 0;
+
+/// The input schema of the tool `shutdown`. The server ends each listen stream at once, as at
+/// the end of its input. On stdio, each stream then gets its result and a
+/// `notifications/cancelled`. The call gets a result, and the process stops `after_ms` later.
+pub const shutdown_schema =
+    \\{"type":"object","properties":{"after_ms":{"type":"integer","minimum":1,"maximum":60000,"description":"The time in milliseconds from the result to the stop"}},"required":["after_ms"],"additionalProperties":false}
 ;
 
 /// The values of each completion result.
@@ -65,6 +83,28 @@ pub const bad_url = "file://localhost/etc/passwd";
 /// the bridge for one round.
 pub const many_inputs_count = 17;
 
+/// The input schema of the tool `toggle`. Without `target`, the tool changes the tool
+/// `toggled`.
+pub const toggle_schema =
+    \\{"type":"object","properties":{"enabled":{"type":"boolean","description":"Enable the target, or disable it"},"target":{"type":"string","enum":["tool","prompt"],"description":"The tool toggled or the prompt toggled"}},"required":["enabled"],"additionalProperties":false}
+;
+
+/// The input schema of the tool `touch`.
+pub const touch_schema =
+    \\{"type":"object","properties":{"uri":{"type":"string","description":"The URI of the resource that changed"}},"required":["uri"],"additionalProperties":false}
+;
+
+/// The URI of the text resource of the server. A test subscribes to it and changes it with the
+/// tool `touch`.
+pub const notes_uri = "file:///fixture/notes.txt";
+/// The text of the resource `notes_uri`.
+pub const notes_text = "The notes of the fixture.";
+
+/// The levels of the log messages of the tool `log`, in this order.
+pub const log_levels = [_]mcp.types.LoggingLevel{ .debug, .info, .warning, .@"error" };
+/// The logger name of the log messages of the tool `log`.
+pub const log_logger = "fixture";
+
 pub const Options = struct {
     /// The number of generated tools. Their names are `tool_0` to `tool_<N-1>`. With more tools
     /// than `limits.page_size`, the result of `tools/list` has more than one page.
@@ -72,8 +112,10 @@ pub const Options = struct {
     /// Register the completion handler. Without it, the server does not declare the
     /// `completions` capability, and `completion/complete` gives the error -32601.
     completion: bool = true,
-    /// Register the tool `crash`. A call of it stops the process with `crash_exit_code`. Only
-    /// the executable sets this option, because the tool also stops a test process.
+    /// Register the tools `crash` and `shutdown`. A call of `crash` stops the process with
+    /// `crash_exit_code`. A call of `shutdown` ends the listen streams and then stops the
+    /// process with `shutdown_exit_code`. Only the executable sets this option, because these
+    /// tools also stop a test process.
     crash: bool = false,
     /// Register the tool `array_output`. Its output schema and its structured content are
     /// arrays. The TypeScript SDK 1.x refuses such a result, thus the executable does not set
@@ -96,6 +138,8 @@ pub fn build(gpa: Allocator, io: Io, options: Options) BuildError!*mcp.Server {
         // The tools that ask for input use each kind. The server sends a kind only when the
         // client declared it.
         .mrtr = .{ .elicitation = true, .sampling = true, .sampling_tools = true, .roots = true },
+        // The tool `log` sends log messages.
+        .capabilities = .{ .logging = .{ .object = .empty } },
     });
     errdefer server.deinit();
     try register(server, options);
@@ -137,6 +181,7 @@ fn register(server: *mcp.Server, options: Options) mcp.Server.RegisterError!void
     }
     if (options.crash) {
         try server.addToolJson(.{ .name = "crash", .description = "Stop the server process with exit code 3", .input_schema = crash_schema }, crash);
+        try server.addToolJson(.{ .name = "shutdown", .description = "End the listen streams as at the end of the input, then stop the server process with exit code 0", .input_schema = shutdown_schema }, shutdown);
     }
     try server.addToolJson(.{ .name = "ask_form", .description = "Ask for a name, an age, a choice and a color in a form" }, askForm);
     try server.addToolJson(.{ .name = "ask_url", .description = "Ask the user to open a page" }, askUrl);
@@ -151,6 +196,11 @@ fn register(server: *mcp.Server, options: Options) mcp.Server.RegisterError!void
     try server.addToolJson(.{ .name = "list_roots", .description = "List the roots of the client" }, listRoots);
     try server.addToolJson(.{ .name = "multi", .description = "Ask for a name and the roots in one round" }, multi);
     try server.addToolJson(.{ .name = "many_inputs", .description = "Ask for the roots 17 times in one round" }, manyInputs);
+    try server.addToolJson(.{ .name = "toggle", .description = "Enable or disable the tool toggled or the prompt toggled", .input_schema = toggle_schema }, toggle);
+    try server.addToolJson(.{ .name = "toggled", .description = "A tool that the tool toggle enables and disables", .annotations = read_only }, toggled);
+    try server.addToolJson(.{ .name = "touch", .description = "Tell the subscribers that a resource changed", .input_schema = touch_schema }, touch);
+    try server.addToolJson(.{ .name = "log", .description = "Send log messages at the levels debug, info, warning and error", .annotations = read_only }, logMessages);
+    try server.addResource(.{ .uri = notes_uri, .name = "notes", .mime_type = "text/plain" }, readNotes);
     var i: u32 = 0;
     while (i < options.many_tools) : (i += 1) {
         var name_buf: [32]u8 = undefined;
@@ -159,6 +209,7 @@ fn register(server: *mcp.Server, options: Options) mcp.Server.RegisterError!void
     }
     try server.addPrompt(.{ .name = "greet", .description = "Greet a person", .arguments = &greet_arguments }, greet);
     try server.addPrompt(.{ .name = "ask_name", .description = "Ask for a name in a form, then greet the person" }, askName);
+    try server.addPrompt(.{ .name = "toggled", .description = "A prompt that the tool toggle enables and disables" }, toggledPrompt);
     if (options.completion) server.setCompletionHandler(complete);
 }
 
@@ -276,14 +327,81 @@ fn crash(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToo
     const after_ms: u32 = if (after == .integer) std.math.cast(u32, after.integer) orelse 0 else 0;
     if (after_ms == 0) std.process.exit(crash_exit_code);
     // A plain thread stops the process later. The tasks of the server do not wait for it.
-    const thread = try std.Thread.spawn(.{}, exitLater, .{ ctx.io, after_ms });
+    const thread = try std.Thread.spawn(.{}, exitLater, .{ ctx.io, after_ms, crash_exit_code });
     thread.detach();
     return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "the server stops in {d} ms", .{after_ms}) };
 }
 
-fn exitLater(io: Io, ms: u32) void {
+/// End each listen stream as the stdio server does at the end of its input. Each stream gets
+/// its result and then a `notifications/cancelled` with the id of the stream. The process
+/// stops later with `shutdown_exit_code`.
+fn shutdown(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    const after: Value = if (args == .object) args.object.get("after_ms") orelse .null else .null;
+    if (after != .integer) return error.InvalidParams;
+    const after_ms = std.math.cast(u32, after.integer) orelse return error.InvalidParams;
+    if (after_ms == 0) return error.InvalidParams;
+    ctx.server.shutdownSubscriptions(ctx.io);
+    const thread = try std.Thread.spawn(.{}, exitLater, .{ ctx.io, after_ms, shutdown_exit_code });
+    thread.detach();
+    return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "the server ended its listen streams and stops in {d} ms", .{after_ms}) };
+}
+
+fn exitLater(io: Io, ms: u32, code: u8) void {
     io.sleep(.fromMilliseconds(ms), .awake) catch {};
-    std.process.exit(crash_exit_code);
+    std.process.exit(code);
+}
+
+// -- The tools that send notifications ----------------------------------------------------------
+
+/// Enable or disable the tool `toggled` or the prompt `toggled`. A change writes the list
+/// change to each listen stream of the server before the result.
+fn toggle(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    const enabled_arg: Value = if (args == .object) args.object.get("enabled") orelse .null else .null;
+    if (enabled_arg != .bool) return error.InvalidParams;
+    const target = if (args == .object) mcp.json.getString(args, "target") orelse "tool" else "tool";
+    const prompt = std.mem.eql(u8, target, "prompt");
+    if (!prompt and !std.mem.eql(u8, target, "tool")) return error.InvalidParams;
+    const changed = if (prompt)
+        ctx.server.setPromptEnabled(ctx.io, "toggled", enabled_arg.bool)
+    else
+        ctx.server.setToolEnabled(ctx.io, "toggled", enabled_arg.bool);
+    const state = if (enabled_arg.bool) "enabled" else "disabled";
+    return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "{s} toggled: {s}{s}", .{ target, state, if (changed) "" else " (no change)" }) };
+}
+
+fn toggled(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    _ = args;
+    return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "toggled", .{}) };
+}
+
+fn toggledPrompt(ctx: *mcp.RequestContext, args: ?std.json.ArrayHashMap([]const u8)) anyerror!mcp.Outcome(mcp.GetPromptResult) {
+    _ = args;
+    const messages = try ctx.arena.alloc(mcp.types.PromptMessage, 1);
+    messages[0] = .{ .role = .user, .content = .{ .text = .{ .text = "toggled" } } };
+    return .{ .complete = .{ .messages = messages } };
+}
+
+/// Tell each listen stream with the URI that the resource changed, before the result.
+fn touch(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    const uri = if (args == .object) mcp.json.getString(args, "uri") orelse return error.InvalidParams else return error.InvalidParams;
+    ctx.server.notifyResourceUpdated(ctx.io, uri);
+    return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "touched {s}", .{uri}) };
+}
+
+/// Send one log message at each level of `log_levels`. The server sends only the messages at
+/// the log level of the request and above, and none without a level.
+fn logMessages(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    _ = args;
+    for (log_levels) |level| {
+        try ctx.log(level, log_logger, .{ .string = try std.fmt.allocPrint(ctx.arena, "a message at the level {t}", .{level}) });
+    }
+    return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "logged {d} messages", .{log_levels.len}) };
+}
+
+fn readNotes(ctx: *mcp.RequestContext, uri: []const u8) anyerror!mcp.Outcome(mcp.ReadResourceResult) {
+    const contents = try ctx.arena.alloc(mcp.types.ResourceContents, 1);
+    contents[0] = .{ .text = .{ .uri = uri, .mimeType = "text/plain", .text = notes_text } };
+    return .{ .complete = .{ .contents = contents } };
 }
 
 /// The handler of the tools `tool_<i>`. It sends the name of the tool back.
@@ -497,12 +615,15 @@ test "tools/list has pages with many tools and the result names every tool" {
         for (result.object.get("tools").?.array.items) |tool| try names.append(arena, tool.object.get("name").?.string);
         cursor = mcp.json.getString(result, "nextCursor") orelse break;
     }
-    // echo, add, slow, progress, bare_array, structured, the nine tools that ask for input and
-    // tool_0 to tool_4.
-    try testing.expectEqual(@as(usize, 20), names.items.len);
-    try testing.expectEqual(@as(usize, 4), pages);
+    // echo, add, slow, progress, bare_array, structured, the nine tools that ask for input,
+    // toggle, toggled, touch, log and tool_0 to tool_4.
+    try testing.expectEqual(@as(usize, 24), names.items.len);
+    try testing.expectEqual(@as(usize, 5), pages);
     try testing.expectEqualStrings("tool_4", names.items[names.items.len - 1]);
-    for (names.items) |n| try testing.expect(!std.mem.eql(u8, n, "crash"));
+    for (names.items) |n| {
+        try testing.expect(!std.mem.eql(u8, n, "crash"));
+        try testing.expect(!std.mem.eql(u8, n, "shutdown"));
+    }
 }
 
 test "the tools give the expected results" {
@@ -540,6 +661,79 @@ test "the tools give the expected results" {
     try testing.expectEqual(@as(usize, 2), values.len);
     try testing.expectEqualStrings("alpha", values[0].string);
     try testing.expectEqualStrings("beta", values[1].string);
+}
+
+/// The text of the first content block of the result in the last frame.
+fn lastText(arena: Allocator, h: *Harness) ![]const u8 {
+    return (try lastResult(arena, h)).object.get("content").?.array.items[0].object.get("text").?.string;
+}
+
+/// True when the result of `tools/list` or `prompts/list` in the last frame names `name`.
+fn listed(arena: Allocator, h: *Harness, member: []const u8, name: []const u8) !bool {
+    for ((try lastResult(arena, h)).object.get(member).?.array.items) |item| {
+        if (std.mem.eql(u8, item.object.get("name").?.string, name)) return true;
+    }
+    return false;
+}
+
+test "the tool toggle enables and disables the tool toggled and the prompt toggled" {
+    const io = testing.io;
+    const server = try build(testing.allocator, io, .{});
+    defer destroy(server);
+    var h: Harness = .init(io, testing.allocator, server);
+    defer h.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try h.send(try testRequest(arena, 1, "tools/list", ""));
+    try testing.expect(try listed(arena, &h, "tools", "toggled"));
+    try h.send(try testRequest(arena, 2, "tools/call", "\"name\":\"toggle\",\"arguments\":{\"enabled\":false}"));
+    try testing.expectEqualStrings("tool toggled: disabled", try lastText(arena, &h));
+    try h.send(try testRequest(arena, 3, "tools/list", ""));
+    try testing.expect(!try listed(arena, &h, "tools", "toggled"));
+    try h.send(try testRequest(arena, 4, "tools/call", "\"name\":\"toggle\",\"arguments\":{\"enabled\":false}"));
+    try testing.expectEqualStrings("tool toggled: disabled (no change)", try lastText(arena, &h));
+    try h.send(try testRequest(arena, 5, "tools/call", "\"name\":\"toggle\",\"arguments\":{\"enabled\":true}"));
+    try testing.expectEqualStrings("tool toggled: enabled", try lastText(arena, &h));
+
+    try h.send(try testRequest(arena, 6, "tools/call", "\"name\":\"toggle\",\"arguments\":{\"enabled\":false,\"target\":\"prompt\"}"));
+    try testing.expectEqualStrings("prompt toggled: disabled", try lastText(arena, &h));
+    try h.send(try testRequest(arena, 7, "prompts/list", ""));
+    try testing.expect(!try listed(arena, &h, "prompts", "toggled"));
+    try testing.expect(try listed(arena, &h, "prompts", "greet"));
+
+    // The resource of the tool touch.
+    try h.send(try testRequest(arena, 8, "tools/call", "\"name\":\"touch\",\"arguments\":{\"uri\":\"" ++ notes_uri ++ "\"}"));
+    try testing.expectEqualStrings("touched " ++ notes_uri, try lastText(arena, &h));
+    try h.send(try testRequest(arena, 9, "resources/read", "\"uri\":\"" ++ notes_uri ++ "\""));
+    try testing.expectEqualStrings(notes_text, (try lastResult(arena, &h)).object.get("contents").?.array.items[0].object.get("text").?.string);
+}
+
+test "the tool log sends the messages at the log level of the request and above" {
+    const io = testing.io;
+    const server = try build(testing.allocator, io, .{});
+    defer destroy(server);
+    var h: Harness = .init(io, testing.allocator, server);
+    defer h.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // Without a log level, the server sends no log message.
+    try h.send(try testRequest(arena, 1, "tools/call", "\"name\":\"log\""));
+    try testing.expectEqual(@as(usize, 1), h.out.items.len);
+    try testing.expectEqualStrings("logged 4 messages", try lastText(arena, &h));
+    h.clear();
+    try h.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{},\"io.modelcontextprotocol/logLevel\":\"warning\"},\"name\":\"log\"}}");
+    try testing.expectEqual(@as(usize, 3), h.out.items.len);
+    for (h.out.items[0..2], [_][]const u8{ "warning", "error" }) |frame, level| {
+        const tree = try mcp.json.parseTree(arena, frame);
+        try testing.expectEqualStrings("notifications/message", mcp.json.getString(tree, "method").?);
+        const params = tree.object.get("params").?;
+        try testing.expectEqualStrings(level, mcp.json.getString(params, "level").?);
+        try testing.expectEqualStrings(log_logger, mcp.json.getString(params, "logger").?);
+    }
 }
 
 test "the progress tool sends one notification for each step before the result" {

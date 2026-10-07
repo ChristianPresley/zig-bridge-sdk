@@ -19,9 +19,15 @@
 //!   each such request until its answer. The reader puts each answer into the table at once,
 //!   also at the limit of requests in flight. It drops an answer whose id is not in the table,
 //!   because VS Code ignores a cancellation of the bridge and answers late.
+//! - After `notifications/initialized`, a listen stream sends the list changes and the
+//!   resource updates of the upstream server to the client (`notify.zig`).
+//!   `resources/subscribe` and `resources/unsubscribe` change the URIs of the stream.
+//! - Each upstream request has the log level of `logging/setLevel` and the `_meta` keys of the
+//!   client that the profile allows. The log messages of the upstream server go to the client
+//!   as `notifications/message` (`forwardLog`).
 //!
 //! A canceled request gets no response. Each task writes its frames under one lock, thus the
-//! frames do not mix.
+//! frames do not mix. This output lock is the last lock in each lock order.
 const Frontend = @This();
 
 const std = @import("std");
@@ -37,6 +43,7 @@ const bridge = @import("../bridge.zig");
 const legacy = @import("legacy.zig");
 const translate = @import("translate.zig");
 const input = @import("input.zig");
+const notify = @import("notify.zig");
 const Upstream = @import("Upstream.zig");
 const Profile = bridge.Profile;
 const TimeLimit = translate.TimeLimit;
@@ -76,6 +83,13 @@ pending_lock: Io.Mutex = .init,
 next_request: std.atomic.Value(u64) = .init(1),
 /// The number in the next `elicitationId` of a URL elicitation.
 next_elicitation: std.atomic.Value(u64) = .init(1),
+/// The listen stream of the notifications of the upstream server for the client.
+listener: notify.Listener,
+/// The notifications that the `initialize` result declares to the client. `runInitialize`
+/// sets it before the state becomes `ready`.
+declared: translate.Declared = .{},
+/// True after the start of the listener. Guarded by `in_flight_lock`.
+listening: bool = false,
 
 /// The lifecycle of the connection.
 pub const State = enum(u8) {
@@ -186,6 +200,11 @@ pub const Options = struct {
     /// The maximum number of input requests in one round. A round with more input requests
     /// fails with -32603, and the client gets none of them.
     max_input_requests_per_round: u32 = input.default_max_requests_per_round,
+    /// The first wait before a new listen stream after a loss. The wait doubles after each
+    /// loss.
+    listen_backoff: Io.Duration = .fromMilliseconds(500),
+    /// The longest wait before a new listen stream after a loss.
+    listen_max_backoff: Io.Duration = .fromSeconds(30),
     hooks: Hooks = .{},
 };
 
@@ -258,13 +277,22 @@ const Pending = struct {
 };
 
 pub fn init(io: Io, gpa: Allocator, upstream: *Upstream, profile: *const Profile, sink: Sink, options: Options) Frontend {
-    return .{ .io = io, .gpa = gpa, .upstream = upstream, .profile = profile, .sink = sink, .options = options };
+    return .{
+        .io = io,
+        .gpa = gpa,
+        .upstream = upstream,
+        .profile = profile,
+        .sink = sink,
+        .options = options,
+        .listener = .init(io, gpa, upstream),
+    };
 }
 
 /// Stop the requests in flight, and release the memory of the front end. The function does
 /// not release the upstream.
 pub fn deinit(self: *Frontend) void {
     self.shutdown();
+    self.listener.deinit();
     self.in_flight.deinit(self.gpa);
     self.pending.deinit(self.gpa);
 }
@@ -577,8 +605,15 @@ fn handleRequest(self: *Frontend, slot: *Slot, req: Message.Request) void {
                 const cause: translate.Cause = if (legacy.hasModernMeta(req.params)) .method_not_found else .not_initialized;
                 return self.errorInline(slot, translate.errorFor(cause, null));
             }
-            if (slot.kind != .forwarded) return self.errorInline(slot, translate.errorFor(.method_not_found, null));
-            _ = self.admit(slot);
+            switch (slot.kind) {
+                .forwarded => _ = self.admit(slot),
+                // Only a running listener can change the URIs. It starts at
+                // `notifications/initialized` when the result declares `resources.subscribe`.
+                .subscribe, .unsubscribe => if (self.declared.resources_subscribe and self.listener.isRunning()) {
+                    _ = self.admit(slot);
+                } else self.errorInline(slot, translate.errorFor(.method_not_found, null)),
+                else => self.errorInline(slot, translate.errorFor(.method_not_found, null)),
+            }
         },
     }
 }
@@ -603,7 +638,10 @@ fn closingInline(self: *Frontend, slot: *Slot) void {
 
 fn handleNotification(self: *Frontend, arena: Allocator, n: Message.Notification) void {
     switch (legacy.classifyNotification(n.method)) {
-        .initialized => log.debug("the client sent notifications/initialized", .{}),
+        .initialized => {
+            log.debug("the client sent notifications/initialized", .{});
+            self.startListener();
+        },
         .roots_list_changed => {},
         .other => log.debug("ignored the notification {s}", .{n.method}),
         .cancelled => {
@@ -619,6 +657,49 @@ fn handleNotification(self: *Frontend, arena: Allocator, n: Message.Notification
             }
         },
     }
+}
+
+/// Start the listen stream after `notifications/initialized`, when the `initialize` result
+/// declares a list change or `resources.subscribe`. The start happens under `in_flight_lock`,
+/// thus `stopAdmission` sees it. A second `notifications/initialized`, and one before the
+/// `initialize` result, start nothing.
+fn startListener(self: *Frontend) void {
+    if (self.lifecycle.load(.acquire) != .ready) return log.debug("ignored notifications/initialized: the connection is not ready", .{});
+    const d = self.declared;
+    if (!d.listens()) return;
+    self.in_flight_lock.lockUncancelable(self.io);
+    defer self.in_flight_lock.unlock(self.io);
+    if (!self.admitting or self.listening) return;
+    self.listening = true;
+    self.listener.start(&self.group, .{ .context = self, .vtable = &host_vtable }, .{
+        .tools = d.tools_list_changed,
+        .prompts = d.prompts_list_changed,
+        .resources = d.resources_list_changed,
+        .backoff = self.options.listen_backoff,
+        .max_backoff = self.options.listen_max_backoff,
+    }) catch |e| log.warn("cannot start the listen stream: {t}. The client gets no list changes.", .{e});
+}
+
+/// The functions of the front end for the listener.
+const host_vtable: notify.Host.VTable = .{ .write = hostWrite, .writeIf = hostWriteIf, .logLevel = hostLogLevel };
+
+fn hostWrite(context: *anyopaque, frame: []const u8) void {
+    const self: *Frontend = @ptrCast(@alignCast(context));
+    self.writeFrame(frame);
+}
+
+fn hostWriteIf(context: *anyopaque, frame: []const u8, active: *const std.atomic.Value(u64), generation: u64) bool {
+    const self: *Frontend = @ptrCast(@alignCast(context));
+    self.out_lock.lockUncancelable(self.io);
+    defer self.out_lock.unlock(self.io);
+    if (active.load(.acquire) != generation) return false;
+    self.writeLocked(frame);
+    return true;
+}
+
+fn hostLogLevel(context: *anyopaque) ?types.LoggingLevel {
+    const self: *Frontend = @ptrCast(@alignCast(context));
+    return self.clientLogLevel();
 }
 
 /// Start the task of a request, or answer it when the limit is full. The admission and the
@@ -677,6 +758,7 @@ fn runSlot(slot: *Slot) Io.Cancelable!void {
     switch (slot.kind) {
         .initialize => self.runInitialize(slot),
         .forwarded => self.runForward(slot),
+        .subscribe, .unsubscribe => self.runSubscribe(slot),
         else => unreachable,
     }
 }
@@ -690,6 +772,8 @@ fn runInitialize(self: *Frontend, slot: *Slot) void {
     log.info("initialize from {s} {s}", .{ params.clientInfo.name, params.clientInfo.version });
     const caps = translate.upstreamCapabilities(arena, params.capabilities, self.options.capability_mask) catch
         return self.failInitialize(slot, translate.errorFor(.out_of_memory, null));
+    // On stdio, the log messages of the upstream server belong to no request.
+    self.upstream.on_log = .{ .context = self, .call = upstreamLog };
     self.upstream.connect(params.clientInfo, caps) catch |e| {
         const cause: translate.Cause = if (e == error.OutOfMemory) .out_of_memory else .spawn_failed;
         return self.failInitialize(slot, translate.errorFor(cause, null));
@@ -700,6 +784,7 @@ fn runInitialize(self: *Frontend, slot: *Slot) void {
         .timeout = self.options.discover_timeout,
         .diagnostics = &diag,
         .client_id = slot.id,
+        .log_level = self.clientLogLevel(),
     }) catch |e| {
         if (e == error.Canceled) {
             // At the end of the input, `shutdown` closes the upstream.
@@ -721,6 +806,7 @@ fn runInitialize(self: *Frontend, slot: *Slot) void {
         .fallback_name = self.options.fallback_name,
         .mask = self.options.reply_mask,
     }) catch return self.failInitialize(slot, translate.errorFor(.out_of_memory, null));
+    self.declared = translate.declared(raw, self.options.reply_mask);
     // The state is `ready` before the response goes out, because the next requests of the
     // client can come at once. At the end of the input, the state is `closing`.
     if (self.lifecycle.cmpxchgStrong(.initializing, .ready, .acq_rel, .acquire) != null) return;
@@ -769,9 +855,16 @@ fn runForward(self: *Frontend, slot: *Slot) void {
         const raw = self.upstream.request(arena, slot.method, params, .{
             .cancel = &slot.token,
             .timeout = timeout,
-            .progress = if (fwd.progress_token != null) .{ .context = slot, .call = onProgress } else null,
+            .callbacks = .{
+                .context = slot,
+                .progress = if (fwd.progress_token != null) onProgress else null,
+                .log = onLog,
+            },
             .diagnostics = &diag,
             .client_id = slot.id,
+            // A change of the level reaches the next round.
+            .log_level = self.clientLogLevel(),
+            .meta = fwd.meta,
         }) catch |e| {
             if (e == error.Rpc and has_state) if (diag.rpc_error) |rpc| if (input.isRejectedState(rpc)) {
                 return self.rejectedState(slot, &session, rpc);
@@ -891,6 +984,63 @@ fn onProgress(context: ?*anyopaque, params: types.ProgressNotificationParams) vo
     }) catch return;
     defer self.gpa.free(frame);
     _ = self.writeForSlot(slot, frame, .notification);
+}
+
+/// A log message that the transport routed to a request, for example on the memory link.
+fn onLog(context: ?*anyopaque, params: types.LoggingMessageNotificationParams) void {
+    const slot: *Slot = @ptrCast(@alignCast(context.?));
+    slot.owner.forwardLog(params);
+}
+
+/// A log message of a stdio upstream server. It runs on the reader task of the upstream
+/// client.
+fn upstreamLog(context: *anyopaque, params: types.LoggingMessageNotificationParams) void {
+    const self: *Frontend = @ptrCast(@alignCast(context));
+    self.forwardLog(params);
+}
+
+/// Send a log message of the upstream server to the client as `notifications/message` of
+/// revision 2025-11-25. The function drops a message below the level of the client. The
+/// upstream server filters with the level of each request, but a request can start before a
+/// change of the level. The function only translates and writes under the output lock, thus
+/// the reader task of the upstream client can call it.
+pub fn forwardLog(self: *Frontend, params: types.LoggingMessageNotificationParams) void {
+    if (self.clientLogLevel()) |min| if (params.level.severity() < min.severity()) return;
+    const frame = mcp.json.writeAlloc(self.gpa, mcp.jsonrpc.message.OutNotification(translate.LogMessage){
+        .method = "notifications/message",
+        .params = translate.logMessage(params),
+    }) catch return log.debug("dropped a log message of the upstream server: no memory", .{});
+    defer self.gpa.free(frame);
+    self.writeFrame(frame);
+}
+
+/// Add the URI of `resources/subscribe` to the listen stream, or remove the URI of
+/// `resources/unsubscribe`. The listener writes the response (`notify.Change`).
+fn runSubscribe(self: *Frontend, slot: *Slot) void {
+    const params = legacy.parseSubscribeParams(slot.arena.allocator(), slot.params) catch |e| {
+        const cause: translate.Cause = if (e == error.OutOfMemory) .out_of_memory else .invalid_params;
+        return self.respondError(slot, translate.errorFor(cause, null));
+    };
+    var change: notify.Change = .{
+        .kind = if (slot.kind == .subscribe) .subscribe else .unsubscribe,
+        .uri = params.uri,
+        .respond = .{ .context = slot, .ok = subscribeOk, .fail = subscribeFail },
+    };
+    self.listener.change(&change);
+    // A canceled change has no response. After the end of the input, or after the loss of
+    // the upstream server, the slot drops this error.
+    if (change.outcome == .canceled) self.respondError(slot, translate.errorFor(.closed, "subscriptions/listen"));
+    self.logOutcome(slot, @tagName(change.outcome));
+}
+
+fn subscribeOk(context: *anyopaque) void {
+    const slot: *Slot = @ptrCast(@alignCast(context));
+    slot.owner.respond(slot, .{ .object = .empty });
+}
+
+fn subscribeFail(context: *anyopaque, err: translate.RpcError) void {
+    const slot: *Slot = @ptrCast(@alignCast(context));
+    slot.owner.respondError(slot, err);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1071,6 +1221,11 @@ fn respondError(self: *Frontend, slot: *Slot, err: translate.RpcError) void {
 fn writeFrame(self: *Frontend, frame: []const u8) void {
     self.out_lock.lockUncancelable(self.io);
     defer self.out_lock.unlock(self.io);
+    self.writeLocked(frame);
+}
+
+/// Write a frame that belongs to no slot task. The caller holds `out_lock`.
+fn writeLocked(self: *Frontend, frame: []const u8) void {
     if (self.closed.load(.acquire)) return;
     self.sink.write(self.sink.ptr, frame) catch |e| log.debug("cannot write a frame: {t}", .{e});
 }
@@ -1178,8 +1333,9 @@ fn upstreamLost(self: *Frontend) void {
     } else log.err("the upstream server stopped", .{});
     self.stopAdmission();
     self.failInFlight();
-    // This task is in the group, thus it cannot wait for the group. The requests fail at
-    // once, because the client of the upstream server is closed.
+    self.listener.stop();
+    // This task is in the group, thus it cannot wait for the group. The requests and the
+    // listen stream fail at once, because the client of the upstream server is closed.
     _ = self.waitForSlots(self.options.shutdown_grace);
     // After this step, no frame is in progress. Thus the hook can stop the process.
     self.closeOutput();
@@ -1236,20 +1392,22 @@ fn cancelAll(self: *Frontend, reason: []const u8) void {
     for (self.in_flight.items) |slot| cancelSlot(self.io, slot, reason);
 }
 
-/// Wait until no request is in flight, at most `grace`. Returns false at the end of `grace`.
+/// Wait until no request is in flight and the listener stopped, at most `grace`. Returns false
+/// at the end of `grace`.
 fn waitForSlots(self: *Frontend, grace: Io.Duration) bool {
     const io = self.io;
     const deadline = Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = grace, .clock = .awake });
-    while (self.inFlightCount() > 0) {
+    while (self.inFlightCount() > 0 or self.listener.isRunning()) {
         if (Io.Clock.Timestamp.now(io, .awake).durationTo(deadline).raw.nanoseconds <= 0) return false;
         io.sleep(.fromMilliseconds(5), .awake) catch return false;
     }
     return true;
 }
 
-/// Stop the connection. The function stops the admission and cancels each request in flight.
-/// It waits for them for at most `shutdown_grace`, then it cancels the tasks that are left
-/// and closes the upstream. The function does nothing the second time. `run` calls it at the
+/// Stop the connection. The function stops the admission, cancels each request in flight and
+/// stops the listener. It waits for them for at most `shutdown_grace`, then it cancels the
+/// tasks that are left and closes the upstream. Thus the listen stream ends before the
+/// upstream client closes. The function does nothing the second time. `run` calls it at the
 /// end of the input.
 pub fn shutdown(self: *Frontend) void {
     if (self.shut_down) return;
@@ -1259,6 +1417,7 @@ pub fn shutdown(self: *Frontend) void {
     if (!self.upstream_lost.load(.acquire)) if (self.options.hooks.on_eof) |f| f(self.options.hooks.context, self.upstream);
     self.stopAdmission();
     self.cancelAll(eof_cancel_reason);
+    self.listener.stop();
     if (self.waitForSlots(self.options.shutdown_grace)) {
         // Only the watcher can be left. `stop_event` wakes it.
         self.group.await(self.io) catch {};
@@ -1823,7 +1982,7 @@ const HoldTransport = struct {
     released: std.atomic.Value(bool) = .init(false),
 
     const Transport = mcp.transport.Transport;
-    const vtable: Transport.ClientTransport.VTable = .{ .kind = .memory, .exchange = exchange, .notify = notify };
+    const vtable: Transport.ClientTransport.VTable = .{ .kind = .memory, .exchange = exchange, .notify = onNotify };
 
     fn transport(self: *HoldTransport) Transport.ClientTransport {
         return .{ .ptr = self, .vtable = &vtable };
@@ -1843,7 +2002,7 @@ const HoldTransport = struct {
         return if (ex.cancel.isCancelled()) error.Canceled else error.Closed;
     }
 
-    fn notify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
+    fn onNotify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
         const self: *HoldTransport = @ptrCast(@alignCast(ptr));
         return self.inner.notify(io, frame);
     }
@@ -1869,7 +2028,7 @@ const ScriptTransport = struct {
     requests: usize = 0,
 
     const Transport = mcp.transport.Transport;
-    const vtable: Transport.ClientTransport.VTable = .{ .kind = .memory, .exchange = exchange, .notify = notify };
+    const vtable: Transport.ClientTransport.VTable = .{ .kind = .memory, .exchange = exchange, .notify = onNotify };
     const discover_result =
         \\{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{},"prompts":{}}}
     ;
@@ -1902,7 +2061,7 @@ const ScriptTransport = struct {
         ex.deliver(io, frame) catch return error.InvalidFrame;
     }
 
-    fn notify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
+    fn onNotify(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
         _ = .{ ptr, io, frame };
     }
 };
@@ -1966,11 +2125,16 @@ const TestBridge = struct {
     const profile: Profile = .{ .name = "mcp-bridge-test", .quirks = .{ .normalize_array_items = true } };
 
     fn create(options: Options) !*TestBridge {
+        return createWith(testServer, options);
+    }
+
+    /// A front end with the upstream server of `makeServer`.
+    fn createWith(makeServer: *const fn (gpa: Allocator, io: Io) anyerror!*mcp.Server, options: Options) !*TestBridge {
         const io = testing.io;
         const gpa = testing.allocator;
         const self = try gpa.create(TestBridge);
         errdefer gpa.destroy(self);
-        self.server = try testServer(gpa, io);
+        self.server = try makeServer(gpa, io);
         errdefer destroyServer(self.server);
         self.upstream = try Upstream.init(io, gpa, .{ .memory = self.server });
         self.out = .{ .io = io };
@@ -2017,7 +2181,7 @@ const vscode_initialize =
     \\{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{"listChanged":true},"sampling":{},"elicitation":{"form":{},"url":{}},"tasks":{"list":{},"cancel":{},"requests":{"sampling":{"createMessage":{}},"elicitation":{"create":{}}}},"extensions":{"io.modelcontextprotocol/ui":{"mimeTypes":["text/html;profile=mcp-app"]}}},"clientInfo":{"name":"Visual Studio Code","version":"1.140.0"}}}
 ;
 
-fn testServer(gpa: Allocator, io: Io) !*mcp.Server {
+fn testServer(gpa: Allocator, io: Io) anyerror!*mcp.Server {
     const server = try gpa.create(mcp.Server);
     errdefer gpa.destroy(server);
     server.* = try mcp.Server.init(gpa, io, .{
@@ -2169,8 +2333,12 @@ test "the initialize result for VS Code, and a second initialize" {
     try testing.expectEqualStrings("2025-11-25", result.object.get("protocolVersion").?.string);
     const caps = result.object.get("capabilities").?;
     try testing.expect(caps.object.get("tools") != null);
-    try testing.expect(caps.object.get("tools").?.object.get("listChanged") == null);
+    // The upstream server declares the list changes of its tools, thus the result has them.
+    try testing.expect(caps.object.get("tools").?.object.get("listChanged").?.bool);
+    try testing.expect(caps.object.get("resources") == null);
     try testing.expect(caps.object.get("tasks") == null);
+    try testing.expect(b.frontend.declared.tools_list_changed);
+    try testing.expect(!b.frontend.declared.resources_subscribe);
     try testing.expectEqualStrings("frontend-test", result.object.get("serverInfo").?.object.get("name").?.string);
     for ([_][]const u8{ "resultType", "ttlMs", "cacheScope", "_meta" }) |key| try testing.expect(result.object.get(key) == null);
     try testing.expectEqual(State.ready, b.frontend.state());
@@ -2185,6 +2353,7 @@ test "the initialize result for VS Code, and a second initialize" {
 
     try expectError(try b.call(2, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":{}}"), -32600, "already_initialized");
     try expectError(try b.call(3, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"server/discover\"}"), -32601, "method_not_found");
+    // The upstream server declares no subscriptions.
     try expectError(try b.call(4, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"resources/subscribe\",\"params\":{\"uri\":\"x:/y\"}}"), -32601, "method_not_found");
     try expectError(try b.call(5, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tasks/list\"}"), -32601, "method_not_found");
 }
@@ -2801,4 +2970,177 @@ test "run reads the lines until the end of the input" {
     // the shutdown cancels the initialize.
     try testing.expect(b.out.has("\"id\":2,\"result\":{}"));
     try testing.expectEqual(State.closing, b.frontend.state());
+}
+
+// The tests of the notifications: the listen stream, the subscriptions and the log messages.
+
+const notes_uri = "file:///test/notes.txt";
+
+/// An upstream server with notifications: a tool that changes the tool list, a resource with
+/// updates, and log messages.
+fn notifyServer(gpa: Allocator, io: Io) anyerror!*mcp.Server {
+    const server = try gpa.create(mcp.Server);
+    errdefer gpa.destroy(server);
+    server.* = try mcp.Server.init(gpa, io, .{
+        .info = .{ .name = "notify-test", .version = "1.0.0" },
+        .capabilities = .{ .logging = .{ .object = .empty } },
+    });
+    errdefer server.deinit();
+    try server.addToolJson(.{ .name = "flip", .description = "Disable the tool spare" }, testFlip);
+    try server.addToolJson(.{ .name = "spare", .description = "A tool that flip disables" }, testAsk);
+    try server.addToolJson(.{ .name = "poke", .description = "Tell the subscribers that the notes changed" }, testPoke);
+    try server.addToolJson(.{ .name = "say", .description = "Send log messages" }, testSay);
+    try server.addResource(.{ .uri = notes_uri, .name = "notes", .mime_type = "text/plain" }, testNotes);
+    return server;
+}
+
+fn testFlip(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    _ = args;
+    const changed = ctx.server.setToolEnabled(ctx.io, "spare", false);
+    return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "changed: {}", .{changed}) };
+}
+
+fn testPoke(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    _ = args;
+    ctx.server.notifyResourceUpdated(ctx.io, notes_uri);
+    return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "poked", .{}) };
+}
+
+fn testSay(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    _ = args;
+    try ctx.log(.debug, "test", .{ .string = "debug" });
+    try ctx.log(.warning, "test", .{ .string = "warning" });
+    return .{ .complete = try mcp.CallToolResult.text(ctx.arena, "said", .{}) };
+}
+
+fn testNotes(ctx: *mcp.RequestContext, uri: []const u8) anyerror!mcp.Outcome(mcp.ReadResourceResult) {
+    const contents = try ctx.arena.alloc(types.ResourceContents, 1);
+    contents[0] = .{ .text = .{ .uri = uri, .mimeType = "text/plain", .text = "notes" } };
+    return .{ .complete = .{ .contents = contents } };
+}
+
+/// The methods of the frames from `start`, or "response" for a response.
+fn methodsFrom(out: *TestSink, arena: Allocator, start: usize) ![]const []const u8 {
+    out.lock.lockUncancelable(testing.io);
+    defer out.lock.unlock(testing.io);
+    var list: std.ArrayList([]const u8) = .empty;
+    for (out.frames.items[start..]) |f| {
+        const v = try mcp.json.parseTree(arena, f);
+        try list.append(arena, mcp.json.getString(v, "method") orelse "response");
+    }
+    return list.items;
+}
+
+fn expectMethods(expected: []const []const u8, actual: []const []const u8) !void {
+    if (expected.len == actual.len) {
+        for (expected, actual) |want, got| {
+            if (!std.mem.eql(u8, want, got)) break;
+        } else return;
+    }
+    std.debug.print("\nexpected the methods {f}, got {f}\n", .{ std.json.fmt(expected, .{}), std.json.fmt(actual, .{}) });
+    return error.TestExpectedEqual;
+}
+
+fn expectJson(arena: Allocator, expected: []const u8, value: Value) !void {
+    try testing.expectEqualStrings(expected, try mcp.json.writeAlloc(arena, value));
+}
+
+/// Send `notifications/initialized`, and wait for the first acknowledgment of the listen
+/// stream.
+fn startListening(b: *TestBridge) !void {
+    try b.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+    var i: usize = 0;
+    while (b.frontend.listener.acknowledgments.load(.acquire) == 0) : (i += 1) {
+        if (i > 5000) return error.TestTimeout;
+        try testing.io.sleep(.fromMilliseconds(1), .awake);
+    }
+}
+
+test "notifications/initialized starts the listen stream, and a change of the tools comes before the result" {
+    const b = try TestBridge.createWith(notifyServer, .{});
+    defer b.destroy();
+    try b.initialize();
+    try testing.expect(b.frontend.declared.listens());
+    try testing.expect(b.frontend.declared.logging);
+    try startListening(b);
+    // A second notifications/initialized starts nothing.
+    try b.send("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}");
+    const arena = b.arena_state.allocator();
+    // The list changes after the acknowledgment. The server has no prompts.
+    try expectMethods(&.{ "response", "notifications/tools/list_changed", "notifications/resources/list_changed" }, try methodsFrom(&b.out, arena, 0));
+    const start = b.out.count();
+    _ = try b.call(2, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"flip\"}}");
+    try expectMethods(&.{ "notifications/tools/list_changed", "response" }, try methodsFrom(&b.out, arena, start));
+    // A call that changes nothing gives no list change.
+    _ = try b.call(3, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"flip\"}}");
+    try expectMethods(&.{ "notifications/tools/list_changed", "response", "response" }, try methodsFrom(&b.out, arena, start));
+    try testing.expectEqual(@as(u64, 1), b.frontend.listener.acknowledgments.load(.acquire));
+}
+
+test "resources/subscribe and resources/unsubscribe change the URIs of the listen stream" {
+    const b = try TestBridge.createWith(notifyServer, .{});
+    defer b.destroy();
+    try b.initialize();
+    try startListening(b);
+    const arena = b.arena_state.allocator();
+    const start = b.out.count();
+    const subscribed = try b.call(2, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/subscribe\",\"params\":{\"uri\":\"" ++ notes_uri ++ "\"}}");
+    try testing.expectEqual(@as(usize, 0), subscribed.object.get("result").?.object.count());
+    // The new stream gives no list change, and its update comes before the result of the call.
+    _ = try b.call(3, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"poke\"}}");
+    try expectMethods(&.{ "response", "notifications/resources/updated", "response" }, try methodsFrom(&b.out, arena, start));
+    const updates = try b.out.withMethod(arena, "notifications/resources/updated");
+    try expectJson(arena, "{\"uri\":\"" ++ notes_uri ++ "\"}", updates[0].object.get("params").?);
+    // A URI that the stream has already gets `{}` without a new stream.
+    _ = try b.call(4, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"resources/subscribe\",\"params\":{\"uri\":\"" ++ notes_uri ++ "\"}}");
+    // An unknown URI gets `{}`, and parameters that are not valid get -32602.
+    _ = try b.call(5, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"resources/unsubscribe\",\"params\":{\"uri\":\"file:///other\"}}");
+    try expectError(try b.call(6, "{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"resources/subscribe\",\"params\":{\"uri\":5}}"), -32602, "invalid_params");
+    _ = try b.call(7, "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"resources/unsubscribe\",\"params\":{\"uri\":\"" ++ notes_uri ++ "\"}}");
+    for ([_]i64{ 4, 5, 7 }) |id| try testing.expect((try b.out.byId(arena, id)).object.get("result") != null);
+    // After the unsubscribe, an update does not reach the client.
+    const before = b.out.count();
+    _ = try b.call(8, "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"tools/call\",\"params\":{\"name\":\"poke\"}}");
+    try expectMethods(&.{"response"}, try methodsFrom(&b.out, arena, before));
+}
+
+test "logging/setLevel goes upstream with each request, and the log messages of a request go to the client" {
+    const b = try TestBridge.createWith(notifyServer, .{});
+    defer b.destroy();
+    try b.initialize();
+    const arena = b.arena_state.allocator();
+    // Without a level, the upstream server sends no log message.
+    var start = b.out.count();
+    _ = try b.call(2, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"say\"}}");
+    try expectMethods(&.{"response"}, try methodsFrom(&b.out, arena, start));
+    // The upstream server sends the messages at the level and above. The memory link gives
+    // them to the request.
+    _ = try b.call(3, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"logging/setLevel\",\"params\":{\"level\":\"info\"}}");
+    start = b.out.count();
+    _ = try b.call(4, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"say\"}}");
+    try expectMethods(&.{ "notifications/message", "response" }, try methodsFrom(&b.out, arena, start));
+    const messages = try b.out.withMethod(arena, "notifications/message");
+    try expectJson(arena, "{\"level\":\"warning\",\"logger\":\"test\",\"data\":\"warning\"}", messages[0].object.get("params").?);
+    // The bridge also drops a message below the level of the client.
+    b.frontend.forwardLog(.{ .level = .info, .data = .{ .string = "x" } });
+    b.frontend.forwardLog(.{ .level = .debug, .data = .{ .string = "y" } });
+    b.frontend.forwardLog(.{ .level = .critical, .data = .{ .integer = 1 } });
+    try testing.expectEqual(@as(usize, 3), (try b.out.withMethod(arena, "notifications/message")).len);
+}
+
+test "the end of the input stops the listen stream before the upstream closes" {
+    const b = try TestBridge.createWith(notifyServer, .{});
+    defer b.destroy();
+    try b.initialize();
+    try startListening(b);
+    try testing.expect(b.frontend.listener.isRunning());
+    const before = b.out.count();
+    const started = Io.Clock.Timestamp.now(testing.io, .awake);
+    b.frontend.shutdown();
+    try testing.expect(started.durationTo(Io.Clock.Timestamp.now(testing.io, .awake)).raw.toMilliseconds() < 1000);
+    try testing.expect(!b.frontend.listener.isRunning());
+    try testing.expect(b.upstream.conn == null);
+    // A subscribe after the end of the input gets nothing.
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/subscribe\",\"params\":{\"uri\":\"" ++ notes_uri ++ "\"}}");
+    try testing.expectEqual(before, b.out.count());
 }

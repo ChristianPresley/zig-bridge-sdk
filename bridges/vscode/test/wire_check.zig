@@ -10,6 +10,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const mcp = @import("mcp");
+const vscode = @import("vscode");
 const validator = mcp.schema.validator;
 
 const schema_2025_11_25 = @embedFile("schema_2025_11_25");
@@ -129,14 +130,26 @@ pub fn notificationDefinition(method: []const u8) ?[]const u8 {
         .{ "notifications/progress", "ProgressNotification" },
         .{ "notifications/cancelled", "CancelledNotification" },
         .{ "notifications/elicitation/complete", "ElicitationCompleteNotification" },
+        .{ "notifications/tools/list_changed", "ToolListChangedNotification" },
+        .{ "notifications/prompts/list_changed", "PromptListChangedNotification" },
+        .{ "notifications/resources/list_changed", "ResourceListChangedNotification" },
+        .{ "notifications/resources/updated", "ResourceUpdatedNotification" },
+        .{ "notifications/message", "LoggingMessageNotification" },
     });
     return map.get(method);
+}
+
+/// True for the notifications of a listen stream that the bridge sends to VS Code.
+pub fn isListenEvent(method: []const u8) bool {
+    for (vscode.bridge.translate.forwarded_events) |m| if (std.mem.eql(u8, m, method)) return true;
+    return false;
 }
 
 /// The definition of the 2026-07-28 schema for a request to the upstream server, or null.
 pub fn upstreamRequestDefinition(method: []const u8) ?[]const u8 {
     const map: std.StaticStringMap([]const u8) = .initComptime(.{
         .{ "server/discover", "DiscoverRequest" },
+        .{ "subscriptions/listen", "SubscriptionsListenRequest" },
         .{ "tools/list", "ListToolsRequest" },
         .{ "tools/call", "CallToolRequest" },
         .{ "prompts/list", "ListPromptsRequest" },
@@ -155,8 +168,8 @@ pub const modern_result_members = [_][]const u8{ "resultType", "ttlMs", "cacheSc
 /// The `_meta` keys of a result that the bridge removes.
 pub const modern_result_meta = [_][]const u8{ "io.modelcontextprotocol/serverInfo", "io.modelcontextprotocol/subscriptionId" };
 
-/// The `_meta` keys that the upstream client of this version writes into a request. The
-/// bridge sends no key of VS Code to the upstream server in this version.
+/// The `_meta` keys that the upstream client writes into a request. The other keys of a
+/// request must be keys that the VS Code profile passes to the upstream server.
 pub const upstream_meta_keys = [_][]const u8{
     "io.modelcontextprotocol/protocolVersion",
     "io.modelcontextprotocol/clientInfo",
@@ -238,11 +251,11 @@ fn truthy(v: Value) bool {
     };
 }
 
-/// Fail when a request to the upstream server has `task` or a `_meta` key of VS Code. This
-/// version of the bridge must not send them. Also fail when the client capabilities declare
-/// `tasks`, the Tasks extension, `roots.listChanged`, `sampling.tools` or `sampling.context`.
-/// The clients of the transcripts declare no sampling with tools or context, thus the bridge
-/// must not declare them upstream.
+/// Fail when a request to the upstream server has `task`, or a `_meta` key of VS Code that the
+/// profile does not pass. Also fail when the client capabilities declare `tasks`, the Tasks
+/// extension, `roots.listChanged`, `sampling.tools` or `sampling.context`. The clients of the
+/// transcripts declare no sampling with tools or context, thus the bridge must not declare
+/// them upstream.
 pub fn expectUpstreamRequest(method: []const u8, frame: Value) !void {
     const params = frame.object.get("params") orelse return fail("the upstream {s} request has no params", .{method});
     if (params.object.get("task") != null) return fail("the upstream {s} request has a task", .{method});
@@ -250,6 +263,7 @@ pub fn expectUpstreamRequest(method: []const u8, frame: Value) !void {
     var it = meta.object.iterator();
     next: while (it.next()) |kv| {
         for (upstream_meta_keys) |k| if (std.mem.eql(u8, k, kv.key_ptr.*)) continue :next;
+        if (vscode.profile.meta_passthrough.allows(kv.key_ptr.*)) continue;
         return fail("the upstream {s} request has the _meta key {s}", .{ method, kv.key_ptr.* });
     }
     const caps = meta.object.get("io.modelcontextprotocol/clientCapabilities") orelse

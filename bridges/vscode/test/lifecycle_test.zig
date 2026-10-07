@@ -39,14 +39,14 @@ test "the initialize of VS Code gives the result that VS Code needs" {
     // Without `tools`, VS Code never sends tools/list.
     const tools = caps.object.get("tools") orelse return error.TestNoToolsCapability;
     try testing.expect(tools == .object);
-    // This version sends no notification to VS Code, thus it declares no list changes, no
-    // subscriptions and no logging.
-    try testing.expect(tools.object.get("listChanged") == null);
-    try testing.expect(caps.object.get("prompts").?.object.get("listChanged") == null);
+    // The bridge sends the list changes, the resource updates and the log messages of the
+    // upstream server to VS Code. Thus it declares them as the upstream server does.
+    try testing.expect(tools.object.get("listChanged").?.bool);
+    try testing.expect(caps.object.get("prompts").?.object.get("listChanged").?.bool);
     const resources = caps.object.get("resources").?;
-    try testing.expect(resources.object.get("listChanged") == null);
-    try testing.expect(resources.object.get("subscribe") == null);
-    try testing.expect(caps.object.get("logging") == null);
+    try testing.expect(resources.object.get("listChanged").?.bool);
+    try testing.expect(resources.object.get("subscribe").?.bool);
+    try testing.expect(caps.object.get("logging") != null);
     try testing.expect(caps.object.get("completions") != null);
     try testing.expect(caps.object.get("tasks") == null);
     const extensions = caps.object.get("extensions").?;
@@ -75,6 +75,19 @@ test "the initialize of VS Code gives the result that VS Code needs" {
     try testing.expect(upstream_caps.roots != null);
     try testing.expect(upstream_caps.hasExtension(mcp.apps.extension_id));
     try testing.expect(!upstream_caps.hasExtension(mcp.tasks.extension_id));
+
+    // After `notifications/initialized`, the bridge opens one listen stream for the three
+    // lists. After its acknowledgment, VS Code gets one list change for each list. Thus a
+    // change before the first tools/list of VS Code is not lost.
+    try testing.expectEqual(@as(usize, 1), t.tap.listenCount());
+    const listen = (try t.tap.listenRequest(t.arena(), 0)).object.get("params").?.object.get("notifications").?;
+    try testing.expectEqual(@as(usize, 3), listen.object.count());
+    const frames = try t.parsedFrames();
+    try testing.expectEqual(@as(usize, 4), frames.len);
+    for (frames[1..], [_][]const u8{ "notifications/tools/list_changed", "notifications/prompts/list_changed", "notifications/resources/list_changed" }) |frame, method| {
+        try testing.expectEqualStrings(method, mcp.json.getString(frame, "method").?);
+        try testing.expect(frame.object.get("params") == null);
+    }
 
     // The first request of VS Code after `notifications/initialized`.
     const tap = try t.tapUpstream();
@@ -343,6 +356,7 @@ test "the Copilot harness: discover first, then initialize, then requests with p
     try testing.expect(client.options.capabilities.hasElicitation(.url));
     try testing.expect(client.options.capabilities.roots == null);
     try t.send(h.initialized);
+    try t.waitListening(1);
 
     // The harness sends `_meta.progressToken: 0` with each request.
     const tap = try t.tapUpstream();
@@ -384,6 +398,8 @@ test "the Copilot harness: discover first, then initialize, then requests with p
     for (try t.parsedFrames()) |frame| {
         const method = mcp.json.getString(frame, "method") orelse continue;
         if (std.mem.eql(u8, method, "elicitation/create")) continue;
+        // The list changes after the acknowledgment of the listen stream.
+        if (h.isListenEvent(method)) continue;
         try testing.expectEqualStrings("notifications/progress", method);
         try testing.expectEqual(@as(i64, 0), frame.object.get("params").?.object.get("progressToken").?.integer);
         progress += 1;

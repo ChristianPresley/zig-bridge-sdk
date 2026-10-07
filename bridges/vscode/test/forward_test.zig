@@ -31,10 +31,10 @@ test "the pages of tools/list never have a nextCursor that is null" {
         cursor = next.string;
         if (pages > 10) return error.TestTooManyPages;
     }
-    // echo, add, slow, progress, bare_array, structured, the nine tools that ask for input, show
-    // and tool_0 to tool_8.
-    try testing.expectEqual(@as(usize, 25), names.items.len);
-    try testing.expectEqual(@as(usize, 7), pages);
+    // echo, add, slow, progress, bare_array, structured, the nine tools that ask for input,
+    // toggle, toggled, touch, log, show and tool_0 to tool_8.
+    try testing.expectEqual(@as(usize, 29), names.items.len);
+    try testing.expectEqual(@as(usize, 8), pages);
     for (names.items, 0..) |n, i| for (names.items[i + 1 ..]) |m| try testing.expect(!std.mem.eql(u8, n, m));
     for (0..t.count()) |i| try testing.expect(std.mem.indexOf(u8, t.text(i), "\"nextCursor\":null") == null);
     try t.verify();
@@ -46,18 +46,22 @@ test "tools/call with the progress token of VS Code gets the progress with that 
     _ = try t.initialize();
     const tap = try t.tapUpstream();
     const a = t.arena();
+    const start = t.count();
 
     // The `_meta` of a tools/call of VS Code: a UUID token, the keys of VS Code and the
     // trace context.
     const uuid = "8f14e45f-ceea-4672-9b2f-0c3b7c2d5a11";
+    // A key that is not valid, a key of zig-sdk and a key outside the profile stay with the
+    // bridge, and the call does not fail.
     const params = "{\"name\":\"progress\",\"arguments\":{\"count\":3},\"_meta\":{\"progressToken\":\"" ++ uuid ++
-        "\",\"vscode.conversationId\":\"c-1\",\"vscode.requestId\":\"r-1\",\"traceparent\":\"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\",\"tracestate\":\"x=1\"}}";
+        "\",\"vscode.conversationId\":\"c-1\",\"vscode.requestId\":\"r-1\",\"traceparent\":\"00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01\",\"tracestate\":\"x=1\"," ++
+        "\"vscode.bad key\":1,\"io.modelcontextprotocol/logLevel\":\"debug\",\"baggage\":\"b=1\"}}";
     const result = try h.expectResult(try t.request(2, "tools/call", params));
     try testing.expectEqualStrings("sent 3 progress notifications", try h.firstText(result));
 
     const response_index = (try t.responseIndex(2)).?;
     var steps: usize = 0;
-    for (try t.parsedFrames(), 0..) |frame, i| {
+    for ((try t.parsedFrames())[start..], start..) |frame, i| {
         const method = mcp.json.getString(frame, "method") orelse continue;
         try testing.expectEqualStrings("notifications/progress", method);
         // Each progress comes before the result.
@@ -73,13 +77,19 @@ test "tools/call with the progress token of VS Code gets the progress with that 
     }
     try testing.expectEqual(@as(usize, 3), steps);
 
-    // Upstream, the request has the token of the upstream client, and no key of VS Code in
-    // this version. `verify` also checks the keys.
+    // Upstream, the request has the token of the upstream client. The keys of VS Code and the
+    // trace context go upstream unchanged. `verify` also checks the keys.
     const req = try tap.request(a, 0);
     const meta = req.object.get("params").?.object.get("_meta").?;
     try testing.expectEqual(req.object.get("id").?.integer, meta.object.get("progressToken").?.integer);
-    try testing.expect(meta.object.get("vscode.conversationId") == null);
-    try testing.expect(meta.object.get("traceparent") == null);
+    try testing.expectEqualStrings("c-1", meta.object.get("vscode.conversationId").?.string);
+    try testing.expectEqualStrings("r-1", meta.object.get("vscode.requestId").?.string);
+    try testing.expectEqualStrings("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01", meta.object.get("traceparent").?.string);
+    try testing.expectEqualStrings("x=1", meta.object.get("tracestate").?.string);
+    // VS Code set no log level.
+    try testing.expect(meta.object.get("io.modelcontextprotocol/logLevel") == null);
+    try testing.expect(meta.object.get("vscode.bad key") == null);
+    try testing.expect(meta.object.get("baggage") == null);
 
     // Without a token, VS Code gets no progress.
     const before = t.count();

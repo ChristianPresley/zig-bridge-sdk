@@ -4,7 +4,8 @@
 //!
 //! Usage: `bridge-fixture-server [--many-tools N] [--close-stdout]`. With `--many-tools N`, the
 //! server also has the generated tools `tool_0` to `tool_<N-1>`. The tool `crash` stops the
-//! process with the exit code 3.
+//! process with the exit code 3. The tool `shutdown` ends the listen streams as at the end of
+//! the input, and then stops the process with the exit code 0.
 //!
 //! With `--close-stdout`, the process is a server that does not operate correctly. It closes
 //! its stdout at once, and then it waits for `close_stdout_wait_s` seconds without a read. Thus

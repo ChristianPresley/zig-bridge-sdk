@@ -28,6 +28,9 @@ pub const Upstream = @import("bridge/Upstream.zig");
 /// The input requests of the upstream server: the checks, the rounds and the answers of the
 /// client.
 pub const input = @import("bridge/input.zig");
+/// The listen stream of the upstream server: the list changes and the resource updates for
+/// the client.
+pub const notify = @import("bridge/notify.zig");
 
 test {
     _ = legacy;
@@ -36,6 +39,7 @@ test {
     _ = Frontend;
     _ = Upstream;
     _ = input;
+    _ = notify;
     _ = @import("bridge/fuzz_test.zig");
 }
 

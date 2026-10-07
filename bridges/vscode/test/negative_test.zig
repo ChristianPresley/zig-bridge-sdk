@@ -237,6 +237,7 @@ test "the results of a scripted upstream server lose the members of revision 202
     defer t.destroy();
     _ = try t.initialize();
     const tap = try t.tapUpstream();
+    const start = t.count();
 
     // A nextCursor that is null, with the members of revision 2026-07-28.
     tap.setScript(.{ .result = "{\"resultType\":\"complete\",\"ttlMs\":60000,\"cacheScope\":\"public\",\"tools\":[],\"nextCursor\":null,\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"s\",\"version\":\"1\"}}}" });
@@ -263,7 +264,8 @@ test "the results of a scripted upstream server lose the members of revision 202
     const refused = try t.request(5, "tools/call", echo_params);
     try h.expectError(refused, -32603, undeclared_message, "undeclared_input_request");
     try testing.expectEqualStrings("input request 'plan': sampling with tools needs sampling.tools, and the client did not declare it", h.errorDetail(refused).?);
-    for (try t.parsedFrames()) |frame| try testing.expect(frame.object.get("method") == null);
+    // The frames after the list changes of the listen stream have no request of the bridge.
+    for ((try t.parsedFrames())[start..]) |frame| try testing.expect(frame.object.get("method") == null);
     try testing.expectEqual(@as(usize, 0), t.frontend.pendingCount());
 
     // Structured content that is not an object goes to VS Code unchanged, with a text copy.
