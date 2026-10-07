@@ -2,7 +2,7 @@
 
 `mcp-bridge-vscode` is a bridge between Visual Studio Code (VS Code) and an MCP server of specification revision 2026-07-28.[^mcp-2026] The MCP clients of VS Code speak revision 2025-11-25.[^mcp-2025] The bridge is a stdio server for VS Code. It starts the upstream server as a child process and connects to it with the `mcp.Client` of zig-sdk.
 
-This version is milestone M1, the runtime. The input requests of the upstream server arrive in M2. The [Status](#status) section tells what each milestone adds.
+This version is milestone M2. The bridge sends the input requests of the upstream server to VS Code. The [Status](#status) section tells what each milestone adds.
 
 Visual Studio Code and VS Code are trademarks of Microsoft Corporation. This project has no affiliation with Microsoft, and Microsoft does not endorse it.
 
@@ -21,9 +21,9 @@ VS Code marks the Local harness for removal in a future release. Until VS Code s
 
 ## Status
 
-This is milestone M1. The bridge starts the upstream command and speaks to it over stdio. It answers `initialize`, and it forwards the requests for tools, prompts, resources and completion. It also forwards the progress notifications of the upstream server and the cancellations of VS Code.
+This is milestone M2. The bridge starts the upstream command and speaks to it over stdio. It answers `initialize`, and it forwards the requests for tools, prompts, resources and completion. It also forwards the progress notifications of the upstream server and the cancellations of VS Code. When a tool, a prompt or a resource needs input, the bridge asks VS Code. The section [Input requests](#input-requests) gives the rules.
 
-A tool that asks for input gets an error until M2. Until M3, the `initialize` result does not announce list changes, resource subscriptions or log messages. The section [Options](#options) gives the command line.
+Until M3, the `initialize` result does not announce list changes, resource subscriptions or log messages. The section [Options](#options) gives the command line.
 
 The [Roadmap](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/Roadmap) on the wiki is the plan of record. Each milestone adds these parts:
 
@@ -94,7 +94,7 @@ The options of the bridge come before `--`. The bridge does not examine the argu
 
 VS Code has no limit for the length of a message. A message of VS Code that is longer than `--max-line-bytes` gets the error -32600 with the id of the request. The bridge cannot read a response of the upstream server that is longer than the limit. The request then gets -32603 at the end of its time limit.
 
-Each forwarded request has a time limit. The limit is 120 s for the list requests, `completion/complete`, `prompts/get` and `resources/read`, and 1 h for `tools/call`.
+Each forwarded request has a time limit. The limit is 120 s for the list requests, `completion/complete`, `prompts/get` and `resources/read`, and 1 h for `tools/call`. The answers of VS Code to the input requests of one round have a limit of 1 h. After the first round, each round of `prompts/get` and `resources/read` also has a limit of 1 h.
 
 The exit code of the bridge tells why it stopped:
 
@@ -176,6 +176,44 @@ The Copilot harness does not get the entries of `.vscode/mcp.json` that use `${i
 - The URL form (M4): `mcp-bridge-vscode <https-url>` will connect to an upstream server over HTTPS, with OAuth sign-in. The secret values of HTTP headers will come from environment variables, not from `args`.
 - The API of M5: a zig-sdk server will serve the two revisions in one process, without the separate executable.
 
+## Input requests
+
+A server of revision 2026-07-28 asks for input with a result of the type `input_required`. That result has one or more input requests. The bridge sends each input request to VS Code as a request of revision 2025-11-25, with an id such as `b-1`. It sends all input requests of one round at one time. When VS Code answers all of them, the bridge sends the upstream request again with the answers. The next result can ask for more input, or it can be the result for VS Code.
+
+| Input request | Request to VS Code | What VS Code does |
+| --- | --- | --- |
+| A form | `elicitation/create` with `mode: "form"` | It shows the questions of the form to the user. |
+| A URL | `elicitation/create` with `mode: "url"` | It shows the URL, and the user can open it in the web browser. |
+| Sampling | `sampling/createMessage` | It asks the user for consent, then it sends the messages to a language model. |
+| Roots | `roots/list` | It gives the folders of the workspace. |
+
+The bridge declares to the upstream server the input kinds that VS Code declares. The Copilot harness declares no roots. Before VS Code gets an input request, the bridge examines it:
+
+- VS Code must declare the kind of the input request.
+- VS Code declares no `sampling.tools`. Thus a sampling request with tools fails.
+- One round has at most 16 input requests.
+- VS Code gets a URL only with the scheme `https`, or with the scheme `http` and a loopback host (`localhost`, an address in `127.0.0.0/8`, or `[::1]`). VS Code can also open other schemes, such as `file:`, `vscode:` and `command:`. For such a URL, the upstream server gets the answer decline, and the bridge writes a warning.
+- A URL with a backslash, or an `http` URL with user information before the host, also gets decline. The web browser can find a different host in such a URL.
+- VS Code cannot show a form without a property, for example a confirmation. For such a form, VS Code gets a form with the message of the server and one choice, Continue. When the user accepts, the upstream server gets accept with empty content.
+
+When a check fails, the request of VS Code gets the error -32603, and VS Code gets no request of that round. The `data.detail` of the error names the key of the input request.
+
+The bridge also examines the answers of VS Code:
+
+- The accepted content of a form must be valid against the schema of the form. VS Code does not examine it. Content that is not valid gives the error -32603.
+- The upstream server gets only the roots with a `file://` URI.
+- An answer to a URL never has content. An answer that declines or cancels never has content.
+- When VS Code answers an elicitation with an error, the upstream server gets the answer cancel. When VS Code answers a sampling or roots request with an error, the original request gets that error. VS Code refuses a sampling request with the error -32000.
+
+These rules apply across the rounds of one request:
+
+- A URL request has an `elicitationId`. After the user accepts the URL, VS Code gets `notifications/elicitation/complete` when the upstream server does not ask for the URL again. VS Code also gets it when the request ends with an error or a cancellation. Then VS Code hides the URL in the chat.
+- A server can ask for an accepted URL again in the next round. It does so when it has no result of the step in the web browser yet. VS Code then does not show the URL again. It shows a form with one choice, Continue. Select Continue after you complete the step in the web browser.
+- One request has at most 10 rounds.
+- The upstream server keeps the state of the request for a time limit, 600 s for a zig-sdk server. It refuses an answer that comes after this limit. Then a tool call gets a result with an error text that tells you to run the tool again. Another request gets an error with the same text.
+
+VS Code ignores the cancellation of a request of the bridge. When you stop a request in the chat, a question of the bridge can stay open. The bridge ignores a late answer.
+
 ## Troubleshooting
 
 VS Code writes the messages of each MCP server to an Output channel. The channel also shows the stderr lines of the bridge and of the upstream server. VS Code writes each stderr line at the Warning level. Each line of the bridge has the form `mcp-bridge-vscode: <scope>: <level>: <text>`. A line without this start comes from the upstream server.
@@ -197,14 +235,19 @@ These messages can occur in the channel:
 | `mcp-bridge-vscode: bridge: warning: cannot start the upstream command: <error>` | The bridge cannot start `<command>`, and VS Code gets an error for `initialize`. Examine the path of the command in `args`. |
 | `mcp-bridge-vscode: bridge: warning: server/discover failed: <error>` | The upstream server did not answer `server/discover`, or it answered with an error. VS Code gets an error for `initialize`. |
 | `mcp-bridge-vscode: bridge: info: still waiting for the upstream server: <method> (request <id>, <N> s)` | The upstream server did not answer the request in 10 s. The line comes again each 30 s until the response or the time limit. |
+| `mcp-bridge-vscode: bridge: info: still waiting for the answers of the client to the input requests of <method> (request <id>, <N> s)` | The upstream server asked for input, and VS Code did not answer all input requests yet. The user must answer the form, the URL or the sampling request in VS Code. The line comes again each 30 s until the answers or the time limit. |
 | `mcp-bridge-vscode: bridge: info: tool '<name>': added an items schema at '<pointer>' of the input schema` | An array schema of the tool had no `items`, or its `items` was false in JavaScript. The bridge added `items: {}`, so that VS Code shows the tool. |
+| `mcp-bridge-vscode: bridge: warning: input request '<key>': the bridge refused the URL of a URL elicitation, and the upstream server gets decline` | The URL does not use `https`, or it uses `http` to a host that is not a loopback host. The URL can also have a backslash, or user information before the host. VS Code did not get the URL. |
+| `mcp-bridge-vscode: bridge: warning: request <id> (<method>): the input requests of the upstream server failed: <detail>` | An input request or an answer of VS Code did not pass a check, or VS Code did not answer in time. `<detail>` gives the cause. The request of VS Code gets an error. |
+| `mcp-bridge-vscode: bridge: info: request <id> (<method>): the client answered an input request with an error: <message>` | VS Code answered a sampling or roots request with an error. For example, the user refused a sampling request. The request of VS Code gets that error. |
+| `mcp-bridge-vscode: bridge: warning: request <id> (<method>): the upstream server refused the request state after an input wait of <time>` | The answers came after the time limit of the state of the request, or the upstream server started again. Send the request again. |
 | `mcp-bridge-vscode: bridge: error: the upstream server exited with code N` | The upstream server stopped while VS Code was connected. The bridge answered each request in flight with -32603, and it exits with code 1. The lines before this line can tell the cause. On POSIX, the line can also tell the signal that stopped the upstream server. |
 | `mcp-bridge-vscode: vscode: warning: the bridge did not stop in 8 s after the end of stdin, thus it stops now` | A request did not stop after its cancellation. The watchdog stopped the bridge and the upstream server. |
 | `Process exited with code N` | The bridge stopped. Code 1 means that the upstream server stopped, or that the bridge has an internal error. Code 2 means that the arguments are not valid. VS Code starts the bridge again at the next tool call. |
 | `N tools have invalid JSON schemas and will be omitted` | VS Code checks the input schema of each tool against JSON Schema draft-07. It does not show the tools that fail, and a notification names the server. Correct the schemas in the upstream server. |
 | `MPC <code>: <message>` | The server sent an error response. VS Code writes "MPC" in place of "MCP". The next table gives the messages of the bridge. A different message comes from the upstream server. |
 
-The bridge sends these error messages. Each error also has `data.cause`. The table shows the start of each message:
+The bridge sends these error messages. Each error also has `data.cause`, except the -32602 error for a refused request state, which keeps the `data` of the upstream server. The table shows the start of each message:
 
 | Message | What it means |
 | --- | --- |
@@ -212,7 +255,13 @@ The bridge sends these error messages. Each error also has `data.cause`. The tab
 | `MPC -32603: The bridge cannot start the upstream server. ...` | The bridge cannot start `<command>`. Examine the path of the command in `args`. |
 | `MPC -32603: The upstream server process stopped. ...` | The upstream server stopped, or it closed its stdout. |
 | `MPC -32603: The upstream server did not answer in time. ...` | The request did not get a response in its time limit. `data.detail` gives the method and the limit. |
-| `MPC -32603: The upstream server needs input that this version of the bridge cannot ask for yet.` | The tool asked for input: an elicitation, a sampling or the roots. M2 adds this function. |
+| `MPC -32603: The upstream server asked for input that the client did not declare.` | The upstream server sent an input request of a kind that VS Code did not declare, or a sampling request with tools. `data.detail` names the key of the input request. |
+| `MPC -32603: The upstream server sent an input request that is not valid for the client. ...` | The input request does not have the shape of the schema, or the schema of its form has an error. |
+| `MPC -32603: The upstream server asked for more inputs at one time than the limit of the bridge.` | One round has more than 16 input requests. |
+| `MPC -32603: The upstream server asked for input too many times. ...` | The request has more than 10 rounds. |
+| `MPC -32603: The client did not answer the input request of the upstream server in time.` | VS Code did not answer all input requests of a round in 1 h. |
+| `MPC -32603: The client sent an answer that is not valid for the input request of the upstream server.` | The content of a form is not valid against the schema of the form, or an answer does not have the shape of the schema. |
+| `MPC -32602: The upstream server did not accept the saved state of the request. ...` | The answers came after the time limit of the state of the request, or the upstream server started again. Send the request again. A tool call gets this text in a result with `isError: true`. |
 | `MPC -32603: The connection has too many requests in flight` | VS Code sent a new request at the limit of requests in flight. |
 | `MPC -32600: The request is longer than the line limit of the bridge.` | The message of VS Code is longer than `--max-line-bytes`. |
 

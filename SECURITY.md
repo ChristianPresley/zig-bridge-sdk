@@ -21,7 +21,7 @@ Only the newest release receives security fixes. Until the first release, only t
 
 ## Security design
 
-The wiki page [Threat-Model](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/Threat-Model) holds the security design of the bridges. For each security requirement, that page gives the milestone, the module and the test. From milestone M1, the page gives the test of each requirement of M1. The requirements of the later milestones are a plan.
+The wiki page [Threat-Model](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/Threat-Model) holds the security design of the bridges. For each security requirement, that page gives the milestone, the module and the test. From milestone M2, the page gives the test of each requirement of M1 and M2. The requirements of the later milestones are a plan.
 
 A bridge stands between its client and an upstream server. The threat model has these trust boundaries:
 

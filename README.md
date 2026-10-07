@@ -6,9 +6,9 @@ A bridge connects an MCP client of revision 2025-11-25 to an MCP server of revis
 
 ## Status
 
-The project is in development. This is milestone M1, the runtime of the `vscode` bridge. The bridge starts the upstream command and speaks to it over stdio. It answers `initialize`, and it forwards the requests for tools, prompts, resources and completion. It also forwards the progress notifications of the upstream server and the cancellations of the client.
+The project is in development. This is milestone M2 of the `vscode` bridge. The bridge starts the upstream command and speaks to it over stdio. It answers `initialize`, and it forwards the requests for tools, prompts, resources and completion. It also forwards the progress notifications of the upstream server and the cancellations of the client. When the upstream server asks for input, the bridge sends each input request to the client and sends the answers to the upstream server.
 
-The later milestones add these parts. M2 adds the input requests of the upstream server. M3 adds the notifications of list changes, the resource subscriptions and the log level, and it needs zig-sdk v0.4.0. M4 adds an upstream server at an HTTPS URL. M5 adds an API that puts the bridge into the executable of a zig-sdk server.
+The later milestones add these parts. M3 adds the notifications of list changes, the resource subscriptions and the log level, and it needs zig-sdk v0.4.0. M4 adds an upstream server at an HTTPS URL. M5 adds an API that puts the bridge into the executable of a zig-sdk server.
 
 The [Roadmap](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/Roadmap) on the wiki shows the milestones, the state of each part and the planned work. `CHANGELOG.md` lists the changes.
 
@@ -18,7 +18,7 @@ The first bridge is for Visual Studio Code (VS Code).
 
 | Bridge | Product | Client revision | Executable | Status |
 | --- | --- | --- | --- | --- |
-| `vscode` | Visual Studio Code | 2025-11-25 | `mcp-bridge-vscode` | M1: runtime (input requests in M2) |
+| `vscode` | Visual Studio Code | 2025-11-25 | `mcp-bridge-vscode` | M2: runtime and input requests |
 
 Each bridge has its own README. [`bridges/vscode/README.md`](bridges/vscode/README.md) tells how to build the `vscode` bridge and how to configure VS Code.
 
