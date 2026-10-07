@@ -32,6 +32,7 @@ test {
     _ = log;
     _ = Frontend;
     _ = Upstream;
+    _ = @import("bridge/fuzz_test.zig");
 }
 
 /// The settings of one product. Each bridge module declares one `Profile`, and the core

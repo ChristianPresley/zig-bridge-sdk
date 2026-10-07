@@ -57,13 +57,24 @@ pub fn build(b: *std.Build) void {
     b.step("run-vscode", "Run mcp-bridge-vscode").dependOn(&run_vscode.step);
 
     // The upstream server of the tests: a zig-sdk server with the tools that the tests need.
+    // The module `fixture` makes the server. The executable serves it over stdio, and a test
+    // can make it in its own process.
+    const fixture = b.createModule(.{
+        .root_source_file = b.path("test/fixture.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "mcp", .module = mcp }},
+    });
     const fixture_server = b.addExecutable(.{
         .name = "bridge-fixture-server",
         .root_module = b.createModule(.{
             .root_source_file = b.path("test/fixture_server.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "mcp", .module = mcp }},
+            .imports = &.{
+                .{ .name = "mcp", .module = mcp },
+                .{ .name = "fixture", .module = fixture },
+            },
         }),
     });
     const install_fixture = b.addInstallArtifact(fixture_server, .{});
@@ -92,6 +103,56 @@ pub fn build(b: *std.Build) void {
     const run_vscode_exe_tests = b.addRunArtifact(vscode_exe_tests);
     test_step.dependOn(&run_vscode_exe_tests.step);
     test_vscode_step.dependOn(&run_vscode_exe_tests.step);
+
+    // The tests of the fixture server: its tools through the memory transport of zig-sdk.
+    const fixture_tests = b.addTest(.{ .name = "fixture", .root_module = fixture, .test_runner = test_runner, .use_llvm = use_llvm });
+    test_step.dependOn(&b.addRunArtifact(fixture_tests).step);
+
+    // The transcript tests of the vscode bridge: the lines of VS Code go through the front
+    // end, and the fixture server in the same process is the upstream server. The tests check
+    // each frame against the vendored schemas.
+    const vscode_transcripts = b.addTest(.{
+        .name = "vscode-transcripts",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bridges/vscode/test/transcripts.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mcp", .module = mcp },
+                .{ .name = "vscode", .module = vscode },
+                .{ .name = "fixture", .module = fixture },
+            },
+        }),
+        .test_runner = test_runner,
+        .use_llvm = use_llvm,
+    });
+    addSchemaImports(b, vscode_transcripts.root_module);
+    const run_vscode_transcripts = b.addRunArtifact(vscode_transcripts);
+    test_step.dependOn(&run_vscode_transcripts.step);
+    test_vscode_step.dependOn(&run_vscode_transcripts.step);
+
+    // The process tests start the two executables and speak to them over pipes. The options
+    // give the paths of the executables to the tests. Thus the build makes the executables
+    // first, and a test fails, and never skips, when an executable is missing.
+    const process_options = b.addOptions();
+    process_options.addOptionPath("bridge_exe", vscode_exe.getEmittedBin());
+    process_options.addOptionPath("fixture_exe", fixture_server.getEmittedBin());
+    const process_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("test/process_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "mcp", .module = mcp },
+            .{ .name = "fixture", .module = fixture },
+            .{ .name = "build_options", .module = build_options },
+            .{ .name = "process_options", .module = process_options.createModule() },
+        },
+    }), .test_runner = test_runner, .use_llvm = use_llvm });
+    const run_process_tests = b.addRunArtifact(process_tests);
+    // The paths of the options can be relative to the build root.
+    run_process_tests.setCwd(b.path("."));
+    test_step.dependOn(&run_process_tests.step);
+    test_vscode_step.dependOn(&run_process_tests.step);
 
     // The checks of the vendored schemas. The fixtures come in as anonymous imports, because
     // Zig 0.16 does not embed a file outside the module root.

@@ -61,6 +61,8 @@ zig test -target x86_64-linux-musl --test-no-exec -femit-bin=zig-out/linux/bridg
   -Mmcp="$(ls -d zig-pkg/mcp-*)/src/mcp.zig" -Mbuild_options=zig-out/linux/build_options.zig
 ```
 
+The process test in `test/process_test.zig` starts the two executables. `build.zig` gives it their paths in the import `process_options`. For a run in WSL, give it a file with the constants `bridge_exe` and `fixture_exe`, or set the environment variables `PROCESS_TEST_BRIDGE` and `PROCESS_TEST_FIXTURE`. The test fails when an executable is missing. In WSL, a test that the runner skips is also a failure.
+
 ## Accept loops
 
 On Windows, a cancel does not always wake a task that waits in `accept`. Thus every new accept loop uses the wake pattern of zig-sdk, `mcp.util.wake`.[^wake] The loop reads a stop flag after each `accept`. To stop the loop, `cancelAcceptLoop` sets the flag and connects to the listener until the task ends.
