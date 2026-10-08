@@ -4,6 +4,10 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
+### Fixed
+
+- `bridge`: the loopback receiver of the sign-in ignores a cancel while it waits in `accept`. Only the wake connection of `Receiver.stop` ends that wait. On Windows, the cancel of the stop could arrive just after the accept took the wake connection. Std then closed that connection, and a Debug build wrote a stack trace of `error.Unexpected` with the status `INVALID_PARAMETER` to stderr. These lines have no tag of the bridge.
+
 ## [0.1.0] - 2026-10-08
 
 This section has the work of milestones M0 to M5. M0 is the scaffold: the package, the build, the tools and the documents. M1 is the runtime of the `vscode` bridge over stdio. M2 and M3 send the input requests and the notifications of the upstream server to the client. M4 adds an upstream server at an HTTPS URL, with the OAuth sign-in and the storage of the tokens. M5 puts the bridge into the executable of a zig-sdk server, so that one executable serves the two revisions.
