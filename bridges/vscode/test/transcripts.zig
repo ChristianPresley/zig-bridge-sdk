@@ -16,6 +16,8 @@
 //! - `https_test.zig`: the HTTPS upstream server with the upstream configuration of the
 //!   executable. The tests cover the registration modes, the stored sign-ins and the step-up.
 //!   They also cover the stop of a sign-in, the trust, the icons and a proxy.
+//! - `embed_test.zig`: the bridge in the process of the server (`bridge.embed`). The first
+//!   lines of a client select the legacy path or the modern path.
 const std = @import("std");
 
 test {
@@ -27,4 +29,5 @@ test {
     _ = @import("notify_test.zig");
     _ = @import("oauth_test.zig");
     _ = @import("https_test.zig");
+    _ = @import("embed_test.zig");
 }

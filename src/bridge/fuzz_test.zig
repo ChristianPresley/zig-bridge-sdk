@@ -567,3 +567,94 @@ test "fuzz: the lines of the client through the front end" {
         }),
     });
 }
+
+// ---------------------------------------------------------------------------------------------
+// The first line of a connection in the process of the server (M5)
+// ---------------------------------------------------------------------------------------------
+
+/// The input is the whole input of `embed.serveStdioAuto`. The target examines these rules:
+///
+/// - `embed.classify` gives `legacy` only for a request with the method `initialize`, and
+///   `discover` only for a request with the method `server/discover`.
+/// - Each line of the output is one JSON-RPC message.
+/// - The legacy path serves the connection only when a line of the input is an `initialize`
+///   request.
+fn embedLines(_: void, smith: *Smith) anyerror!void {
+    var buf: [max_input]u8 = undefined;
+    const bytes = input(smith, &buf, 0x3005);
+    const gpa = std.testing.allocator;
+    var threaded: Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const saved_level = std.testing.log_level;
+    std.testing.log_level = .err;
+    defer std.testing.log_level = saved_level;
+
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var any_initialize = false;
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |line| {
+        const class = try bridge.embed.classify(arena, line, 16);
+        const msg: ?mcp.jsonrpc.Message = mcp.jsonrpc.Message.parseMaxDepth(arena, line, 16) catch null;
+        const method: ?[]const u8 = if (msg) |m| switch (m) {
+            .request => |r| r.method,
+            else => null,
+        } else null;
+        const is_initialize = method != null and std.mem.eql(u8, method.?, "initialize");
+        const is_discover = method != null and std.mem.eql(u8, method.?, "server/discover");
+        try std.testing.expectEqual(is_initialize, class == .legacy);
+        try std.testing.expectEqual(is_discover, class == .discover);
+        // The framer removes a CR at the end of the line.
+        const trimmed = std.mem.trimEnd(u8, line, "\r");
+        any_initialize = any_initialize or (try bridge.embed.classify(arena, trimmed, 16)) == .legacy;
+    }
+
+    var limits: mcp.Limits = .{};
+    limits.stdio.max_line_bytes = 256;
+    limits.json_max_depth = 16;
+    const server = try gpa.create(mcp.Server);
+    defer gpa.destroy(server);
+    server.* = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "fuzz-embedded", .version = "1.0.0" }, .limits = limits });
+    defer server.deinit();
+    try server.addTool(.{ .name = "echo", .description = "Send the text back" }, echo);
+    try server.addToolJson(.{ .name = "ask", .description = "Ask for a name" }, ask);
+
+    var in: Io.Reader = .fixed(bytes);
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    const era = try bridge.embed.serveStdioAuto(io, gpa, server, &in, &out.writer, .{
+        .profile = &profile,
+        .discover = if (bytes.len > 0 and bytes[0] & 1 == 1) .refuse else .answer,
+        .shutdown_grace = .fromMilliseconds(200),
+    });
+    if (era == .legacy) try std.testing.expect(any_initialize);
+    var lines = std.mem.splitScalar(u8, out.written(), '\n');
+    while (lines.next()) |line| {
+        if (lines.peek() == null) {
+            try std.testing.expectEqual(@as(usize, 0), line.len);
+            break;
+        }
+        _ = mcp.jsonrpc.Message.parse(arena, line) catch |e| {
+            std.debug.print("\nthe connection wrote a line that is not a JSON-RPC message ({t}): {s}\n", .{ e, line });
+            return e;
+        };
+    }
+}
+
+test "fuzz: the first line of a connection in the process of the server" {
+    try std.testing.fuzz({}, embedLines, .{
+        .corpus = corpus(&.{
+            initialize_line ++ "\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"a\"}}}",
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\",\"params\":{\"_meta\":{\"io.modelcontextprotocol/protocolVersion\":\"2026-07-28\",\"io.modelcontextprotocol/clientCapabilities\":{}}}}\n" ++ initialize_line,
+            "\x01\n{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"server/discover\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}",
+            "\xff\xfe\n" ++ initialize_line,
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n" ++ initialize_line,
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"initialize\"}}",
+            "{\"x\":\"" ++ "a" ** 300 ++ "\"}\n" ++ initialize_line ++ "\r\n",
+            "",
+        }),
+    });
+}

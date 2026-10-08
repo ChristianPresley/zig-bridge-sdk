@@ -8,10 +8,15 @@
 //! into the loopback receiver of the bridge. The bridge gets `--no-browser`, and a token store
 //! that never uses the keychain of the host.
 //!
-//! The build makes the two executables before it compiles this file. The module
-//! `process_options` holds their paths. The environment variables `PROCESS_TEST_BRIDGE` and
-//! `PROCESS_TEST_FIXTURE` replace these paths, for example for a run in WSL. A missing
-//! executable makes the test fail. The tests never skip.
+//! The tests of `vscode.serveStdio` start `bridge-embedded-server`. That executable has the
+//! server of `bridge-fixture-server` and the bridge in one process. VS Code speaks to it over
+//! the pipes, and a client of revision 2026-07-28 speaks to it through
+//! `mcp.transport.stdio.Client.spawn`.
+//!
+//! The build makes the three executables before it compiles this file. The module
+//! `process_options` holds their paths. The environment variables `PROCESS_TEST_BRIDGE`,
+//! `PROCESS_TEST_FIXTURE` and `PROCESS_TEST_EMBEDDED` replace these paths, for example for a
+//! run in WSL. A missing executable makes the test fail. The tests never skip.
 //!
 //! A watchdog thread sets a time limit for each phase of a test. At the limit, the watchdog
 //! stops the bridge, and the test fails. Thus a test that does not end cannot stop the CI.
@@ -759,6 +764,287 @@ test "the upstream server ends its listen stream at its shutdown: VS Code gets n
     try expectStderr(b, std.fmt.comptimePrint("mcp-bridge-vscode: bridge: error: the upstream server exited with code {d}\n", .{fixture.shutdown_exit_code}));
 }
 
+// ---------------------------------------------------------------------------------------------
+// The bridge in the process of the server (`vscode.serveStdio`)
+// ---------------------------------------------------------------------------------------------
+
+test "the embedded server: initialize selects the legacy path, a tool asks for a form, and the process exits with code 0 at the end of stdin" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    const b = try Bridge.spawn(gpa, &.{paths.embedded});
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    // The server of the process is the upstream server of the bridge. Its listen stream gives
+    // the list changes after notifications/initialized.
+    try initialize(b, arena);
+
+    // VS Code lists the tools after the list change. The schemas come through the bridge.
+    b.watchdog.arm("tools/list", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"progressToken":0}}}
+    );
+    const list = try expectResult(try b.response(arena, 2));
+    const tools = list.object.get("tools") orelse return fail("tools/list has no tools", .{});
+    if (tools != .array) return fail("the tools of tools/list are not an array", .{});
+    var has_add = false;
+    var has_ask_form = false;
+    for (tools.array.items) |tool| {
+        const name = mcp.json.getString(tool, "name") orelse "";
+        if (std.mem.eql(u8, name, "add")) has_add = true;
+        if (std.mem.eql(u8, name, "ask_form")) has_ask_form = true;
+        const schema = tool.object.get("inputSchema") orelse return fail("the tool {s} has no inputSchema", .{name});
+        try testing.expectEqualStrings("object", mcp.json.getString(schema, "type") orelse "");
+    }
+    try testing.expect(has_add);
+    try testing.expect(has_ask_form);
+    if (list.object.get("nextCursor")) |cursor| try testing.expect(cursor == .string);
+
+    b.watchdog.arm("tools/call", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":3}}}
+    );
+    try testing.expectEqualStrings("5", try firstText(try expectResult(try b.response(arena, 3))));
+
+    // The bridge does the MRTR rounds of the tool for VS Code. The test is the user, and it
+    // answers the form over stdin.
+    b.watchdog.arm("elicitation", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ask_form"}}
+    );
+    try expectBridgeId(try b.request(arena, "elicitation/create"), "b-1");
+    try b.send(
+        \\{"jsonrpc":"2.0","id":"b-1","result":{"action":"accept","content":{"name":"Ada","age":36,"subscribe":true,"color":"green"}}}
+    );
+    try testing.expectEqualStrings(
+        \\form: accept {"name":"Ada","age":36,"subscribe":true,"color":"green"}
+    , try firstText(try expectResult(try b.response(arena, 4))));
+
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try expectWithin(exit.elapsed, exit_bound, "the stop of the embedded server at the end of stdin");
+    // The responses of initialize, tools/list, add and ask_form, the list changes and the
+    // form.
+    try testing.expectEqual(@as(usize, 5 + list_changes.len), try expectFrames(arena, b.out.items));
+}
+
+test "the embedded server with --refuse-discover: the Copilot harness gets -32601 for server/discover and selects the legacy path" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    const b = try Bridge.spawn(gpa, &.{ paths.embedded, "--refuse-discover" });
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    b.watchdog.arm("server/discover", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{"sampling":{},"elicitation":{"form":{},"url":{}}},"io.modelcontextprotocol/clientInfo":{"name":"copilot-cli","version":"1.0.89"}}}}
+    );
+    switch (try b.response(arena, 1)) {
+        .error_response => |e| try testing.expectEqual(@as(i64, -32601), e.code),
+        else => return fail("server/discover did not get an error", .{}),
+    }
+
+    b.watchdog.arm("initialize", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"sampling":{},"elicitation":{"form":{},"url":{}}},"clientInfo":{"name":"copilot-cli","version":"1.0.89"}}}
+    );
+    const result = try expectResult(try b.response(arena, 2));
+    try testing.expectEqualStrings("2025-11-25", mcp.json.getString(result, "protocolVersion") orelse "");
+    try b.send(initialized);
+    for (list_changes) |method| _ = try b.notification(arena, method);
+
+    b.watchdog.arm("tools/list", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{"_meta":{"progressToken":0}}}
+    );
+    const list = try expectResult(try b.response(arena, 3));
+    const tools = list.object.get("tools") orelse return fail("tools/list has no tools", .{});
+    if (tools != .array or tools.array.items.len == 0) return fail("tools/list has no tools", .{});
+
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try expectWithin(exit.elapsed, exit_bound, "the stop of the embedded server at the end of stdin");
+}
+
+test "the embedded server: a client of revision 2026-07-28 selects the modern path, and the process exits with code 0 at the end of stdin" {
+    const gpa = testing.allocator;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    // The stdio client of zig-sdk starts the process, as a client of revision 2026-07-28 does.
+    // Each request has a time limit, and `close` stops the process after two grace periods.
+    const proc = try mcp.transport.stdio.Client.spawn(io, gpa, .{ .argv = &.{paths.embedded} });
+    defer proc.deinit();
+    var client: mcp.Client = .init(gpa, io, .{ .info = .{ .name = "process-test", .version = "1.0.0" } });
+    defer client.deinit();
+    client.connect(proc.transport());
+    const options: mcp.Client.RequestOptions = .{ .timeout = exchange_limit };
+
+    const discovered = try client.discover(arena, options);
+    for (discovered.supportedVersions) |v| {
+        if (std.mem.eql(u8, v, "2026-07-28")) break;
+    } else return fail("server/discover does not name the revision 2026-07-28", .{});
+    try testing.expect(discovered.capabilities.tools != null);
+
+    const listed = try client.listTools(arena, null, options);
+    for (listed.tools) |tool| {
+        if (std.mem.eql(u8, tool.name, "add")) break;
+    } else return fail("tools/list has no tool add", .{});
+
+    const called = try client.callTool(arena, "add", .{ .a = 2, .b = 3 }, options);
+    if (called.content.len == 0 or called.content[0] != .text) return fail("the result of add has no text", .{});
+    try testing.expectEqualStrings("5", called.content[0].text.text);
+
+    // `close` closes stdin of the process and waits for its exit. A process that does not
+    // exit in the grace period gets a signal, and then its status is not the exit code 0.
+    const start = Io.Timestamp.now(io, .awake);
+    proc.close();
+    try expectWithin(start.untilNow(io, .awake), exit_bound, "the stop of the embedded server at the end of stdin");
+    const term = proc.exitStatus() orelse return fail("the stdio client has no exit status of the process", .{});
+    try expectExit(.{ .term = term, .elapsed = .fromNanoseconds(0) }, 0);
+}
+
+test "the embedded server stops at the end of stdin on the legacy path with a listen stream, a slow call, a form and a sampling in flight" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    const b = try Bridge.spawn(gpa, &.{paths.embedded});
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    // After the list changes, the listen stream of the bridge is open in the server.
+    try initialize(b, arena);
+
+    // The slow call takes one minute when nothing cancels it. Its handler runs on the task of
+    // the request in the process. The response of the ping tells that the call started.
+    b.watchdog.arm("slow tools/call", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"slow","arguments":{"ms":60000}}}
+    );
+    try b.send(
+        \\{"jsonrpc":"2.0","id":3,"method":"ping"}
+    );
+    _ = try expectResult(try b.response(arena, 3));
+
+    // One tool asks for a form, and one tool asks for a sampling. VS Code never answers.
+    b.watchdog.arm("elicitation", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"ask_form"}}
+    );
+    try expectBridgeId(try b.request(arena, "elicitation/create"), "b-1");
+    b.watchdog.arm("sampling", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"sample"}}
+    );
+    try expectBridgeId(try b.request(arena, "sampling/createMessage"), "b-2");
+
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try expectWithin(exit.elapsed, exit_bound, "the stop of the embedded server at the end of stdin with requests in flight");
+    // The responses of initialize and ping, the list changes, the two requests of the bridge
+    // and their cancellations. The canceled calls get no response.
+    try testing.expectEqual(@as(usize, 6 + list_changes.len), try expectFrames(arena, b.out.items));
+    const frames = try sortFrames(arena, b.out.items);
+    try expectStrings(&.{ "b-1", "b-2" }, frames.cancelled);
+    try testing.expectEqual(@as(usize, 2), frames.responses.len);
+}
+
+test "the embedded server stops at the end of stdin on the modern path with a listen stream and a slow call in flight" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    const b = try Bridge.spawn(gpa, &.{paths.embedded});
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    // A listen stream of revision 2026-07-28 selects the modern path.
+    b.watchdog.arm("subscriptions/listen", exchange_limit);
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"subscriptions/listen\",\"params\":{\"notifications\":{\"toolsListChanged\":true}," ++ modern_meta ++ "}}");
+    _ = try b.notification(arena, "notifications/subscriptions/acknowledged");
+
+    // The slow call takes one minute when nothing cancels it. The response of tools/list tells
+    // that the reader took the call. Revision 2026-07-28 has no ping.
+    b.watchdog.arm("slow tools/call", exchange_limit);
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":6,\"method\":\"tools/call\",\"params\":{\"name\":\"slow\",\"arguments\":{\"ms\":60000}," ++ modern_meta ++ "}}");
+    try b.send("{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\",\"params\":{" ++ modern_meta ++ "}}");
+    _ = try expectResult(try b.response(arena, 7));
+
+    // The listen stream ends at once. The slow call gets the grace period, then the server
+    // cancels its task.
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try expectWithin(exit.elapsed, exit_bound, "the stop of the embedded server at the end of stdin on the modern path");
+    _ = try expectFrames(arena, b.out.items);
+    const frames = try sortModernFrames(arena, b.out.items);
+    // The listen stream ends with its result, and the canceled call gets no response.
+    const ended = frames.response(5) orelse return fail("the listen stream did not end with a response", .{});
+    if (ended != .response) return fail("the listen stream ended with an error", .{});
+    if (frames.response(6) != null) return fail("the canceled call got a response", .{});
+}
+
+/// The `_meta` member of a request of revision 2026-07-28.
+const modern_meta =
+    \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"process-test","version":"1.0.0"},"io.modelcontextprotocol/clientCapabilities":{}}
+;
+
+/// The responses of a connection of revision 2026-07-28.
+const ModernFrames = struct {
+    responses: []const Message,
+
+    /// The response or the error response with the integer id `id`, or null.
+    fn response(self: ModernFrames, id: i64) ?Message {
+        for (self.responses) |msg| {
+            const msg_id: mcp.RequestId = switch (msg) {
+                .response => |r| r.id,
+                .error_response => |r| r.id orelse continue,
+                .request, .notification => continue,
+            };
+            if (msg_id == .integer and msg_id.integer == id) return msg;
+        }
+        return null;
+    }
+};
+
+/// Parse each line of `out`, and keep the responses.
+fn sortModernFrames(arena: Allocator, out: []const u8) !ModernFrames {
+    var responses: std.ArrayList(Message) = .empty;
+    var lines = std.mem.splitScalar(u8, out, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        const msg = try parseFrame(arena, line);
+        switch (msg) {
+            .response, .error_response => try responses.append(arena, msg),
+            .notification, .request => {},
+        }
+    }
+    return .{ .responses = responses.items };
+}
+
 /// The bearer token of the HTTP upstream server of the tests of the URL form. It is also the
 /// marker that must never reach stderr.
 const http_token = "process-test-marker-4c2e9a";
@@ -1460,15 +1746,17 @@ fn initialize(b: *Bridge, arena: Allocator) !void {
     for (list_changes) |method| _ = try b.notification(arena, method);
 }
 
-/// The paths of the two executables.
+/// The paths of the three executables.
 const Paths = struct {
     bridge: []const u8,
     fixture: []const u8,
+    embedded: []const u8,
 
     fn get(arena: Allocator) !Paths {
         return .{
             .bridge = try executable(arena, "PROCESS_TEST_BRIDGE", process_options.bridge_exe),
             .fixture = try executable(arena, "PROCESS_TEST_FIXTURE", process_options.fixture_exe),
+            .embedded = try executable(arena, "PROCESS_TEST_EMBEDDED", process_options.embedded_exe),
         };
     }
 

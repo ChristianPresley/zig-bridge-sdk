@@ -80,6 +80,23 @@ pub fn build(b: *std.Build) void {
     const install_fixture = b.addInstallArtifact(fixture_server, .{});
     b.step("fixture-server", "Build the upstream server of the tests").dependOn(&install_fixture.step);
 
+    // The same server with the `vscode` bridge in its process (`vscode.serveStdio`). It serves
+    // the two revisions on stdio.
+    const embedded_server = b.addExecutable(.{
+        .name = "bridge-embedded-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("test/embedded_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "vscode", .module = vscode },
+                .{ .name = "fixture", .module = fixture },
+            },
+        }),
+    });
+    const install_embedded = b.addInstallArtifact(embedded_server, .{});
+    b.step("embedded-server", "Build the server of the tests with the vscode bridge in its process").dependOn(&install_embedded.step);
+
     // Unit tests. `-Dfuzz` prepares them for `zig build test -Dfuzz --fuzz` on Zig 0.16.0: a test
     // runner whose fuzz path compiles, and the LLVM backend, because the self-hosted backend of
     // Debug builds emits no `__sancov_pcs1` table and the fuzzer then sees no coverage.
@@ -141,12 +158,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_vscode_transcripts.step);
     test_vscode_step.dependOn(&run_vscode_transcripts.step);
 
-    // The process tests start the two executables and speak to them over pipes. The options
+    // The process tests start the three executables and speak to them over pipes. The options
     // give the paths of the executables to the tests. Thus the build makes the executables
     // first, and a test fails, and never skips, when an executable is missing.
     const process_options = b.addOptions();
     process_options.addOptionPath("bridge_exe", vscode_exe.getEmittedBin());
     process_options.addOptionPath("fixture_exe", fixture_server.getEmittedBin());
+    process_options.addOptionPath("embedded_exe", embedded_server.getEmittedBin());
     const process_tests = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("test/process_test.zig"),
         .target = target,

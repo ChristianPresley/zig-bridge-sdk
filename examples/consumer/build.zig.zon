@@ -8,5 +8,5 @@
     // `.paths` filter of the package, and the job would then miss a file that the package does not
     // ship.
     .dependencies = .{},
-    .paths = .{ "build.zig", "build.zig.zon", "main.zig" },
+    .paths = .{ "build.zig", "build.zig.zon", "main.zig", "driver.zig" },
 }
