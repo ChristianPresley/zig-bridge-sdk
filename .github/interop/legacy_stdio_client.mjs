@@ -1,6 +1,13 @@
 // A legacy MCP client for the interop check of the bridge. It uses the TypeScript SDK 1.x
-// (@modelcontextprotocol/sdk, MCP revision 2025-11-25), like VS Code, and starts the bridge
-// over stdio with the given command. Then it:
+// (@modelcontextprotocol/sdk, MCP revision 2025-11-25), like VS Code, and starts the given
+// command over stdio. The command is one of the two forms of the bridge:
+//
+// - the executable mcp-bridge-vscode, with bridge-fixture-server as its upstream command;
+// - bridge-embedded-server, a zig-sdk server that calls vscode.serveStdio. The bridge and the
+//   server of bridge-fixture-server are then in one process, and no bridge executable is
+//   between the client and the server.
+//
+// Then it:
 //
 // - connects, and asserts that the negotiated protocol version is 2025-11-25;
 // - lists the tools page by page, and asserts that no page has a nextCursor that is not a
@@ -29,14 +36,16 @@
 // - sets the log level with logging/setLevel, and asserts that the log messages of the tool log
 //   at that level and above come before the result of the call;
 // - asserts that no notifications/cancelled comes to the client;
-// - closes the input of the bridge, and asserts that the bridge exits with code 0 before the
-//   transport stops it (2 s).
+// - closes the input of the process, and asserts that the process exits with code 0 before
+//   the transport stops it (2 s).
 //
 // It exits with code 1 on each failure.
 //
-// Usage: node legacy_stdio_client.mjs <bridge> [bridge arguments...]
-// Example: node .github/interop/legacy_stdio_client.mjs zig-out/bin/mcp-bridge-vscode -- \
-//            zig-out/bin/bridge-fixture-server --many-tools 150
+// Usage: node legacy_stdio_client.mjs <command> [arguments...]
+// Examples: node .github/interop/legacy_stdio_client.mjs zig-out/bin/mcp-bridge-vscode -- \
+//             zig-out/bin/bridge-fixture-server --many-tools 150
+//           node .github/interop/legacy_stdio_client.mjs zig-out/bin/bridge-embedded-server \
+//             --many-tools 150
 //
 // Install the pinned packages first: npm ci --ignore-scripts --prefix .github/interop
 import { createRequire } from "node:module";
@@ -94,7 +103,7 @@ function ok(message) {
 
 const [command, ...args] = process.argv.slice(2);
 if (!command) {
-  console.error("Usage: node legacy_stdio_client.mjs <bridge> [bridge arguments...]");
+  console.error("Usage: node legacy_stdio_client.mjs <command> [arguments...]");
   process.exit(2);
 }
 
@@ -706,9 +715,9 @@ async function main() {
   const elapsed = Date.now() - start;
   if (exit) {
     if (exit.code === 0 && elapsed < close_grace_ms) {
-      ok(`the bridge exited with code 0 ${elapsed} ms after the end of its input`);
+      ok(`the process exited with code 0 ${elapsed} ms after the end of its input`);
     } else {
-      fail(`after the end of its input, the bridge exited with code ${exit.code} and signal ${exit.signal} after ${elapsed} ms`);
+      fail(`after the end of its input, the process exited with code ${exit.code} and signal ${exit.signal} after ${elapsed} ms`);
     }
   }
 }

@@ -83,12 +83,19 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-zig
       - run: zig build -Dtarget=${{ matrix.target }}
+      # vscode.serveStdio is a part of the API of the package. Of the executables, only the
+      # embedded server of the tests calls it, thus the job compiles that server for each target.
+      - run: zig build embedded-server -Dtarget=${{ matrix.target }}
 
   # The legacy TypeScript SDK (MCP revision 2025-11-25) starts the bridge over stdio, like VS Code.
   # It lists and calls the tools, and it answers the input requests of the fixture tools as VS Code
   # does: forms, URLs, sampling and roots. Its notification handlers get the list changes, the
   # resource updates and the log messages, and it checks that each comes before the result of the
   # call that caused it. The lockfile pins the npm tree, and npm ci runs no install scripts.
+  #
+  # The same script then starts bridge-embedded-server (M5), with no bridge executable between
+  # the client and the server. That server calls vscode.serveStdio. Thus the initialize of the
+  # client selects the legacy path, and the bridge in the process of the server answers it.
   #
   # The second script checks the URL form against bridge-fixture-server over HTTPS with the test
   # CA. The bridge runs as in the process tests: --no-browser, --token-store memory and
@@ -109,21 +116,31 @@ jobs:
       - run: npm ci --ignore-scripts --no-audit --no-fund --prefix .github/interop
       - run: zig build -Doptimize=ReleaseSafe
       - run: zig build fixture-server -Doptimize=ReleaseSafe
+      - run: zig build embedded-server -Doptimize=ReleaseSafe
       # With 150 more tools, tools/list has two pages (the page size of zig-sdk is 100).
       - name: Connect the TypeScript SDK client to the bridge
         run: >-
           node .github/interop/legacy_stdio_client.mjs zig-out/bin/mcp-bridge-vscode --
           zig-out/bin/bridge-fixture-server --many-tools 150
+      - name: Connect the TypeScript SDK client to a server with the bridge in its process
+        run: >-
+          node .github/interop/legacy_stdio_client.mjs zig-out/bin/bridge-embedded-server
+          --many-tools 150
       # The sign-in at the start, the step-up through a URL elicitation, and the static header.
       - name: Sign in through the bridge with the TypeScript SDK client
         run: >-
           node .github/interop/oauth_stdio_client.mjs zig-out/bin/mcp-bridge-vscode
           zig-out/bin/bridge-fixture-server test/fixtures/tls/ca.crt
 
-  # The stub of milestone M0. In milestone M5, the consumer also serves a server through the bridge.
+  # The consumer of the package (M5): a zig-sdk server that calls vscode.serveStdio. It gets the
+  # package from a tarball of the commit, with zig fetch, as an outside user does. The driver then
+  # starts the consumer over pipes two times: as VS Code (initialize, a tool call and a form) and
+  # as a client of revision 2026-07-28 (server/discover, tools/list and a tool call). The consumer
+  # must exit with code 0 at the end of each stdin.
   consumer:
     name: consumer
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-zig
@@ -137,4 +154,7 @@ jobs:
       - run: zig build
         working-directory: examples/consumer
       - run: ./zig-out/bin/consumer --check
+        working-directory: examples/consumer
+      - name: Drive one legacy and one modern connection through the consumer
+        run: zig build drive
         working-directory: examples/consumer
