@@ -42,7 +42,7 @@ From M1, the two harnesses can list and call the tools of the upstream server. F
 
 ## Build and install
 
-You need Zig 0.16.0. The project gives source code only, without prebuilt executables. The first build fetches zig-sdk, the only dependency, from GitHub. `build.zig.zon` pins a commit of zig-sdk 0.4.0 before its release.
+You need Zig 0.16.0. The project gives source code only, without prebuilt executables. The first build fetches zig-sdk, the only dependency, from GitHub. `build.zig.zon` pins the release commit of zig-sdk 0.4.0.
 
 1. Get the source code:
 

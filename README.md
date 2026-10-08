@@ -116,9 +116,9 @@ Each release of zig-bridge-sdk pins one release of zig-sdk. `VERSIONING.md` give
 
 | zig-bridge-sdk | zig-sdk | zig-sdk commit |
 | --- | --- | --- |
-| 0.0.0 (no release) | 0.4.0 before its release | `cda66dc616ce01ad69e8c7ea716416c324669a54` |
+| 0.0.0 (no release) | 0.4.0 | `8334b1501644c9f8e1f65f7e24b1ef86b335093f` |
 
-Milestones M3 and M4 need the changes of zig-sdk 0.4.0. Until the release of zig-sdk 0.4.0, the pin is a commit of its stack of pull requests. Before the first release of zig-bridge-sdk, the pin moves to the commit of the tag `v0.4.0`.
+Milestones M3 and M4 need the changes of zig-sdk 0.4.0. The pin is the release commit of zig-sdk 0.4.0.
 
 ## Documentation
 

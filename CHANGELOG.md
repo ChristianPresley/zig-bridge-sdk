@@ -8,11 +8,11 @@ This section has the work of milestones M0 to M4. M0 is the scaffold: the packag
 
 The bridge starts the upstream command, or it connects to the upstream server at a URL over Streamable HTTP. When the server at the URL asks for it, the bridge signs in at its authorization server. The bridge answers `initialize`, and forwards the requests for tools, prompts, resources and completion. It also forwards the progress notifications and the cancellations.
 
-When the upstream server asks for input, the bridge sends each input request to the client and sends the answers to the upstream server. A listen stream gives the list changes and the resource updates of the upstream server to the client. The log messages of the requests also go to the client. The pin of zig-sdk is a commit of zig-sdk 0.4.0 before its release.
+When the upstream server asks for input, the bridge sends each input request to the client and sends the answers to the upstream server. A listen stream gives the list changes and the resource updates of the upstream server to the client. The log messages of the requests also go to the client. The pin of zig-sdk is the release commit of zig-sdk 0.4.0.
 
 ### Added
 
-- Package: the Zig package `bridge_sdk` for Zig 0.16.0. Its only dependency is zig-sdk. `build.zig.zon` pins the commit `cda66dc616ce01ad69e8c7ea716416c324669a54` of zig-sdk 0.4.0 before its release, with the package hash. M0 to M2 used zig-sdk v0.3.0 (`c1f55f00deefb3f09ac97126d6405b1820b927dd`). The `.paths` list has `build.zig`, `build.zig.zon`, `src`, `bridges`, `LICENSE`, `NOTICE` and `README.md`.
+- Package: the Zig package `bridge_sdk` for Zig 0.16.0. Its only dependency is zig-sdk. `build.zig.zon` pins zig-sdk v0.4.0 (`8334b1501644c9f8e1f65f7e24b1ef86b335093f`), with the package hash. M0 to M2 used zig-sdk v0.3.0 (`c1f55f00deefb3f09ac97126d6405b1820b927dd`). The `.paths` list has `build.zig`, `build.zig.zon`, `src`, `bridges`, `LICENSE`, `NOTICE` and `README.md`.
 - Package: the package exports the `mcp` module of the pinned zig-sdk, so that an embedder can use the same `mcp` types as the bridges.
 - `bridge`: the core module in `src/bridge.zig`. `bridge.Profile` holds the settings of one product, for example its name, the `_meta` keys for the upstream server and the quirk flags. `bridge.version` is the version of the package.
 - `bridge`: the quirk `drop_non_object_output_schema` of `bridge.Profile`. It removes each tool `outputSchema` whose root does not have `type: "object"`.
@@ -101,6 +101,7 @@ When the upstream server asks for input, the bridge sends each input request to 
 
 ### Changed
 
+- Package: the pin of zig-sdk moves to the release commit of zig-sdk v0.4.0 (`8334b1501644c9f8e1f65f7e24b1ef86b335093f`). M3 and M4 used the commit `cda66dc616ce01ad69e8c7ea716416c324669a54` of zig-sdk 0.4.0 before its release. The release commit adds the HTTP/2 and gRPC fixes of zig-sdk 0.4.0 and `mcp.util.loopback`. The bridges do not use HTTP/2 or gRPC, thus their code has no change.
 - Repository: the CI workflows, the release workflow and `CONTRIBUTING.md` give `--test-timeout 10m` to `zig build test`. On Windows, a race of Zig 0.16.0 in parallel process starts can delay the answer of a test runner. Without the option, the build runner then reports a test runner that does not answer, although no test hangs.
 
 [Unreleased]: https://github.com/ChristianPresley/zig-bridge-sdk/commits/main
