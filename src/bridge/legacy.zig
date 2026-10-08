@@ -144,12 +144,14 @@ pub fn isListMethod(method: []const u8) bool {
 /// What the reader does with a notification of the client. The reader processes each
 /// notification itself and never sends one to the upstream server.
 pub const NotificationKind = enum {
-    /// `notifications/initialized`. The reader ignores it.
+    /// `notifications/initialized`. After the initialize result, the reader starts the listen
+    /// stream of the upstream server when the server declares list changes or subscriptions.
     initialized,
     /// `notifications/cancelled`. The reader cancels the request with that id.
     cancelled,
-    /// `notifications/roots/list_changed`. The reader ignores it, because the bridge declares
-    /// no roots to the upstream server.
+    /// `notifications/roots/list_changed`. The reader ignores it, because revision 2026-07-28
+    /// has no such notification: the upstream server asks for the roots in each request that
+    /// needs them.
     roots_list_changed,
     /// Each other notification. The reader ignores it and writes a debug log line.
     other,

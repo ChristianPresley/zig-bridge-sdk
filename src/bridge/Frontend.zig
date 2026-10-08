@@ -608,8 +608,8 @@ fn handleRequest(self: *Frontend, slot: *Slot, req: Message.Request) void {
                 const cause: translate.Cause = if (e == error.OutOfMemory) .out_of_memory else .invalid_params;
                 return self.errorInline(slot, translate.errorFor(cause, null));
             };
-            // Revision 2026-07-28 has no setLevel request. A later version sends the level
-            // with each request.
+            // Revision 2026-07-28 has no setLevel request. Each upstream request carries the
+            // stored level in its `_meta` (RequestOptions.log_level).
             self.client_level.store(@as(u8, @intFromEnum(p.level)) + 1, .release);
             self.answerInline(slot, .{ .object = .empty });
         },
