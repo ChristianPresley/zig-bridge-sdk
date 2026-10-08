@@ -4,8 +4,14 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
+### Changed
+
+- Package: the pin of zig-sdk moves to the commit `7a937c450ad6a9898dabe55e428b9f38d41730a7` of zig-sdk pull request #36. That commit has zig-sdk 0.5.0 and a fix of `mcp.util.wake.wakeIp`. No tag of zig-sdk has this fix yet. Before the next release of zig-bridge-sdk, the pin moves to the commit of a tag.
+- Package: from zig-sdk 0.5.0, the Secret Service backend of the keychain has time limits. Each answer of the Secret Service has a limit of 25 seconds, and a prompt to the user has a limit of 5 minutes. At a limit, the keychain store of the bridge gets `error.KeychainUnavailable` or `error.KeychainLocked`.
+
 ### Fixed
 
+- `bridge`: on macOS, the stop of the loopback receiver after a cancel does not stop a Debug build with the panic `programmer bug caused syscall error: ISCONN`. The pinned zig-sdk connects the wake connection of `cancelAcceptLoop` with a socket that does not block. Before, a late cancel signal of std could interrupt the connect, and the second connect of std got `EISCONN`.
 - `bridge`: the loopback receiver of the sign-in ignores a cancel while it waits in `accept`. Only the wake connection of `Receiver.stop` ends that wait. On Windows, the cancel of the stop could arrive just after the accept took the wake connection. Std then closed that connection, and a Debug build wrote a stack trace of `error.Unexpected` with the status `INVALID_PARAMETER` to stderr. These lines have no tag of the bridge.
 
 ## [0.1.0] - 2026-10-08

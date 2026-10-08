@@ -149,7 +149,7 @@ Each release of zig-bridge-sdk pins one release of zig-sdk. `VERSIONING.md` give
 | --- | --- | --- |
 | 0.1.0 | 0.4.0 (`v0.4.0`) | `8334b1501644c9f8e1f65f7e24b1ef86b335093f` |
 
-Milestones M3 to M5 need the changes of zig-sdk 0.4.0. The pin is the commit `8334b15` of the tag `v0.4.0` of zig-sdk.
+Milestones M3 to M5 need the changes of zig-sdk 0.4.0. Release 0.1.0 pins the commit `8334b15` of the tag `v0.4.0` of zig-sdk. After 0.1.0, the pin is the commit `7a937c4` of zig-sdk pull request #36, after the tag `v0.5.0`. No tag of zig-sdk has that commit yet.
 
 ## Documentation
 
