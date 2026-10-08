@@ -6,7 +6,7 @@ A bridge connects an MCP client of revision 2025-11-25 to an MCP server of revis
 
 ## Status
 
-The project is in development. This is milestone M4 of the `vscode` bridge. The bridge starts the upstream command and speaks to it over stdio. It can also connect to an upstream server at an HTTPS URL over Streamable HTTP.
+The project is in development. Milestones M0 to M5 of the `vscode` bridge are complete. The bridge starts the upstream command and speaks to it over stdio. It can also connect to an upstream server at an HTTPS URL over Streamable HTTP.
 
 The bridge answers `initialize`, and it forwards the requests for tools, prompts, resources and completion. It also forwards the progress notifications of the upstream server and the cancellations of the client. When the upstream server asks for input, the bridge sends each input request to the client and sends the answers to the upstream server.
 
@@ -14,7 +14,7 @@ The bridge also sends the list changes, the resource updates and the log message
 
 When an upstream server at a URL asks for a sign-in, the bridge signs in at its authorization server with OAuth. The first sign-in opens the browser during `initialize`. For a later sign-in, the client gets a URL elicitation. The bridge keeps the tokens in the keychain of the host, in encrypted files or in memory. `mcp-bridge-vscode logout` deletes a stored sign-in.
 
-The next milestone, M5, adds an API that puts the bridge into the executable of a zig-sdk server.
+A zig-sdk server can also put the bridge into its own executable with `vscode.serveStdio`. The first request of the client then selects revision 2025-11-25 or revision 2026-07-28. The section [The bridge in a zig-sdk server](#the-bridge-in-a-zig-sdk-server) gives the steps.
 
 The [Roadmap](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/Roadmap) on the wiki shows the milestones, the state of each part and the planned work. `CHANGELOG.md` lists the changes.
 
@@ -24,7 +24,7 @@ The first bridge is for Visual Studio Code (VS Code).
 
 | Bridge | Product | Client revision | Executable | Status |
 | --- | --- | --- | --- | --- |
-| `vscode` | Visual Studio Code | 2025-11-25 | `mcp-bridge-vscode` | M4: runtime, input requests, notifications, and an HTTPS upstream server with OAuth |
+| `vscode` | Visual Studio Code | 2025-11-25 | `mcp-bridge-vscode` | M5: runtime, input requests, notifications, an HTTPS upstream server with OAuth, and `vscode.serveStdio` |
 
 Each bridge has its own README. [`bridges/vscode/README.md`](bridges/vscode/README.md) tells how to build the `vscode` bridge and how to configure VS Code.
 
@@ -41,7 +41,7 @@ The package `bridge_sdk` has one bridge for each product. The key of a bridge is
 - The module `vscode` in `bridges/vscode/vscode.zig`. It declares the settings of the product as a `bridge.Profile`.
 - The executable `mcp-bridge-vscode` from `bridges/vscode/main.zig`.
 
-The module `bridge` in `src/bridge.zig` is the core that all bridges use. The package also exports the `mcp` module of the pinned zig-sdk. A planned wiki page, Package Model, will give the steps to add a bridge for a product.
+The module `bridge` in `src/bridge.zig` is the core that all bridges use. The package also exports the `mcp` module of the pinned zig-sdk. The wiki page [Package Model](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/Package-Model) gives the steps to add a bridge for a product and the rules for embedders.
 
 ### Use the `mcp` module of the package
 
@@ -51,6 +51,35 @@ If your package uses the `mcp` module and a bridge module, the two must use the 
 - Pin the zig-sdk commit and hash of the `build.zig.zon` of this package. Give `b.dependency` the same `.target` and `.optimize` arguments for zig-sdk and for `bridge_sdk`.
 
 When the two `mcp` modules are not the same, Zig shows an error. The [table of errors](#troubleshooting) gives the cause of each error.
+
+## The bridge in a zig-sdk server
+
+If you write your server with zig-sdk, you do not need the separate executable. Call `vscode.serveStdio` in place of `mcp.transport.stdio.serve`. Then your executable serves the two harnesses of VS Code and each client of revision 2026-07-28 on stdio. The first request of the client selects the path:
+
+- `initialize` selects the bridge. Its upstream server is your server in the same process.
+- Each other request selects the stdio transport of zig-sdk, without the bridge.
+- A `server/discover` before the first other request selects no path.
+
+In `build.zig`, take the modules `vscode` and `mcp` from this package:
+
+```zig
+const dep = b.dependency("bridge_sdk", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("vscode", dep.module("vscode"));
+exe.root_module.addImport("mcp", dep.module("mcp"));
+```
+
+Do not pin zig-sdk a second time for `mcp`. `vscode.serveStdio` takes the `mcp.Server` of this package, and a second pin gives a different type. The section [Use the `mcp` module of the package](#use-the-mcp-module-of-the-package) gives the rule.
+
+In your source code, give your server to `vscode.serveStdio`:
+
+```zig
+var server = try mcp.Server.init(gpa, io, .{ .info = .{ .name = "my-server", .version = "1.0.0" } });
+defer server.deinit();
+// Add the tools, the prompts and the resources here.
+try vscode.serveStdio(io, gpa, &server, .{});
+```
+
+[`bridges/vscode/README.md`](bridges/vscode/README.md#the-bridge-in-a-zig-sdk-server) gives the limits and the behavior of the Copilot harness. The example in `examples/consumer/` is a complete program.
 
 ## Requirements
 
@@ -82,22 +111,24 @@ mcp-bridge-vscode logout --all
 zig build test --test-timeout 10m
 ```
 
-Always give `--test-timeout 10m`. `CONTRIBUTING.md` tells why. `zig build test` also runs the transcript tests, the process tests, the tests of the HTTPS mode of `bridge-fixture-server` and the test of the files in `site/`. The process tests start the two executables `mcp-bridge-vscode` and `bridge-fixture-server`.
+Always give `--test-timeout 10m`. `CONTRIBUTING.md` tells why. `zig build test` also runs the transcript tests, the process tests, the tests of the HTTPS mode of `bridge-fixture-server` and the test of the files in `site/`. The process tests start the three executables `mcp-bridge-vscode`, `bridge-fixture-server` and `bridge-embedded-server`.
 
 The CI job `interop` connects a client of the TypeScript SDK to the bridge. To run it on your computer, you need Node.js. Run these commands in the root of the repository:
 
 ```bash
 npm ci --ignore-scripts --no-audit --no-fund --prefix .github/interop
-zig build install fixture-server
+zig build install fixture-server embedded-server
 node .github/interop/legacy_stdio_client.mjs zig-out/bin/mcp-bridge-vscode -- \
   zig-out/bin/bridge-fixture-server --many-tools 150
+node .github/interop/legacy_stdio_client.mjs zig-out/bin/bridge-embedded-server \
+  --many-tools 150
 node .github/interop/oauth_stdio_client.mjs zig-out/bin/mcp-bridge-vscode \
   zig-out/bin/bridge-fixture-server test/fixtures/tls/ca.crt
 ```
 
-The second script starts `bridge-fixture-server` in its HTTPS mode with the test CA, and it signs in as a browser does.
+The first script also starts `bridge-embedded-server`, which has the bridge in its process. The second script starts `bridge-fixture-server` in its HTTPS mode with the test CA, and it signs in as a browser does.
 
-Other build steps: `test-vscode`, `fixture-server`, `run-vscode`, `fmt`, `lint-docs`, `commit-policy`, `gen-dictionary`, `check-version` and `changelog-section`. The option `-Dfuzz` prepares the tests for `zig build test -Dfuzz --fuzz` (not on Windows).
+Other build steps: `test-vscode`, `fixture-server`, `embedded-server`, `run-vscode`, `fmt`, `lint-docs`, `commit-policy`, `gen-dictionary`, `check-version` and `changelog-section`. The option `-Dfuzz` prepares the tests for `zig build test -Dfuzz --fuzz` (not on Windows).
 
 ## Troubleshooting
 
@@ -116,9 +147,9 @@ Each release of zig-bridge-sdk pins one release of zig-sdk. `VERSIONING.md` give
 
 | zig-bridge-sdk | zig-sdk | zig-sdk commit |
 | --- | --- | --- |
-| 0.0.0 (no release) | 0.4.0 | `8334b1501644c9f8e1f65f7e24b1ef86b335093f` |
+| 0.0.0 (no release) | 0.4.0 before its tag | `8334b1501644c9f8e1f65f7e24b1ef86b335093f` |
 
-Milestones M3 and M4 need the changes of zig-sdk 0.4.0. The pin is the release commit of zig-sdk 0.4.0.
+Milestones M3 to M5 need the changes of zig-sdk 0.4.0. The pin is the commit `8334b15` of zig-sdk pull request #31, before the tag `v0.4.0`. Before the first release of zig-bridge-sdk, the pin moves to the commit of the tag `v0.4.0`.
 
 ## Documentation
 

@@ -2,7 +2,7 @@
 
 `mcp-bridge-vscode` is a bridge between Visual Studio Code (VS Code) and an MCP server of specification revision 2026-07-28.[^mcp-2026] The MCP clients of VS Code speak revision 2025-11-25.[^mcp-2025] The bridge is a stdio server for VS Code. It starts the upstream server as a child process, or it connects to an upstream server at a URL over Streamable HTTP. It speaks to the upstream server with the `mcp.Client` of zig-sdk.
 
-This version is milestone M4. The bridge sends the input requests, the list changes, the resource updates and the log messages of the upstream server to VS Code. It also connects to an upstream server at an HTTPS URL, and it signs in with OAuth when that server asks for it. The [Status](#status) section tells what each milestone adds.
+This version is milestone M5. The bridge sends the input requests, the list changes, the resource updates and the log messages of the upstream server to VS Code. It also connects to an upstream server at an HTTPS URL, and it signs in with OAuth when that server asks for it. A zig-sdk server can also put the bridge into its own executable. The [Status](#status) section tells what each milestone adds.
 
 Visual Studio Code and VS Code are trademarks of Microsoft Corporation. This project has no affiliation with Microsoft, and Microsoft does not endorse it.
 
@@ -19,14 +19,17 @@ VS Code marks the Local harness for removal in a future release. Until VS Code s
 - The bridge answers `server/discover` with -32601 at once, so that the Copilot harness sends `initialize` (M1).
 - For a tool that needs input, the bridge completes the MRTR rounds with the upstream server. It sends each input request to VS Code as an elicitation, sampling or roots request of revision 2025-11-25 (M2).
 - Revision 2026-07-28 sends the list changes and the resource updates on a listen stream. The bridge keeps a listen stream open, and it sends these notifications to VS Code as revision 2025-11-25 does (M3).
+- A zig-sdk server can put the bridge into its own executable with `vscode.serveStdio`. Then the server needs no separate process (M5).
 
 ## Status
 
-This is milestone M4. The bridge starts the upstream command and speaks to it over stdio, or it connects to the upstream server at a URL. It answers `initialize`, and it forwards the requests for tools, prompts, resources and completion. It also forwards the progress notifications of the upstream server and the cancellations of VS Code. When a tool, a prompt or a resource needs input, the bridge asks VS Code. The section [Input requests](#input-requests) gives the rules.
+This is milestone M5. The bridge starts the upstream command and speaks to it over stdio, or it connects to the upstream server at a URL. It answers `initialize`, and it forwards the requests for tools, prompts, resources and completion. It also forwards the progress notifications of the upstream server and the cancellations of VS Code. When a tool, a prompt or a resource needs input, the bridge asks VS Code. The section [Input requests](#input-requests) gives the rules.
 
 The bridge sends the list changes, the resource updates and the log messages of the upstream server to VS Code. It also sends the trace context of VS Code to the upstream server. The section [Notifications](#notifications) gives the rules. The section [Options](#options) gives the command line.
 
 For an upstream server at a URL, the bridge signs in at the authorization server of the upstream server, and it keeps the tokens. The sections [The URL form](#the-url-form), [Sign-in and accounts](#sign-in-and-accounts), [Token storage](#token-storage) and [Environment limits](#environment-limits) give the rules.
+
+A zig-sdk server can put the bridge into its own executable with `vscode.serveStdio`. The section [The bridge in a zig-sdk server](#the-bridge-in-a-zig-sdk-server) gives the rules.
 
 The [Roadmap](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/Roadmap) on the wiki is the plan of record. Each milestone adds these parts:
 
@@ -40,9 +43,11 @@ The [Roadmap](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/Roadmap) o
 
 From M1, the two harnesses can list and call the tools of the upstream server. From M2, they can also complete the tools that need input. From M3, the Local harness lists the tools again after a call that changes them, before the next turn of the same chat request. An editor of a resource also shows the changes of the resource. The Copilot harness has no manual check of this yet.
 
+From M5, the Local harness can use a zig-sdk server that calls `vscode.serveStdio`, without `mcp-bridge-vscode`. By default, the Copilot harness takes the modern path of such a server, thus a tool that asks for input cannot complete there. The option `.discover = .refuse` sends the Copilot harness to the bridge.
+
 ## Build and install
 
-You need Zig 0.16.0. The project gives source code only, without prebuilt executables. The first build fetches zig-sdk, the only dependency, from GitHub. `build.zig.zon` pins the release commit of zig-sdk 0.4.0.
+You need Zig 0.16.0. The project gives source code only, without prebuilt executables. The first build fetches zig-sdk, the only dependency, from GitHub. `build.zig.zon` pins a commit of zig-sdk 0.4.0 before its tag.
 
 1. Get the source code:
 
@@ -61,7 +66,7 @@ You need Zig 0.16.0. The project gives source code only, without prebuilt execut
 4. Copy the executable to a directory that you keep. Write its absolute path in the configuration.
 5. Make sure that it starts: run `mcp-bridge-vscode --version`.
 
-If you write your server with zig-sdk, the API of M5 (planned) will put the bridge into your server executable. Then you will not need a separate bridge process.
+If you write your server with zig-sdk, you do not need a separate bridge process. The section [The bridge in a zig-sdk server](#the-bridge-in-a-zig-sdk-server) tells how to put the bridge into your server.
 
 ### Remote windows
 
@@ -77,6 +82,77 @@ zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl
 VS Code for the Web cannot start stdio servers. The bridge does not operate there.
 
 For the URL form, the sign-in also happens on the host of the bridge. The section [Environment limits](#environment-limits) tells how the browser and the redirect reach a remote host.
+
+## The bridge in a zig-sdk server
+
+If you write your server with zig-sdk, we recommend this path. You then do not need `mcp-bridge-vscode`. Call `vscode.serveStdio` in place of `mcp.transport.stdio.serve`. Then one executable serves revision 2025-11-25 and revision 2026-07-28 on stdio: the Local harness, the Copilot harness and each other client of revision 2026-07-28. The first request of the client selects the path of the connection:
+
+- `initialize` selects the bridge. The bridge serves VS Code as `mcp-bridge-vscode` does, and its upstream server is your server in the same process.
+- Each other request selects the stdio transport of zig-sdk, without the bridge. A line that is not valid JSON-RPC also selects it.
+- A `server/discover` before the first other request selects no path. The option `discover` tells who answers it. The section [The Copilot harness and an embedded server](#the-copilot-harness-and-an-embedded-server) gives the details.
+
+### Steps to put the bridge into your server
+
+1. Add the package to the `build.zig.zon` of your server with `zig fetch --save=bridge_sdk` and the URL of a commit.
+2. In `build.zig`, import the modules `vscode` and `mcp` of the package:
+
+   ```zig
+   const dep = b.dependency("bridge_sdk", .{ .target = target, .optimize = optimize });
+   exe.root_module.addImport("vscode", dep.module("vscode"));
+   exe.root_module.addImport("mcp", dep.module("mcp"));
+   ```
+
+3. Take `mcp` only from this package. A second pin of zig-sdk gives a second `mcp` module, and the build fails. The [README of the repository](../../README.md#troubleshooting) gives the errors.
+4. In your `main`, give your server to `vscode.serveStdio`:
+
+   ```zig
+   const std = @import("std");
+   const vscode = @import("vscode");
+   const mcp = @import("mcp");
+
+   pub fn main(init: std.process.Init) !void {
+       var server = try mcp.Server.init(init.gpa, init.io, .{ .info = .{ .name = "my-server", .version = "1.0.0" } });
+       defer server.deinit();
+       // Add the tools, the prompts and the resources here.
+       try vscode.serveStdio(init.io, init.gpa, &server, .{});
+   }
+   ```
+
+5. In `.vscode/mcp.json`, write the absolute path of your executable as the `command` of the server entry. The entry has no `args` for the bridge:
+
+   ```json
+   {
+     "servers": {
+       "demo": { "type": "stdio", "command": "/abs/path/your-server" }
+     }
+   }
+   ```
+
+The example in [`examples/consumer/`](../../examples/consumer/) is a complete program. CI builds it from a tarball of the package. Then CI runs it as VS Code and as a client of revision 2026-07-28.
+
+### Limits in the process
+
+The two paths take their limits from `server.options.limits` of your server, not from the defaults of `mcp-bridge-vscode`. These limits are the line length, the depth, the requests in flight and `shutdown_grace`. The paths have these differences:
+
+- On the legacy path, a line that is too long gets -32600. On the first line and on the modern path, `vscode.serveStdio` drops it without a response.
+- On the legacy path, a handler sees `ctx.kind == .memory`, and the rate limits of your server see no caller (`Peer.unknown`). On the modern path, a handler sees `.stdio`, and the rate limits see one caller for the connection.
+- On the two paths, a request above the limit of requests in flight gets -32603 at once. Thus the function always reads the cancellations and the end of stdin.
+
+On the legacy path, the bridge speaks to your server through `mcp.transport.memory.ClientLink` of zig-sdk:
+
+- The handler of a request runs on the task of the request of VS Code. Only a cancellation of VS Code and the end of stdin stop it.
+- A request has no time limit in the process. The wait for the answers of VS Code to an input request keeps its limit of 1 h.
+- The acknowledgment of a listen stream arrives before your server can publish an event to that stream. zig-sdk 0.4.0 gives this order. Thus the bridge can forward the list changes and the resource updates.
+- The listen callback of the bridge only translates the event and writes it under the output lock. A change of your server, for example `setToolEnabled`, writes its list change to VS Code on the task that makes the change, before the result. While VS Code does not read stdout, each event and each new listen stream of your server waits.
+- The listen stream, the subscriptions, the log level and the input requests operate as in `mcp-bridge-vscode`.
+
+At the end of stdin, `vscode.serveStdio` ends the listen streams. The requests in flight get at most `shutdown_grace` (2 s by default). Then the function fires the cancel tokens of the requests that are left, cancels their tasks and returns. Only a handler that does not examine its cancel token and has no cancel point can keep the process alive. `mcp-bridge-vscode` has a watchdog for this case, but `vscode.serveStdio` has none.
+
+### The Copilot harness and an embedded server
+
+The Copilot harness sends `server/discover` first. By default, your server answers it, and the harness takes the modern path. The harness has no MRTR yet,[^copilot-mrtr] thus a tool that asks for input cannot complete. The other tools operate. This limit stays until a release of the Copilot harness has MRTR.
+
+To change this, give `.{ .discover = .refuse }` to `vscode.serveStdio`. The harness then gets -32601 for `server/discover` and sends `initialize`, and the bridge does the MRTR rounds for it. With this option, a client of revision 2026-07-28 that needs a `server/discover` result cannot use your server. A client that sends its requests without `server/discover` still takes the modern path.
 
 ## Options
 
@@ -262,10 +338,6 @@ The client secret of a pre-registered client also comes from an environment vari
 The `oauth` keys of an HTTP server entry in `mcp.json`, for example `clientId` and `enterpriseManaged`, do not apply to the stdio entry of the bridge. The bridge does not support the enterprise-managed authorization of VS Code yet. When a server accepts a static token, use `--header-env` with `Authorization` in its place.
 
 For an upstream server at a URL, VS Code gets only `data:` icons: of the server, its tools, its prompts and its resources. VS Code does not load an `http:` or `https:` icon of a stdio server. The bridge also removes `file:` icons, because a remote server must not get the trust of a local process.
-
-### Planned forms
-
-- The API of M5: a zig-sdk server will serve the two revisions in one process, without the separate executable.
 
 ## Sign-in and accounts
 

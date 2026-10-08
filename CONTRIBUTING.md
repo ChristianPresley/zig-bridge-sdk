@@ -36,18 +36,20 @@ On Windows, the build can also stop with "unable to read results of configure ph
 
 ## The interop checks
 
-The CI job `interop` connects the legacy TypeScript SDK client to the bridge with two scripts in `.github/interop/`. To run them on your computer, install Node.js and the pinned packages, and build the two executables:
+The CI job `interop` connects the legacy TypeScript SDK client to the bridge with two scripts in `.github/interop/`. To run them on your computer, install Node.js and the pinned packages, and build the three executables:
 
 ```bash
 npm ci --ignore-scripts --no-audit --no-fund --prefix .github/interop
-zig build install fixture-server
+zig build install fixture-server embedded-server
 node .github/interop/legacy_stdio_client.mjs zig-out/bin/mcp-bridge-vscode -- \
   zig-out/bin/bridge-fixture-server --many-tools 150
+node .github/interop/legacy_stdio_client.mjs zig-out/bin/bridge-embedded-server \
+  --many-tools 150
 node .github/interop/oauth_stdio_client.mjs zig-out/bin/mcp-bridge-vscode \
   zig-out/bin/bridge-fixture-server test/fixtures/tls/ca.crt
 ```
 
-Run the scripts from the root of the repository. The second script starts `bridge-fixture-server` in its HTTPS mode with the test CA. It reads the sign-in URL from the stderr of the bridge, and opens the URL as a browser does.
+Run the scripts from the root of the repository. The first script runs two times. The first run starts the bridge executable with `bridge-fixture-server` as its upstream command. The second run starts `bridge-embedded-server`, which has the bridge in its process. The second script starts `bridge-fixture-server` in its HTTPS mode with the test CA. It reads the sign-in URL from the stderr of the bridge, and opens the URL as a browser does.
 
 ## Prose
 
@@ -64,7 +66,7 @@ The key of each bridge is its product, after a check of the brand guidelines tha
 On Windows, you can run the Linux tests in the Windows Subsystem for Linux (WSL). Use the distribution Ubuntu-24.04. The CI uses Ubuntu 24.04 for its Linux tests too.
 
 1. Compile each test module for Linux with `zig test`, `-target x86_64-linux-musl` and `--test-no-exec`.
-2. Build the executables with `zig build install fixture-server -Dtarget=x86_64-linux-musl`.
+2. Build the executables with `zig build install fixture-server embedded-server -Dtarget=x86_64-linux-musl`.
 3. Copy the test binaries, `zig-out/bin/` and `test/fixtures/` to a directory in `~/`. Keep the path `test/fixtures/` below that directory.
 4. Run the test binaries in that directory. The tests read the test CA from `test/fixtures/tls` in the current directory.
 5. Do not run the tests from `/mnt/c`. On that file system, Unix sockets fail, and file modes do not work as on Linux.
@@ -73,17 +75,18 @@ On Windows, you can run the Linux tests in the Windows Subsystem for Linux (WSL)
 
 A command line that you give to `wsl` directly can change the paths. Thus use a script file.
 
-The next example compiles the tests of the module `bridge`. The other test modules take the same form, with the imports that `build.zig` gives them. Zig keeps the fetched zig-sdk in `zig-pkg/`.
+The next example compiles the tests of the module `bridge`. The other test modules take the same form, with the imports that `build.zig` gives them. Zig keeps the fetched zig-sdk in `zig-pkg/`. After a change of the pin, `zig-pkg/` has more than one zig-sdk. Thus the example takes the directory of the pinned zig-sdk from its hash in `build.zig.zon`.
 
 ```bash
 mkdir -p zig-out/linux
 printf 'pub const version: []const u8 = "0.0.0";\n' > zig-out/linux/build_options.zig
+mcp_dir="zig-pkg/$(sed -n 's/.*\.hash = "\(mcp-[^"]*\)".*/\1/p' build.zig.zon)"
 zig test -target x86_64-linux-musl --test-no-exec -femit-bin=zig-out/linux/bridge-test \
   --dep mcp --dep build_options -Mroot=src/bridge.zig \
-  -Mmcp="$(ls -d zig-pkg/mcp-*)/src/mcp.zig" -Mbuild_options=zig-out/linux/build_options.zig
+  -Mmcp="$mcp_dir/src/mcp.zig" -Mbuild_options=zig-out/linux/build_options.zig
 ```
 
-The process test in `test/process_test.zig` starts the two executables. `build.zig` gives it their paths in the import `process_options`. For a run in WSL, give it a file with the constants `bridge_exe` and `fixture_exe`, or set the environment variables `PROCESS_TEST_BRIDGE` and `PROCESS_TEST_FIXTURE`. The test fails when an executable is missing.
+The process test in `test/process_test.zig` starts the three executables. `build.zig` gives it their paths in the import `process_options`. For a run in WSL, give it a file with the constants `bridge_exe`, `fixture_exe` and `embedded_exe`. As an alternative, set the environment variables `PROCESS_TEST_BRIDGE`, `PROCESS_TEST_FIXTURE` and `PROCESS_TEST_EMBEDDED`. The test fails when an executable is missing.
 
 In WSL, examine each test that the runner skips. Only these skips are correct there:
 

@@ -21,7 +21,7 @@ Only the newest release receives security fixes. Until the first release, only t
 
 ## Security design
 
-The wiki page [Threat-Model](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/Threat-Model) holds the security design of the bridges. For each security requirement, that page gives the milestone, the module and the test. From milestone M4, the page gives the test of each requirement of M1 to M4. The requirements of milestone M5 are a plan.
+The wiki page [Threat-Model](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/Threat-Model) holds the security design of the bridges. For each security requirement, that page gives the milestone, the module and the test. From milestone M5, the page gives the test of each requirement of M1 to M5.
 
 A bridge stands between its client and an upstream server. The threat model has these trust boundaries:
 
@@ -56,6 +56,15 @@ The URL form of a bridge keeps the tokens of a sign-in. It uses the first store 
 3. Memory. Then the user signs in at each start.
 
 The file store protects the tokens against other accounts of the host and against a copy of the token directory alone. It does not protect them against a program that runs as the same user. In a remote window of VS Code, a server can run on the remote host: over Secure Shell, in WSL or in a dev container. Its tokens then stay on that host. A rebuild of a dev container removes them, unless the token directory is on a volume.
+
+### The bridge in a zig-sdk server
+
+From milestone M5, `vscode.serveStdio` puts the bridge into the process of a zig-sdk server. These rules apply:
+
+- The first request of the client selects the path. The function reads the first lines with the line limit and the depth limit of the server. It drops a line that is too long without a response. A line that is not valid JSON-RPC selects the stdio transport of zig-sdk, and that transport answers it with an error.
+- On the two paths, stdout gets only JSON-RPC messages.
+- On the legacy path, the bridge applies its translation rules to the results of the server, as to the results of an upstream process.
+- At the end of stdin, the function stops in a bounded time, but it has no watchdog. A handler that does not examine its cancel token and has no cancel point can keep the process alive. An executable can arm its own watchdog.
 
 ### Shared hosts
 
