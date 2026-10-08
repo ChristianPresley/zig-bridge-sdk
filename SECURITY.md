@@ -21,11 +21,44 @@ Only the newest release receives security fixes. Until the first release, only t
 
 ## Security design
 
-The wiki page [Threat-Model](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/Threat-Model) holds the security design of the bridges. For each security requirement, that page gives the milestone, the module and the test. From milestone M3, the page gives the test of each requirement of M1 to M3. The requirements of the later milestones are a plan.
+The wiki page [Threat-Model](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/Threat-Model) holds the security design of the bridges. For each security requirement, that page gives the milestone, the module and the test. From milestone M4, the page gives the test of each requirement of M1 to M4. The requirements of milestone M5 are a plan.
 
 A bridge stands between its client and an upstream server. The threat model has these trust boundaries:
 
 - The model trusts the client, for example VS Code, and the user of the client.
 - The model does not trust the upstream server or its authorization server. The bridge must check what they send before the client gets it.
+
+### The authorization server
+
+In the URL form, the upstream server names its authorization server, and the authorization server makes the authorization URL. Thus the bridge does not trust the authorization URL, the redirect or the other answers of the authorization server. These rules apply:
+
+- The bridge checks each authorization URL before it writes the URL or opens it. The URL must use `https`, have a host and have no user information. It must have only visible ASCII characters without ``"<>\^`{|}``, and at most 8 KiB. The bridge never writes or opens a URL that fails the check.
+- The bridge never starts a shell to open a URL. On Windows, it calls `ShellExecuteW`. On a POSIX host, it starts `$BROWSER`, `open` or `xdg-open` with the URL as the only argument.
+- Only the first sign-in, before `notifications/initialized`, opens the browser. After it, the bridge never opens the browser itself. The client shows the full URL in a URL elicitation, and the user decides.
+- One sign-in runs at a time. After a sign-in through the client that the user declined or that failed, the bridge asks no new question for 60 s.
+- The loopback receiver listens only on `127.0.0.1`, before the browser opens. No other socket can share its port. Only a `GET` of the callback path with the expected `state` ends the wait. The page of the receiver repeats nothing from the request.
+- zig-sdk does the OAuth protocol: PKCE, the check of `state` and `iss`, and the check that the resource of the metadata covers the URL.
+- The client secret of `--client-id` goes only to the authorization server of `--client-issuer`.
+- `logout` uses the protected resource metadata of a server only when its resource covers the URL. Thus a server cannot name the stored sign-in of a different server.
+
+### Secrets
+
+No option of the bridge takes a secret on the command line. A secret header value comes from an environment variable of `--header-env`, and the client secret comes from `MCP_BRIDGE_CLIENT_SECRET`. `--header` is only for a value that is not secret. The stderr lines and the error messages never have a header value, a token, the client secret or the query of the redirect. The error messages also never have the URL of the upstream server, because its path or its query can hold a key.
+
+The program that opens the browser gets no secret variable of the environment. On a POSIX host, the bridge removes them from the environment of that program. On Windows, the URL form removes them from the environment of its own process at the start.
+
+### Token storage
+
+The URL form of a bridge keeps the tokens of a sign-in. It uses the first store that works:
+
+1. The keychain of the host: Windows Credential Manager, the macOS Keychain or the Secret Service on Linux.
+2. Encrypted files, only with a key from outside the token directory: the environment variable `MCP_BRIDGE_TOKEN_KEY` or a private key file.
+3. Memory. Then the user signs in at each start.
+
+The file store protects the tokens against other accounts of the host and against a copy of the token directory alone. It does not protect them against a program that runs as the same user. In a remote window of VS Code, a server can run on the remote host: over Secure Shell, in WSL or in a dev container. Its tokens then stay on that host. A rebuild of a dev container removes them, unless the token directory is on a volume.
+
+### Shared hosts
+
+On a POSIX host, other users can read the command lines of the processes. The browser opener gets the authorization URL as its argument, and the URL has the `state` of the sign-in. Another user of a shared host can thus send a redirect to the receiver of the bridge. The redirect can have the code of a different account. On a shared host, use `--no-browser` and open the URL of the sign-in line yourself.
 
 [^zig-sdk-security]: Security policy of zig-sdk. https://github.com/ChristianPresley/zig-sdk/blob/main/SECURITY.md
