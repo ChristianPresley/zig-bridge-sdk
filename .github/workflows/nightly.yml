@@ -28,8 +28,9 @@ jobs:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-zig
       # -Dfuzz: the fuzz path of the test runner of Zig 0.16.0 does not compile. See build.zig.
-      # The fuzz targets are in src/bridge/fuzz_test.zig.
-      - run: zig build test -Dfuzz --fuzz=200000 --summary all
+      # The fuzz targets are in src/bridge/fuzz_test.zig. --test-timeout: see the test job of
+      # ci.yml. In Zig 0.16.0, the limit does not apply to the fuzz phase.
+      - run: zig build test -Dfuzz --fuzz=200000 --test-timeout 10m --summary all
       # After a crash of a fuzz target, Zig 0.16.0 keeps the input in .zig-cache/f/crash, but
       # the build still ends with exit code 0. Thus this step fails the job and shows the input.
       - name: Fail when a fuzz target crashed

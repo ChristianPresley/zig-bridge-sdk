@@ -1,0 +1,9 @@
+{
+  "client_id": "https://christianpresley.github.io/zig-bridge-sdk/vscode/client.json",
+  "client_name": "mcp-bridge-vscode (zig-bridge-sdk)",
+  "redirect_uris": ["http://127.0.0.1:41894/callback"],
+  "grant_types": ["authorization_code", "refresh_token"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none",
+  "application_type": "native"
+}

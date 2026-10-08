@@ -60,7 +60,12 @@ jobs:
         with:
           path: ${{ runner.temp }}/zig-global-cache
           key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
-      - run: zig build test -Doptimize=${{ matrix.optimize }} --summary all
+      # Without --test-timeout, the build runner waits only 60 s for each answer of a test runner.
+      # On Windows, a race of Zig 0.16.0 in parallel process starts (an inherited pipe) can delay
+      # that answer. The build runner then reports "test runner failed to respond", although no
+      # test hangs. With the option, each test has a limit of 10 min, and the build runner waits
+      # as long for each answer.
+      - run: zig build test -Doptimize=${{ matrix.optimize }} --test-timeout 10m --summary all
       # The install step builds mcp-bridge-vscode.
       - run: zig build -Doptimize=${{ matrix.optimize }}
       - run: zig build fixture-server -Doptimize=${{ matrix.optimize }}
@@ -84,6 +89,12 @@ jobs:
   # does: forms, URLs, sampling and roots. Its notification handlers get the list changes, the
   # resource updates and the log messages, and it checks that each comes before the result of the
   # call that caused it. The lockfile pins the npm tree, and npm ci runs no install scripts.
+  #
+  # The second script checks the URL form against bridge-fixture-server over HTTPS with the test
+  # CA. The bridge runs as in the process tests: --no-browser, --token-store memory and
+  # --ca-file. The script reads the sign-in URL from stderr of the bridge and opens it with the
+  # redirects, as a browser does (the same pattern as the authorization scenarios of zig-sdk). It
+  # also checks a static authorization header from the environment.
   interop:
     name: interop
     runs-on: ubuntu-24.04
@@ -103,6 +114,11 @@ jobs:
         run: >-
           node .github/interop/legacy_stdio_client.mjs zig-out/bin/mcp-bridge-vscode --
           zig-out/bin/bridge-fixture-server --many-tools 150
+      # The sign-in at the start, the step-up through a URL elicitation, and the static header.
+      - name: Sign in through the bridge with the TypeScript SDK client
+        run: >-
+          node .github/interop/oauth_stdio_client.mjs zig-out/bin/mcp-bridge-vscode
+          zig-out/bin/bridge-fixture-server test/fixtures/tls/ca.crt
 
   # The stub of milestone M0. In milestone M5, the consumer also serves a server through the bridge.
   consumer:

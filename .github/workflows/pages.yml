@@ -1,0 +1,47 @@
+name: Pages
+
+# Publishes site/ to GitHub Pages: the client ID metadata document of the vscode bridge at
+# https://christianpresley.github.io/zig-bridge-sdk/vscode/client.json. The whole workflow needs
+# the repository setting "Pages: Source = GitHub Actions": without it, configure-pages in the
+# build job fails. Turn the setting on before the first push to main that changes site/. Else
+# that run fails: turn the setting on, then start the workflow again with workflow_dispatch.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time. A running deployment finishes before the next one starts.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check that each JSON file of the site parses
+        run: find site -name '*.json' -print0 | xargs -0 -n1 jq -e . >/dev/null
+      - uses: actions/configure-pages@v6
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

@@ -40,7 +40,8 @@ jobs:
       - uses: ./.github/actions/setup-zig
       - run: zig build fmt
       - run: zig build lint-docs -- --strict --string-literals
-      - run: zig build test -Doptimize=ReleaseSafe --summary all
+      # --test-timeout: see the test job of ci.yml (a race of Zig 0.16.0 on Windows).
+      - run: zig build test -Doptimize=ReleaseSafe --test-timeout 10m --summary all
       - run: zig build install fixture-server -Doptimize=ReleaseSafe
 
   publish:

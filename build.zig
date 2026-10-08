@@ -181,6 +181,20 @@ pub fn build(b: *std.Build) void {
     run_fixture_server_tests.setCwd(b.path("."));
     test_step.dependOn(&run_fixture_server_tests.step);
 
+    // The checks of the files of GitHub Pages in `site/`.
+    const site_tests = b.addTest(.{ .name = "site", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/site_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "mcp", .module = mcp },
+            .{ .name = "bridge", .module = bridge },
+            .{ .name = "vscode", .module = vscode },
+        },
+    }) });
+    site_tests.root_module.addAnonymousImport("site_vscode_client", .{ .root_source_file = b.path("site/vscode/client.json") });
+    test_step.dependOn(&b.addRunArtifact(site_tests).step);
+
     // The checks of the vendored schemas. The fixtures come in as anonymous imports, because
     // Zig 0.16 does not embed a file outside the module root.
     const schema_tests = b.addTest(.{ .root_module = b.createModule(.{
