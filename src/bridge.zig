@@ -34,6 +34,9 @@ pub const notify = @import("bridge/notify.zig");
 /// The sign-in at an HTTP upstream server: the URL check, the browser opener, the loopback
 /// receiver, the token store and the OAuth identity.
 pub const oauth = @import("bridge/oauth.zig");
+/// The bridge in the process of a zig-sdk server: one stdio connection for a client of either
+/// revision. The first request of the client selects the path.
+pub const embed = @import("bridge/embed.zig");
 
 test {
     _ = legacy;
@@ -44,6 +47,7 @@ test {
     _ = input;
     _ = notify;
     _ = oauth;
+    _ = embed;
     _ = @import("bridge/fuzz_test.zig");
 }
 
