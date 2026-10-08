@@ -292,9 +292,9 @@ test "an upstream server without serverInfo gets the name from the settings and 
     const command: []const []const u8 = &.{ "/opt/mcp/bin/files-server.exe", "--stdio" };
     const cases = [_]struct { options: Frontend.Options, expected: []const u8 }{
         // `serve` with a name, as from `--name`.
-        .{ .options = vscode.frontendOptions(.{ .command = command, .name = "my-server" }), .expected = "my-server" },
+        .{ .options = vscode.frontendOptions(.{ .upstream = .{ .command = command }, .name = "my-server" }), .expected = "my-server" },
         // `serve` without a name: the file name of the command.
-        .{ .options = vscode.frontendOptions(.{ .command = command }), .expected = "files-server" },
+        .{ .options = vscode.frontendOptions(.{ .upstream = .{ .command = command } }), .expected = "files-server" },
         // A library that gives the front end no name gets the name of the profile, and never
         // an empty name.
         .{ .options = .{ .fallback_name = "" }, .expected = vscode.profile.name },

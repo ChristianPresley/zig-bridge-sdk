@@ -31,38 +31,66 @@ pub const profile: bridge.Profile = .{
     },
 };
 
+/// The names of the VS Code bridge that an authorization server and the keychain see. The
+/// `client_name` is "mcp-bridge-vscode (zig-bridge-sdk)", and the keychain service is
+/// "zig-bridge-sdk/mcp-bridge-vscode". The token directory ends in `zig-bridge-sdk/vscode/tokens`.
+/// The default client ID metadata document is `client_metadata_url`. The names are a part of
+/// the stored sign-ins, thus they never change.
+pub const identity: bridge.oauth.Identity = .of(profile.name, "vscode", client_metadata_url);
+
+/// The URL of the client ID metadata document of the VS Code bridge on GitHub Pages. It is
+/// also the `client_id` in the document (`site/vscode/client.json`), and the default of
+/// `--client-metadata-url`. The `redirect_uris` of the document has only the redirect URI of
+/// `bridge.oauth.default_redirect_port`.
+pub const client_metadata_url = "https://christianpresley.github.io/zig-bridge-sdk/vscode/client.json";
+
 /// The settings of `serve`.
 pub const ServeOptions = struct {
-    /// The upstream command and its arguments. The list has at least one item.
-    command: []const []const u8,
+    /// The upstream server: a command, or the URL of a remote server.
+    upstream: UpstreamOptions,
+    /// The sign-in at the HTTP upstream server, or null. `serve` gives its provider to the
+    /// HTTP client and the sign-in to the front end. `UpstreamOptions.http.auth` must then be
+    /// null.
+    sign_in: ?*bridge.oauth.Authorizer = null,
     /// The `serverInfo.name` when the upstream server sends none. Empty uses `defaultName` of
-    /// the command. VS Code makes the ids of the tools from this name. Thus each upstream
-    /// server gets its own name, and never the fixed name of the bridge.
+    /// the command, or `defaultUrlName` of the URL. VS Code makes the ids of the tools from
+    /// this name. Thus each upstream server gets its own name, and never the fixed name of
+    /// the bridge.
     name: []const u8 = "",
     /// The time limit of `server/discover`.
     discover_timeout: Io.Duration = .fromSeconds(bridge.Frontend.default_discover_timeout_s),
-    /// The maximum length of one line, on the side of VS Code and on the upstream side.
+    /// The maximum length of one line from VS Code, and of one line from a stdio upstream
+    /// server. `UpstreamOptions.http` has its own limit.
     max_line_bytes: usize = bridge.Upstream.default_max_line_bytes,
     /// The functions of the executable for the end of the input and for the loss of the
     /// upstream server.
     hooks: bridge.Frontend.Hooks = .{},
 };
 
+/// The upstream server of `serve`.
+pub const UpstreamOptions = union(enum) {
+    /// The upstream command and its arguments. The bridge starts it at the first
+    /// `initialize` and speaks to it over stdio. The list has at least one item.
+    command: []const []const u8,
+    /// The URL of a remote upstream server and the settings of the HTTP client. The bridge
+    /// speaks to it over Streamable HTTP. A failed request gets an error, and the bridge
+    /// continues.
+    http: bridge.Upstream.Config.Http,
+};
+
 /// The size of the read buffer of stdin.
 const stdin_buffer_bytes = 64 << 10;
 
 /// Serve VS Code over the stdin and the stdout of the process until the end of stdin. The
-/// first `initialize` of VS Code starts the upstream command. Stdout carries only JSON-RPC
-/// messages.
+/// first `initialize` of VS Code starts the upstream command, or makes the HTTP client for
+/// the URL. Stdout carries only JSON-RPC messages.
 ///
 /// The function returns `.eof` after the end of stdin and a bounded stop. It returns
-/// `.upstream_exited` when the upstream server stopped first. The reader can then wait for
-/// the next line, thus an executable exits in `hooks.on_upstream_exit`.
+/// `.upstream_exited` when the upstream command stopped first. The reader can then wait for
+/// the next line, thus an executable exits in `hooks.on_upstream_exit`. An HTTP upstream
+/// server never gives `.upstream_exited`.
 pub fn serve(io: Io, gpa: Allocator, options: ServeOptions) !bridge.Frontend.RunResult {
-    const upstream = try bridge.Upstream.init(io, gpa, .{ .stdio = .{
-        .argv = options.command,
-        .max_line_bytes = options.max_line_bytes,
-    } });
+    const upstream = try bridge.Upstream.init(io, gpa, upstreamConfig(options));
     defer upstream.deinit();
     const in_buf = try gpa.alloc(u8, stdin_buffer_bytes);
     defer gpa.free(in_buf);
@@ -74,14 +102,34 @@ pub fn serve(io: Io, gpa: Allocator, options: ServeOptions) !bridge.Frontend.Run
     return frontend.run(&stdin.interface);
 }
 
+/// The configuration of the upstream server that `serve` makes from `options`. With a
+/// sign-in, the HTTP client gets its provider.
+pub fn upstreamConfig(options: ServeOptions) bridge.Upstream.Config {
+    return switch (options.upstream) {
+        .command => |argv| .{ .stdio = .{ .argv = argv, .max_line_bytes = options.max_line_bytes } },
+        .http => |h| http: {
+            var config = h;
+            if (options.sign_in) |a| config.auth = .{ .provider = a.provider() };
+            break :http .{ .http = config };
+        },
+    };
+}
+
 /// The settings of the front end that `serve` makes from `options`. Without a name, the
-/// fallback name is `defaultName` of the command.
+/// fallback name is `defaultName` of the command, or `defaultUrlName` of the URL.
 pub fn frontendOptions(options: ServeOptions) bridge.Frontend.Options {
     return .{
         .max_line_bytes = options.max_line_bytes,
         .discover_timeout = options.discover_timeout,
-        .fallback_name = if (options.name.len != 0) options.name else defaultName(options.command[0]),
+        .fallback_name = if (options.name.len != 0) options.name else switch (options.upstream) {
+            .command => |argv| defaultName(argv[0]),
+            .http => |h| defaultUrlName(h.url),
+        },
         .hooks = options.hooks,
+        .sign_in = switch (options.upstream) {
+            .command => null,
+            .http => options.sign_in,
+        },
     };
 }
 
@@ -90,6 +138,18 @@ pub fn frontendOptions(options: ServeOptions) bridge.Frontend.Options {
 /// result, the `initialize` result has the name of the profile.
 pub fn defaultName(command: []const u8) []const u8 {
     return nameOf(command, std.fs.path.basename(command));
+}
+
+/// Returns the default server name of an upstream server at `url`: the host of the URL, as
+/// the URL writes it, without the port. The result points into `url`. It is empty for a text
+/// that is not a URL with a host. For an empty result, the `initialize` result has the name
+/// of the profile.
+pub fn defaultUrlName(url: []const u8) []const u8 {
+    const uri = std.Uri.parse(url) catch return "";
+    const host = uri.host orelse return "";
+    return switch (host) {
+        .raw, .percent_encoded => |text| text,
+    };
 }
 
 /// The file name `base` of `command` without its extension, or `command` when `base` is
@@ -130,11 +190,36 @@ test "the default name of a Windows path" {
 
 test "serve takes the fallback name from the option, else from the command" {
     const command: []const []const u8 = &.{ "/opt/mcp/bin/files-server.exe", "--stdio" };
-    try std.testing.expectEqualStrings("files-server", frontendOptions(.{ .command = command }).fallback_name);
-    try std.testing.expectEqualStrings("files", frontendOptions(.{ .command = command, .name = "files" }).fallback_name);
-    const options = frontendOptions(.{ .command = command, .max_line_bytes = 4096, .discover_timeout = .fromSeconds(5) });
+    try std.testing.expectEqualStrings("files-server", frontendOptions(.{ .upstream = .{ .command = command } }).fallback_name);
+    try std.testing.expectEqualStrings("files", frontendOptions(.{ .upstream = .{ .command = command }, .name = "files" }).fallback_name);
+    const options = frontendOptions(.{ .upstream = .{ .command = command }, .max_line_bytes = 4096, .discover_timeout = .fromSeconds(5) });
     try std.testing.expectEqual(@as(usize, 4096), options.max_line_bytes);
     try std.testing.expectEqual(@as(i64, 5), options.discover_timeout.toSeconds());
+}
+
+test "serve takes the fallback name of an HTTP upstream server from the host of the URL" {
+    const http: ServeOptions = .{ .upstream = .{ .http = .{ .url = "https://mcp.example.com:8443/v1/mcp?tenant=a" } } };
+    try std.testing.expectEqualStrings("mcp.example.com", frontendOptions(http).fallback_name);
+    var named = http;
+    named.name = "example";
+    try std.testing.expectEqualStrings("example", frontendOptions(named).fallback_name);
+    try std.testing.expectEqualStrings("127.0.0.1", defaultUrlName("http://127.0.0.1:3000/mcp"));
+    try std.testing.expectEqualStrings("[::1]", defaultUrlName("http://[::1]:3000/mcp"));
+    try std.testing.expectEqualStrings("", defaultUrlName("not a url"));
+    try std.testing.expectEqualStrings("", defaultUrlName("mailto:a@example.com"));
+}
+
+test "serve gives the upstream server the command or the URL" {
+    const command: []const []const u8 = &.{"server"};
+    const stdio = upstreamConfig(.{ .upstream = .{ .command = command }, .max_line_bytes = 4096 });
+    try std.testing.expectEqual(@as(usize, 4096), stdio.stdio.max_line_bytes);
+    try std.testing.expectEqualStrings("server", stdio.stdio.argv[0]);
+    const headers = [_]std.http.Header{.{ .name = "x-tenant", .value = "a" }};
+    const http = upstreamConfig(.{ .upstream = .{ .http = .{ .url = "https://mcp.example.com/mcp", .headers = &headers, .max_response_bytes = 1024 } } });
+    try std.testing.expectEqualStrings("https://mcp.example.com/mcp", http.http.url);
+    try std.testing.expectEqual(@as(usize, 1024), http.http.max_response_bytes);
+    try std.testing.expectEqualStrings("x-tenant", http.http.headers[0].name);
+    try std.testing.expect(http.http.auth == null);
 }
 
 test "the VS Code profile passes the trace keys and the vscode keys" {
@@ -144,4 +229,12 @@ test "the VS Code profile passes the trace keys and the vscode keys" {
     try std.testing.expect(profile.quirks.normalize_array_items);
     try std.testing.expect(profile.quirks.drop_non_object_output_schema);
     try std.testing.expect(!profile.quirks.strict_legacy_results);
+}
+
+test "the OAuth identity of the VS Code bridge stays the same" {
+    try std.testing.expectEqualStrings("mcp-bridge-vscode (zig-bridge-sdk)", identity.client_name);
+    try std.testing.expectEqualStrings("zig-bridge-sdk/mcp-bridge-vscode", identity.keychain_service);
+    try std.testing.expectEqualStrings("vscode", identity.product);
+    try std.testing.expectEqualStrings(profile.name, identity.bridge_name);
+    try std.testing.expectEqualStrings("https://christianpresley.github.io/zig-bridge-sdk/vscode/client.json", client_metadata_url);
 }
