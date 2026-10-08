@@ -3542,6 +3542,37 @@ test "a port in use gives AddressInUse, and the receiver never shares a port" {
     }
 }
 
+test "a cancel does not stop the accept of the receiver, and a connection does" {
+    const io = testing.io;
+    var listener = try listenLoopback(io, 0);
+    defer closeListener(io, &listener);
+    const Accept = struct {
+        fn run(l: *Io.net.Server) void {
+            const stream = acceptUncancelable(testing.io, l) catch return;
+            stream.close(testing.io);
+        }
+    };
+    const Cancel = struct {
+        fn run(f: *Io.Future(void), done: *std.atomic.Value(bool)) void {
+            f.cancel(testing.io);
+            done.store(true, .release);
+        }
+    };
+    var accept = try io.concurrent(Accept.run, .{&listener});
+    var done: std.atomic.Value(bool) = .init(false);
+    var cancel = io.concurrent(Cancel.run, .{ &accept, &done }) catch |e| {
+        mcp.util.wake.wakeIp(io, listener.socket.address);
+        accept.await(io);
+        return e;
+    };
+    // The accept continues after the cancel, until the connection.
+    io.sleep(.fromMilliseconds(100), .awake) catch {};
+    const ended_by_cancel = done.load(.acquire);
+    mcp.util.wake.wakeIp(io, listener.socket.address);
+    cancel.await(io);
+    try testing.expect(!ended_by_cancel);
+}
+
 test "the wait gives a redirect that came before it, then Timeout at once, and Aborted after abort" {
     const io = testing.io;
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
