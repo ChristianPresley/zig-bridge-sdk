@@ -108,9 +108,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_vscode_exe_tests.step);
     test_vscode_step.dependOn(&run_vscode_exe_tests.step);
 
-    // The tests of the fixture server: its tools through the memory transport of zig-sdk.
+    // The tests of the fixture server: its tools through the memory transport of zig-sdk, and
+    // its HTTPS variant through the HTTP client of zig-sdk. The authorization server of the
+    // HTTPS variant reads the test CA from `test/fixtures/tls` in the current directory.
     const fixture_tests = b.addTest(.{ .name = "fixture", .root_module = fixture, .test_runner = test_runner, .use_llvm = use_llvm });
-    test_step.dependOn(&b.addRunArtifact(fixture_tests).step);
+    const run_fixture_tests = b.addRunArtifact(fixture_tests);
+    run_fixture_tests.setCwd(b.path("."));
+    test_step.dependOn(&run_fixture_tests.step);
 
     // The transcript tests of the vscode bridge: the lines of VS Code go through the front
     // end, and the fixture server in the same process is the upstream server. The tests check
@@ -132,6 +136,8 @@ pub fn build(b: *std.Build) void {
     });
     addSchemaImports(b, vscode_transcripts.root_module);
     const run_vscode_transcripts = b.addRunArtifact(vscode_transcripts);
+    // The HTTPS variant of the fixture reads the test CA from `test/fixtures/tls`.
+    run_vscode_transcripts.setCwd(b.path("."));
     test_step.dependOn(&run_vscode_transcripts.step);
     test_vscode_step.dependOn(&run_vscode_transcripts.step);
 
@@ -157,6 +163,23 @@ pub fn build(b: *std.Build) void {
     run_process_tests.setCwd(b.path("."));
     test_step.dependOn(&run_process_tests.step);
     test_vscode_step.dependOn(&run_process_tests.step);
+
+    // The process test of the HTTPS mode of the fixture server. It needs only that executable.
+    const fixture_process_options = b.addOptions();
+    fixture_process_options.addOptionPath("fixture_exe", fixture_server.getEmittedBin());
+    const fixture_server_tests = b.addTest(.{ .name = "fixture-server", .root_module = b.createModule(.{
+        .root_source_file = b.path("test/fixture_server_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "mcp", .module = mcp },
+            .{ .name = "fixture", .module = fixture },
+            .{ .name = "process_options", .module = fixture_process_options.createModule() },
+        },
+    }), .test_runner = test_runner, .use_llvm = use_llvm });
+    const run_fixture_server_tests = b.addRunArtifact(fixture_server_tests);
+    run_fixture_server_tests.setCwd(b.path("."));
+    test_step.dependOn(&run_fixture_server_tests.step);
 
     // The checks of the vendored schemas. The fixtures come in as anonymous imports, because
     // Zig 0.16 does not embed a file outside the module root.

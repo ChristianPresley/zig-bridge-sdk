@@ -1,6 +1,13 @@
 //! The process tests of `mcp-bridge-vscode`. Each test starts the executable as VS Code does,
 //! with a pipe for stdin, stdout and stderr. The upstream command is `bridge-fixture-server`.
 //!
+//! The tests of the URL form use an upstream server over HTTP. Most of them start
+//! `bridge-fixture-server` in its HTTPS mode in a second process, and give the test CA to the
+//! bridge with `--ca-file`. The test is the browser of the user. It reads the sign-in line on
+//! stderr and opens the URL with `fixture.https.browse`. That function follows the redirect
+//! into the loopback receiver of the bridge. The bridge gets `--no-browser`, and a token store
+//! that never uses the keychain of the host.
+//!
 //! The build makes the two executables before it compiles this file. The module
 //! `process_options` holds their paths. The environment variables `PROCESS_TEST_BRIDGE` and
 //! `PROCESS_TEST_FIXTURE` replace these paths, for example for a run in WSL. A missing
@@ -402,11 +409,26 @@ test "with --log-level debug, stdout has only JSON-RPC messages, and each stderr
     );
     try testing.expectEqualStrings("marker-7f3c", try firstText(try expectResult(try b.response(arena, 2))));
 
+    // The answer of VS Code to a form goes upstream, and the log has none of its content.
+    b.watchdog.arm("form answer", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ask_form"}}
+    );
+    try expectBridgeId(try b.request(arena, "elicitation/create"), "b-1");
+    try b.send(
+        \\{"jsonrpc":"2.0","id":"b-1","result":{"action":"accept","content":{"name":"marker-form-5d1e","age":36,"subscribe":true,"color":"green"}}}
+    );
+    try testing.expectEqualStrings(
+        \\form: accept {"name":"marker-form-5d1e","age":36,"subscribe":true,"color":"green"}
+    , try firstText(try expectResult(try b.response(arena, 3))));
+
     const start = Io.Timestamp.now(b.io, .awake);
     b.closeStdin();
     const exit = try b.finish(start);
     try expectExit(exit, 0);
-    try testing.expectEqual(@as(usize, 2 + list_changes.len), try expectFrames(arena, b.out.items));
+    // The initialize result, the list changes, the echo result, the form request and the
+    // result of the form tool.
+    try testing.expectEqual(@as(usize, 4 + list_changes.len), try expectFrames(arena, b.out.items));
 
     // The lines of the bridge have its tag. The fixture server writes to the same stderr with
     // its own tag. No other line is on stderr.
@@ -417,8 +439,9 @@ test "with --log-level debug, stdout has only JSON-RPC messages, and each stderr
     while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "mcp-bridge-vscode: ")) {
             bridge_lines += 1;
-            // The bridge does not write the content of a frame to the log.
+            // The bridge does not write the content of a frame or of a form answer to the log.
             if (std.mem.indexOf(u8, line, "marker-7f3c") != null) return fail("a stderr line of the bridge has the content of a frame: {s}", .{line});
+            if (std.mem.indexOf(u8, line, "marker-form-5d1e") != null) return fail("a stderr line of the bridge has the content of a form answer: {s}", .{line});
         } else if (!std.mem.startsWith(u8, line, "bridge-fixture-server: ")) {
             return fail("a stderr line without a tag: {s}", .{line});
         }
@@ -464,6 +487,15 @@ test "arguments that are not valid give exit code 2 and no stdout" {
         &.{ "--name", "--", paths.fixture },
         &.{ "--max-line-bytes", "0", "--", paths.fixture },
         &.{ "--version=1", "--", paths.fixture },
+        // The URL form: http only for a loopback host, a missing environment variable, a
+        // refused header name, an option of the URL form with a command, a CA file that the
+        // bridge cannot read, and logout without a URL.
+        &.{"http://mcp.example.com/mcp"},
+        &.{ "--header-env", "authorization=MCP_BRIDGE_PROCESS_TEST_NOT_SET", "https://127.0.0.1:9/mcp" },
+        &.{ "--header", "host:x", "https://127.0.0.1:9/mcp" },
+        &.{ "--header", "x-a:1", "--", paths.fixture },
+        &.{ "--ca-file", "test/fixtures/no-such-ca.pem", "https://127.0.0.1:9/mcp" },
+        &.{"logout"},
     };
     for (cases) |args| {
         const argv = try std.mem.concat(arena, []const u8, &.{ &.{paths.bridge}, args });
@@ -727,9 +759,678 @@ test "the upstream server ends its listen stream at its shutdown: VS Code gets n
     try expectStderr(b, std.fmt.comptimePrint("mcp-bridge-vscode: bridge: error: the upstream server exited with code {d}\n", .{fixture.shutdown_exit_code}));
 }
 
+/// The bearer token of the HTTP upstream server of the tests of the URL form. It is also the
+/// marker that must never reach stderr.
+const http_token = "process-test-marker-4c2e9a";
+
+/// The environment variable of the bridge with the authorization header.
+const http_token_variable = "MCP_BRIDGE_PROCESS_TEST_TOKEN";
+
+test "the URL form: the bridge speaks to an HTTP upstream server with a header from the environment" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    var upstream: HttpUpstream = undefined;
+    try upstream.start(gpa);
+    defer upstream.stop();
+    var environ = try testing.environ.createMap(gpa);
+    defer environ.deinit();
+    try environ.put(http_token_variable, "Bearer " ++ http_token);
+
+    // The debug lines have each upstream request. They must not have the header value.
+    const b = try Bridge.spawnWith(gpa, &.{ paths.bridge, "--log-level", "debug", "--header-env", "Authorization=" ++ http_token_variable, upstream.url }, &environ);
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    // The listen stream goes over HTTP too, thus the list changes come after initialize.
+    try initialize(b, arena);
+    b.watchdog.arm("tools/call", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":3}}}
+    );
+    try testing.expectEqualStrings("5", try firstText(try expectResult(try b.response(arena, 2))));
+
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin with an HTTP upstream server");
+    try testing.expectEqual(@as(usize, 2 + list_changes.len), try expectFrames(arena, b.out.items));
+    try expectStderr(b, "mcp-bridge-vscode: bridge: debug: upstream request ");
+    if (std.mem.indexOf(u8, b.err.bytes.items, http_token) != null) return fail("stderr has the value of the authorization header", .{});
+}
+
+test "the URL form: a refused request fails alone, and the bridge runs until the end of stdin" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    var upstream: HttpUpstream = undefined;
+    try upstream.start(gpa);
+    defer upstream.stop();
+
+    // Without the token, the upstream server answers 401. The sign-in of the bridge needs
+    // https, thus it fails at once.
+    const b = try Bridge.spawn(gpa, &.{ paths.bridge, "--token-store", "memory", upstream.url });
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    b.watchdog.arm("initialize", exchange_limit);
+    try b.send(vscode_initialize);
+    switch (try b.response(arena, 1)) {
+        .error_response => |e| {
+            try testing.expectEqual(@as(i64, -32603), e.code);
+            const data = e.data orelse return fail("the error has no data", .{});
+            try testing.expectEqualStrings("sign_in_failed", mcp.json.getString(data, "cause") orelse "");
+            try testing.expectEqualStrings("InsecureEndpoint", mcp.json.getString(data, "detail") orelse "");
+        },
+        else => return fail("initialize did not fail", .{}),
+    }
+    // An HTTP upstream server never stops the bridge. It answers until the end of stdin.
+    b.watchdog.arm("ping", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"ping"}
+    );
+    _ = try expectResult(try b.response(arena, 2));
+
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin after a refused request");
+    try testing.expectEqual(@as(usize, 2), try expectFrames(arena, b.out.items));
+}
+
+test "the URL form signs in: the sign-in line has the URL, the redirect reaches the bridge, a step-up goes through a URL elicitation, and no code reaches stderr" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    var upstream: HttpsUpstream = try .start(arena, paths.fixture, &.{"--oauth"}, null);
+    defer upstream.stop();
+    const port = try freePort();
+    const redirect_uri = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/callback", .{port});
+    // The debug lines have each upstream request. They must not have a secret.
+    const b = try Bridge.spawn(gpa, &.{ paths.bridge, "--log-level", "debug", "--no-browser", "--token-store", "memory", "--ca-file", fixture.https.ca_file, "--redirect-port", try std.fmt.allocPrint(arena, "{d}", .{port}), upstream.url });
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    // Before notifications/initialized, the bridge writes the sign-in line. With --no-browser,
+    // it opens no browser. The test is the browser of the user: it opens the URL of the line.
+    b.watchdog.arm("initialize", exchange_limit);
+    try b.send(vscode_initialize);
+    const first_url = try waitSignIn(b, arena, 0);
+    const first_scope = try expectSignInUrl(arena, first_url, upstream.url, redirect_uri);
+    try testing.expect(std.mem.indexOf(u8, first_scope, fixture.https.step_up_scope) == null);
+    const first_code = try approveSignIn(b, gpa, arena, first_url);
+    const result = try expectResult(try b.response(arena, 1));
+    try testing.expectEqualStrings("2025-11-25", mcp.json.getString(result, "protocolVersion") orelse "");
+    try b.send(initialized);
+
+    b.watchdog.arm("tools/list", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+    );
+    const list = try expectResult(try b.response(arena, 2));
+    const tools = list.object.get("tools") orelse return fail("tools/list has no tools", .{});
+    var names: usize = 0;
+    for (tools.array.items) |tool| {
+        const name = mcp.json.getString(tool, "name") orelse "";
+        if (std.mem.eql(u8, name, "add") or std.mem.eql(u8, name, fixture.guarded_tool)) names += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), names);
+
+    b.watchdog.arm("tools/call", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":3}}}
+    );
+    try testing.expectEqualStrings("5", try firstText(try expectResult(try b.response(arena, 3))));
+
+    // After notifications/initialized, the step-up of the tool guarded asks VS Code with a URL
+    // elicitation. VS Code shows the URL, the user accepts, and VS Code opens the URL.
+    b.watchdog.arm("step-up", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"guarded","arguments":{}}}
+    );
+    const ask = try b.request(arena, "elicitation/create");
+    const params = ask.params orelse return fail("the URL elicitation has no params", .{});
+    try testing.expectEqualStrings("url", mcp.json.getString(params, "mode") orelse "");
+    const elicitation_id = mcp.json.getString(params, "elicitationId") orelse return fail("the URL elicitation has no elicitationId", .{});
+    try testing.expect(elicitation_id.len > 0);
+    const second_url = mcp.json.getString(params, "url") orelse return fail("the URL elicitation has no url", .{});
+    // The sign-in line comes once for each sign-in, also for a step-up.
+    try testing.expectEqualStrings(second_url, try waitSignIn(b, arena, 1));
+    const second_scope = try expectSignInUrl(arena, second_url, upstream.url, redirect_uri);
+    try testing.expect(std.mem.indexOf(u8, second_scope, fixture.https.step_up_scope) != null);
+    const ask_id = switch (ask.id) {
+        .string => |s| s,
+        else => return fail("the id of the URL elicitation is not a string", .{}),
+    };
+    try b.send(try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{f},\"result\":{{\"action\":\"accept\"}}}}", .{std.json.fmt(ask_id, .{})}));
+    const second_code = try approveSignIn(b, gpa, arena, second_url);
+    // The completion of the elicitation comes before the result of the call.
+    const notifications, const guarded = try b.responseWithNotifications(arena, 4);
+    var completions: usize = 0;
+    for (notifications) |n| {
+        if (!std.mem.eql(u8, n.method, "notifications/elicitation/complete")) continue;
+        try testing.expectEqualStrings(elicitation_id, mcp.json.getString(n.params orelse .null, "elicitationId") orelse "");
+        completions += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), completions);
+    try testing.expectEqualStrings(fixture.guarded_text, try firstText(try expectResult(guarded)));
+
+    // The token has the scope now. The next call needs no sign-in, and VS Code gets no request.
+    b.watchdog.arm("tools/call guarded", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"guarded","arguments":{}}}
+    );
+    try testing.expectEqualStrings(fixture.guarded_text, try firstText(try expectResult(try b.response(arena, 5))));
+
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin after a sign-in");
+    _ = try expectFrames(arena, b.out.items);
+    try expectStderr(b, "the tokens stay in memory (--token-store memory)");
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, b.err.bytes.items, sign_in_prefix));
+    for ([_][]const u8{ first_code, second_code }) |code| {
+        if (std.mem.indexOf(u8, b.err.bytes.items, code) != null) return fail("stderr has the code of a redirect", .{});
+    }
+    // The only stderr lines are the lines of the bridge: the HTTP upstream server has no
+    // stderr in this process.
+    try expectTaggedLines(b);
+}
+
+test "the URL form with a static authorization header from the environment: no sign-in, and the token never reaches stderr" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    // The HTTPS fixture server without an authorization server. It takes only the token of
+    // its environment variable.
+    var fixture_environ = try testing.environ.createMap(gpa);
+    defer fixture_environ.deinit();
+    try fixture_environ.put(bearer_variable, http_token);
+    var upstream: HttpsUpstream = try .start(arena, paths.fixture, &.{ "--bearer-env", bearer_variable }, &fixture_environ);
+    defer upstream.stop();
+
+    var environ = try bridgeEnviron(gpa);
+    defer environ.deinit();
+    try environ.put(http_token_variable, "Bearer " ++ http_token);
+    {
+        // The debug lines have each upstream request. They must not have a header value, also
+        // not the value of --header on the command line.
+        const b = try Bridge.spawnWith(gpa, &.{ paths.bridge, "--log-level", "debug", "--header-env", "Authorization=" ++ http_token_variable, "--header", "X-Trace:" ++ header_marker, "--ca-file", fixture.https.ca_file, upstream.url }, &environ);
+        defer b.deinit();
+        errdefer b.failed = true;
+
+        try initialize(b, arena);
+        b.watchdog.arm("tools/list", exchange_limit);
+        try b.send(
+            \\{"jsonrpc":"2.0","id":2,"method":"tools/list"}
+        );
+        const list = try expectResult(try b.response(arena, 2));
+        try testing.expect(list.object.get("tools").?.array.items.len > 0);
+        b.watchdog.arm("tools/call", exchange_limit);
+        try b.send(
+            \\{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":3}}}
+        );
+        try testing.expectEqualStrings("5", try firstText(try expectResult(try b.response(arena, 3))));
+
+        const start = Io.Timestamp.now(b.io, .awake);
+        b.closeStdin();
+        const exit = try b.finish(start);
+        try expectExit(exit, 0);
+        try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin with a static authorization header");
+        try testing.expectEqual(@as(usize, 3 + list_changes.len), try expectFrames(arena, b.out.items));
+        try expectStderr(b, "mcp-bridge-vscode: bridge: debug: upstream request ");
+        // A static authorization header excludes the sign-in, thus no token store opens.
+        try expectNoStderr(b, sign_in_prefix);
+        try expectNoStderr(b, "the tokens ");
+        try expectNoStderr(b, http_token);
+        try expectNoStderr(b, header_marker);
+        try expectTaggedLines(b);
+    }
+
+    // A wrong token: initialize fails with the HTTP status, and the bridge does not sign in.
+    // It answers the next requests until the end of stdin.
+    try environ.put(http_token_variable, "Bearer " ++ wrong_token);
+    {
+        const b = try Bridge.spawnWith(gpa, &.{ paths.bridge, "--log-level", "debug", "--header-env", "Authorization=" ++ http_token_variable, "--ca-file", fixture.https.ca_file, upstream.url }, &environ);
+        defer b.deinit();
+        errdefer b.failed = true;
+
+        b.watchdog.arm("initialize", exchange_limit);
+        try b.send(vscode_initialize);
+        switch (try b.response(arena, 1)) {
+            .error_response => |e| {
+                try testing.expectEqual(@as(i64, -32603), e.code);
+                const detail = mcp.json.getString(e.data orelse .null, "detail") orelse "";
+                if (std.mem.indexOf(u8, detail, "HTTP status 401") == null) return fail("the error does not name the HTTP status 401: {s}", .{detail});
+            },
+            else => return fail("initialize did not fail", .{}),
+        }
+        b.watchdog.arm("ping", exchange_limit);
+        try b.send(
+            \\{"jsonrpc":"2.0","id":2,"method":"ping"}
+        );
+        _ = try expectResult(try b.response(arena, 2));
+
+        const start = Io.Timestamp.now(b.io, .awake);
+        b.closeStdin();
+        const exit = try b.finish(start);
+        try expectExit(exit, 0);
+        try testing.expectEqual(@as(usize, 2), try expectFrames(arena, b.out.items));
+        try expectNoStderr(b, sign_in_prefix);
+        try expectNoStderr(b, wrong_token);
+    }
+}
+
+/// The environment variable of the HTTPS fixture server with the static token.
+const bearer_variable = "BRIDGE_FIXTURE_PROCESS_TEST_TOKEN";
+
+/// The value of a `--header` on the command line. It is a marker that must never reach
+/// stderr.
+const header_marker = "process-test-marker-header-2e8b";
+
+/// A token that the HTTPS fixture server refuses. It is also a marker that must never reach
+/// stderr.
+const wrong_token = "process-test-marker-wrong-81d0";
+
+test "the options of the URL form that do not go together give exit code 2, no stdout and no value on stderr" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+    const url = "https://127.0.0.1:9/mcp";
+    const marker = "process-test-marker-3b7f";
+
+    var environ = try bridgeEnviron(gpa);
+    defer environ.deinit();
+    // A token store that opens uses the temporary directory, never the directory of the user.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try environ.put(if (builtin.os.tag == .windows) "LOCALAPPDATA" else "XDG_STATE_HOME", try tmp.dir.realPathFileAlloc(testing.io, ".", arena));
+    // The values of these variables are secrets. No diagnostic has them.
+    try environ.put(http_token_variable, "Bearer " ++ marker);
+    try environ.put(bridge_client_secret_variable, marker);
+    const Case = struct {
+        args: []const []const u8,
+        /// A key of the file store that is not valid, in `MCP_BRIDGE_TOKEN_KEY`, or null.
+        token_key: ?[]const u8 = null,
+    };
+    const cases = [_]Case{
+        // The executable has no switch that turns off a check of the sign-in (P10).
+        .{ .args = &.{ "--allow-http", "http://127.0.0.1:9/mcp" } },
+        .{ .args = &.{ "--insecure", url } },
+        .{ .args = &.{ "--headless", url } },
+        // A secret never comes from the command line.
+        .{ .args = &.{ "--client-secret=" ++ marker, "--client-id", "c1", url } },
+        .{ .args = &.{ "--token-key=" ++ marker, url } },
+        // A static authorization header and the sign-in options exclude each other.
+        .{ .args = &.{ "--header", "Authorization:Bearer " ++ marker, "--client-id", "c1", url } },
+        .{ .args = &.{ "--header-env", "Authorization=" ++ http_token_variable, "--no-browser", url } },
+        .{ .args = &.{ "--header-env", "authorization=" ++ http_token_variable, "--token-store", "memory", url } },
+        // The registration options.
+        .{ .args = &.{ "--client-issuer", "https://as.example", url } },
+        .{ .args = &.{ "--client-id", "c1", "--client-metadata-url", "https://client.example/c.json", url } },
+        .{ .args = &.{ "--client-metadata-url", "http://client.example/c.json", url } },
+        .{ .args = &.{ "--client-issuer", "http://as.example", "--client-id", "c1", url } },
+        // A client with a secret in the environment needs --client-issuer.
+        .{ .args = &.{ "--client-id", "c1", url } },
+        // The token store.
+        .{ .args = &.{ "--token-store", "memory", "--token-key-file", "key.txt", url } },
+        .{ .args = &.{ "--token-store", "keychain", "--token-key-file", "key.txt", url } },
+        .{ .args = &.{ "--token-store", "file", url } },
+        .{ .args = &.{ "--token-store", "vault", url } },
+        .{ .args = &.{ "--token-key-file", "key.txt", url }, .token_key = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff" },
+        .{ .args = &.{url}, .token_key = marker },
+        .{ .args = &.{ "--token-store", "file", "--token-key-file", "test/fixtures/no-such-key.txt", url } },
+        // The values of the options.
+        .{ .args = &.{ "--redirect-port", "0", url } },
+        .{ .args = &.{ "--redirect-port", "65536", url } },
+        .{ .args = &.{ "--account", "a|b", url } },
+        .{ .args = &.{ "--sign-in-timeout", "0", url } },
+        .{ .args = &.{ "--max-response-bytes", "0", url } },
+        // A file without a certificate.
+        .{ .args = &.{ "--ca-file", "test/fixtures/tls/README.md", url } },
+        // The headers.
+        .{ .args = &.{ "--header", "mcp-protocol-version:2025-11-25", url } },
+        .{ .args = &.{ "--header-env", "Content-Type=" ++ http_token_variable, url } },
+        .{ .args = &.{ "--header", "x-a:1", "--header", "X-A:2", url } },
+        .{ .args = &.{ "--header", "x-a:" ++ marker, "--header-env", "X-A=" ++ http_token_variable, url } },
+        .{ .args = &.{ "--header-env", "x-api-key=MCP_BRIDGE_PROCESS_TEST_NOT_SET", url } },
+        // The credential of a proxy goes in the proxy URL, never to the upstream server.
+        .{ .args = &.{ "--header", "Proxy-Authorization:Basic " ++ marker, url } },
+        .{ .args = &.{ "--header-env", "Proxy-Authorization=" ++ http_token_variable, url } },
+        // The URL.
+        .{ .args = &.{"https://user:" ++ marker ++ "@127.0.0.1:9/mcp"} },
+        .{ .args = &.{"https://127.0.0.1:9/mcp#" ++ marker} },
+        .{ .args = &.{"https://127.0.0.1:0/mcp"} },
+        .{ .args = &.{"ftp://127.0.0.1:9/mcp"} },
+        .{ .args = &.{ url, "--no-browser" } },
+        // An option of the URL form with an upstream command.
+        .{ .args = &.{ "--redirect-port", "41900", "--", paths.fixture } },
+        .{ .args = &.{ "--no-browser", "--", paths.fixture } },
+        .{ .args = &.{ "--ca-file", fixture.https.ca_file, "--", paths.fixture } },
+        // logout.
+        .{ .args = &.{ "logout", "--all", "--account", "work" } },
+        .{ .args = &.{ "logout", "--all", url } },
+        .{ .args = &.{ "logout", "--no-browser", url } },
+        .{ .args = &.{ "logout", "--header", "x-a:1", url } },
+        .{ .args = &.{ "logout", "--", paths.fixture } },
+    };
+    for (cases) |case| {
+        if (case.token_key) |key| try environ.put(bridge_token_key_variable, key) else _ = environ.swapRemove(bridge_token_key_variable);
+        const argv = try std.mem.concat(arena, []const u8, &.{ &.{paths.bridge}, case.args });
+        const b = try Bridge.spawnWith(gpa, argv, &environ);
+        defer b.deinit();
+        errdefer {
+            b.failed = true;
+            std.debug.print("process test: the arguments were {f}\n", .{std.json.fmt(case.args, .{})});
+        }
+        const start = Io.Timestamp.now(b.io, .awake);
+        b.closeStdin();
+        const exit = try b.finish(start);
+        try expectExit(exit, 2);
+        try testing.expectEqualStrings("", b.out.items);
+        try expectStderr(b, "mcp-bridge-vscode: vscode: error: ");
+        try expectNoStderr(b, marker);
+    }
+}
+
+/// The environment variables of the bridge for its secrets.
+const bridge_token_key_variable = "MCP_BRIDGE_TOKEN_KEY";
+const bridge_client_secret_variable = "MCP_BRIDGE_CLIENT_SECRET";
+
+/// The environment of the test without the secret variables of the bridge, and without a
+/// proxy, for the bridge of a test. The caller releases it.
+fn bridgeEnviron(gpa: Allocator) !std.process.Environ.Map {
+    var environ = try testing.environ.createMap(gpa);
+    errdefer environ.deinit();
+    for ([_][]const u8{ bridge_token_key_variable, bridge_client_secret_variable, "SANDBOX_RUNTIME", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy" }) |name| {
+        _ = environ.swapRemove(name);
+    }
+    return environ;
+}
+
+test "the file store keeps the sign-in for the next start, and logout deletes it" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    var upstream: HttpsUpstream = try .start(arena, paths.fixture, &.{"--oauth"}, null);
+    defer upstream.stop();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const state = try tmp.dir.realPathFileAlloc(testing.io, ".", arena);
+    var environ = try testing.environ.createMap(gpa);
+    defer environ.deinit();
+    // The token directory is in the temporary directory, and the key is a test value.
+    try environ.put(if (builtin.os.tag == .windows) "LOCALAPPDATA" else "XDG_STATE_HOME", state);
+    try environ.put("MCP_BRIDGE_TOKEN_KEY", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+    const port = try std.fmt.allocPrint(arena, "{d}", .{try freePort()});
+    const serve_argv: []const []const u8 = &.{ paths.bridge, "--no-browser", "--token-store", "file", "--ca-file", fixture.https.ca_file, "--redirect-port", port, upstream.url };
+
+    // The first start signs in, and the second start uses the stored sign-in.
+    for ([_]bool{ true, false }) |sign_in| try serveOnce(gpa, arena, serve_argv, &environ, sign_in);
+
+    {
+        const b = try Bridge.spawnWith(gpa, &.{ paths.bridge, "logout", "--token-store", "file", "--ca-file", fixture.https.ca_file, "--redirect-port", port, upstream.url }, &environ);
+        defer b.deinit();
+        errdefer b.failed = true;
+        const start = Io.Timestamp.now(b.io, .awake);
+        b.closeStdin();
+        const exit = try b.finish(start);
+        try expectExit(exit, 0);
+        try expectStderr(b, "logout deleted the stored sign-in of the account \"default\"");
+        try testing.expectEqual(@as(usize, 0), b.out.items.len);
+    }
+
+    // After logout, the next start signs in again.
+    try serveOnce(gpa, arena, serve_argv, &environ, true);
+}
+
+test "in the sandbox of VS Code, initialize fails at once with a message that names the sandbox" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+    var environ = try testing.environ.createMap(gpa);
+    defer environ.deinit();
+    try environ.put("SANDBOX_RUNTIME", "1");
+    // The bridge makes no connection, thus the port is closed.
+    const b = try Bridge.spawnWith(gpa, &.{ paths.bridge, "--token-store", "memory", "https://127.0.0.1:9/mcp" }, &environ);
+    defer b.deinit();
+    errdefer b.failed = true;
+    b.watchdog.arm("initialize", exchange_limit);
+    try b.send(vscode_initialize);
+    switch (try b.response(arena, 1)) {
+        .error_response => |e| {
+            try testing.expectEqual(@as(i64, -32603), e.code);
+            try testing.expect(std.mem.indexOf(u8, e.message, "sandbox") != null);
+            try testing.expectEqualStrings("sandbox", mcp.json.getString(e.data orelse .null, "cause") orelse "");
+        },
+        else => return fail("initialize did not fail", .{}),
+    }
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u8, b.err.bytes.items, "sign in at"));
+}
+
+test "the end of stdin while the sign-in waits for the browser stops the bridge with code 0 inside the limit, 20 times on one redirect port" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+    var upstream: HttpsUpstream = try .start(arena, paths.fixture, &.{"--oauth"}, null);
+    defer upstream.stop();
+    var environ = try bridgeEnviron(gpa);
+    defer environ.deinit();
+    // The same port in each loop: each exit must release the port of the receiver. A port
+    // that stays in use makes the next sign-in fail without a sign-in line.
+    const port = try std.fmt.allocPrint(arena, "{d}", .{try freePort()});
+    for (0..20) |_| {
+        const b = try Bridge.spawnWith(gpa, &.{ paths.bridge, "--no-browser", "--token-store", "memory", "--ca-file", fixture.https.ca_file, "--redirect-port", port, upstream.url }, &environ);
+        defer b.deinit();
+        errdefer b.failed = true;
+        b.watchdog.arm("initialize", exchange_limit);
+        try b.send(vscode_initialize);
+        // The receiver listens before the bridge writes the sign-in line.
+        _ = try waitSignIn(b, arena, 0);
+        const start = Io.Timestamp.now(b.io, .awake);
+        b.closeStdin();
+        const exit = try b.finish(start);
+        try expectExit(exit, 0);
+        try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin during a sign-in");
+        // A stopped initialize gets no response.
+        try testing.expectEqualStrings("", b.out.items);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, b.err.bytes.items, sign_in_prefix));
+        try expectTaggedLines(b);
+    }
+}
+
+test "the URL form: a key in the query of the URL never reaches stderr or an error, also after a step-up that did not complete in time" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+    var upstream: HttpsUpstream = try .start(arena, paths.fixture, &.{"--oauth"}, null);
+    defer upstream.stop();
+    var environ = try bridgeEnviron(gpa);
+    defer environ.deinit();
+    // Some remote servers take a key in the query or the path of their URL.
+    const marker = "process-test-marker-query-6a1d";
+    const url = try std.fmt.allocPrint(arena, "{s}?key={s}", .{ upstream.url, marker });
+    const port = try std.fmt.allocPrint(arena, "{d}", .{try freePort()});
+    const b = try Bridge.spawnWith(gpa, &.{ paths.bridge, "--log-level", "debug", "--no-browser", "--token-store", "memory", "--ca-file", fixture.https.ca_file, "--redirect-port", port, "--sign-in-timeout", "5", url }, &environ);
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    b.watchdog.arm("initialize", exchange_limit);
+    try b.send(vscode_initialize);
+    _ = try approveSignIn(b, gpa, arena, try waitSignIn(b, arena, 0));
+    _ = try expectResult(try b.response(arena, 1));
+    try b.send(initialized);
+
+    // The step-up of the tool guarded: VS Code accepts the URL elicitation, but the user does
+    // not complete the sign-in in the browser.
+    b.watchdog.arm("step-up", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"guarded","arguments":{}}}
+    );
+    const ask = try b.request(arena, "elicitation/create");
+    const ask_id = switch (ask.id) {
+        .string => |text| text,
+        else => return fail("the id of the URL elicitation is not a string", .{}),
+    };
+    try b.send(try std.fmt.allocPrint(arena, "{{\"jsonrpc\":\"2.0\",\"id\":{f},\"result\":{{\"action\":\"accept\"}}}}", .{std.json.fmt(ask_id, .{})}));
+    switch (try b.response(arena, 2)) {
+        .error_response => |e| {
+            try testing.expectEqual(@as(i64, -32603), e.code);
+            try testing.expectEqualStrings("sign_in_timeout", mcp.json.getString(e.data orelse .null, "cause") orelse "");
+            if (std.mem.indexOf(u8, e.message, marker) != null) return fail("the error message has the key of the URL: {s}", .{e.message});
+            if (std.mem.indexOf(u8, e.message, upstream.url) != null) return fail("the error message has the URL of the upstream server: {s}", .{e.message});
+        },
+        else => return fail("the step-up did not fail", .{}),
+    }
+
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin after a step-up that did not complete");
+    _ = try expectFrames(arena, b.out.items);
+    try expectStderr(b, "The sign-in did not complete in 5 s.");
+    try expectNoStderr(b, marker);
+    try expectTaggedLines(b);
+}
+
+test "logout of the memory store and logout --all of an empty file store exit with code 0" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var environ = try testing.environ.createMap(gpa);
+    defer environ.deinit();
+    // The token directory is in the temporary directory. The tests never use the keychain of
+    // the host: a logout there could delete the stored sign-ins of the user.
+    try environ.put(if (builtin.os.tag == .windows) "LOCALAPPDATA" else "XDG_STATE_HOME", try tmp.dir.realPathFileAlloc(testing.io, ".", arena));
+    try environ.put("MCP_BRIDGE_TOKEN_KEY", "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");
+    const cases = [_]struct { argv: []const []const u8, texts: []const []const u8 }{
+        .{ .argv = &.{ paths.bridge, "logout", "--token-store", "memory", "https://127.0.0.1:9/mcp" }, .texts = &.{"logout has nothing to delete"} },
+        .{ .argv = &.{ paths.bridge, "logout", "--all", "--token-store", "file" }, .texts = &.{ "logout deleted 0 stored sign-ins", "deleted the token directory " } },
+    };
+    for (cases) |case| {
+        const b = try Bridge.spawnWith(gpa, case.argv, &environ);
+        defer b.deinit();
+        errdefer b.failed = true;
+        const start = Io.Timestamp.now(b.io, .awake);
+        b.closeStdin();
+        const exit = try b.finish(start);
+        try expectExit(exit, 0);
+        for (case.texts) |text| try expectStderr(b, text);
+        try testing.expectEqual(@as(usize, 0), b.out.items.len);
+    }
+}
+
+/// Start the bridge with `argv` and `environ`, and initialize it. Sign in when `sign_in` is
+/// true. Then call a tool, and stop the bridge at the end of stdin. Without `sign_in`, stderr
+/// must have no sign-in line.
+fn serveOnce(gpa: Allocator, arena: Allocator, argv: []const []const u8, environ: *const std.process.Environ.Map, sign_in: bool) !void {
+    const b = try Bridge.spawnWith(gpa, argv, environ);
+    defer b.deinit();
+    errdefer b.failed = true;
+    b.watchdog.arm("initialize", exchange_limit);
+    try b.send(vscode_initialize);
+    if (sign_in) _ = try approveSignIn(b, gpa, arena, try waitSignIn(b, arena, 0));
+    _ = try expectResult(try b.response(arena, 1));
+    b.watchdog.arm("tools/call", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":3}}}
+    );
+    try testing.expectEqualStrings("5", try firstText(try expectResult(try b.response(arena, 2))));
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try expectStderr(b, "the tokens are in encrypted files in ");
+    const lines = std.mem.count(u8, b.err.bytes.items, "mcp-bridge-vscode: sign in at ");
+    try testing.expectEqual(@as(usize, if (sign_in) 1 else 0), lines);
+}
+
 // ---------------------------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------------------------
+
+/// The Streamable HTTP server of zig-sdk with the fixture server, on a loopback port, for the
+/// URL form of the bridge. Each request needs the bearer token `http_token`. The value must
+/// stay at its address between `start` and `stop`.
+const HttpUpstream = struct {
+    server: *mcp.Server,
+    transport: mcp.transport.http.Server,
+    resource: mcp.auth.ResourceServer,
+    future: Io.Future(void),
+    url_buf: [64]u8,
+    url: []const u8,
+
+    fn start(self: *HttpUpstream, gpa: Allocator) !void {
+        const io = testing.io;
+        self.server = try fixture.build(gpa, io, .{});
+        errdefer fixture.destroy(self.server);
+        self.transport = .init(io, gpa, self.server, .{ .port = 0, .auth = &self.resource });
+        errdefer self.transport.deinit();
+        try self.transport.bind();
+        self.url = try std.fmt.bufPrint(&self.url_buf, "http://127.0.0.1:{d}/mcp", .{self.transport.bound_port});
+        self.resource = .{
+            .resource = self.url,
+            .resource_metadata_url = "http://127.0.0.1/.well-known/oauth-protected-resource/mcp",
+            .authorization_servers = &.{"https://as.example"},
+            .verifier = .{ .ptr = self, .verify = verify },
+        };
+        self.future = try io.concurrent(serve, .{&self.transport});
+    }
+
+    fn serve(t: *mcp.transport.http.Server) void {
+        t.serve() catch {};
+    }
+
+    fn verify(ptr: *anyopaque, arena: Allocator, token: []const u8) mcp.auth.resource_server.VerifyError!mcp.auth.Principal {
+        _ = ptr;
+        _ = arena;
+        if (!std.mem.eql(u8, token, http_token)) return error.InvalidToken;
+        return .{ .subject = "process-test" };
+    }
+
+    fn stop(self: *HttpUpstream) void {
+        fixture.https.endAccept(testing.io, &self.transport);
+        self.transport.shutdown();
+        self.future.await(testing.io);
+        self.transport.deinit();
+        fixture.destroy(self.server);
+    }
+};
 
 /// The list changes after the acknowledgment of the first listen stream, in their order. The
 /// fixture server declares the list changes of its tools, prompts and resources.
@@ -810,6 +1511,12 @@ const Bridge = struct {
 
     /// Start the bridge with `argv`, and start the watchdog and the stderr task.
     fn spawn(gpa: Allocator, argv: []const []const u8) !*Bridge {
+        return spawnWith(gpa, argv, null);
+    }
+
+    /// Same as `spawn`, with the environment `environ`. Null gives the environment of the
+    /// test.
+    fn spawnWith(gpa: Allocator, argv: []const []const u8, environ: ?*const std.process.Environ.Map) !*Bridge {
         const io = testing.io;
         const self = try gpa.create(Bridge);
         errdefer gpa.destroy(self);
@@ -819,6 +1526,7 @@ const Bridge = struct {
             .stdout = .pipe,
             .stderr = .pipe,
             .create_no_window = true,
+            .environ_map = environ,
         });
         self.* = .{
             .gpa = gpa,
@@ -1024,7 +1732,9 @@ const Exit = struct {
 const Drain = struct {
     file: Io.File,
     gpa: Allocator,
+    /// Guarded by `lock` until `eof`.
     bytes: std.ArrayList(u8) = .empty,
+    lock: Io.Mutex = .init,
     /// True after the end of stderr. The task does not change `bytes` after this.
     eof: std.atomic.Value(bool) = .init(false),
 
@@ -1033,8 +1743,27 @@ const Drain = struct {
         var buf: [4096]u8 = undefined;
         while (true) {
             const n = self.file.readStreaming(io, &.{&buf}) catch return;
+            self.lock.lockUncancelable(io);
+            defer self.lock.unlock(io);
             if (self.bytes.items.len < max_captured_stderr) self.bytes.appendSlice(self.gpa, buf[0..n]) catch {};
         }
+    }
+
+    /// The rest of the complete line number `index` (from 0) of the lines that start with
+    /// `prefix`, in `arena`, or null. Another task can call it while stderr is open.
+    fn lineAfter(self: *Drain, io: Io, arena: Allocator, prefix: []const u8, index: usize) Allocator.Error!?[]const u8 {
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        var lines = std.mem.splitScalar(u8, self.bytes.items, '\n');
+        var found: usize = 0;
+        while (lines.next()) |line| {
+            // The last part has no line end yet.
+            if (lines.peek() == null) return null;
+            if (!std.mem.startsWith(u8, line, prefix)) continue;
+            if (found == index) return try arena.dupe(u8, std.mem.trimEnd(u8, line[prefix.len..], "\r"));
+            found += 1;
+        }
+        return null;
     }
 };
 
@@ -1231,6 +1960,24 @@ fn expectStderr(b: *Bridge, text: []const u8) !void {
     return fail("stderr does not have the text '{s}'", .{text});
 }
 
+/// Check that stderr of the bridge does not have `text`. Call this after `Bridge.finish`.
+fn expectNoStderr(b: *Bridge, text: []const u8) !void {
+    if (std.mem.indexOf(u8, b.err.bytes.items, text) == null) return;
+    return fail("stderr has the text '{s}'", .{text});
+}
+
+/// Check that each line on stderr is a complete line of the bridge with its tag. Use it when
+/// no child process writes to the same stderr. Call this after `Bridge.finish`.
+fn expectTaggedLines(b: *Bridge) !void {
+    const err = b.err.bytes.items;
+    if (err.len == 0) return;
+    if (err[err.len - 1] != '\n') return fail("stderr ends with a part of a line", .{});
+    var lines = std.mem.splitScalar(u8, err[0..err.len -| 1], '\n');
+    while (lines.next()) |line| {
+        if (!std.mem.startsWith(u8, line, "mcp-bridge-vscode: ")) return fail("a stderr line without the tag of the bridge: {s}", .{line});
+    }
+}
+
 fn expectWithin(elapsed: Io.Duration, bound: Io.Duration, what: []const u8) !void {
     if (elapsed.nanoseconds <= bound.nanoseconds) return;
     return fail("{s} took {d} ms. The limit is {d} ms.", .{ what, elapsed.toMilliseconds(), bound.toMilliseconds() });
@@ -1240,4 +1987,164 @@ fn expectWithin(elapsed: Io.Duration, bound: Io.Duration, what: []const u8) !voi
 fn fail(comptime format: []const u8, args: anytype) error{TestFailed} {
     std.debug.print("process test: " ++ format ++ "\n", args);
     return error.TestFailed;
+}
+
+/// The HTTPS fixture server in its own process: `--https 0` and the options `options`, for
+/// example `--oauth`. `environ` is its environment. Null gives the environment of the test. The
+/// server stops at the end of its stdin.
+const HttpsUpstream = struct {
+    child: std.process.Child,
+    /// The URL of the MCP endpoint, in the arena of `start`.
+    url: []const u8,
+
+    fn start(arena: Allocator, path: []const u8, options: []const []const u8, environ: ?*const std.process.Environ.Map) !HttpsUpstream {
+        const io = testing.io;
+        var child = try std.process.spawn(io, .{
+            .argv = try std.mem.concat(arena, []const u8, &.{ &.{ path, "--https", "0" }, options }),
+            .stdin = .pipe,
+            .stdout = .pipe,
+            .stderr = .ignore,
+            .create_no_window = true,
+            .environ_map = environ,
+        });
+        errdefer child.kill(io);
+        // The timer stops the fixture when it does not write its URL in time. The stop closes
+        // its stdout, and that ends the read.
+        var timer: KillTimer = .{ .io = io, .target = child.id.?, .limit = fixture_limit };
+        try timer.start();
+        var line: std.ArrayList(u8) = .empty;
+        var buf: [256]u8 = undefined;
+        while (std.mem.indexOfScalar(u8, line.items, '\n') == null) {
+            const n = child.stdout.?.readStreaming(io, &.{&buf}) catch |err| {
+                if (timer.stop()) return fail("the HTTPS fixture server did not write its URL in {d} s", .{fixture_limit.toSeconds()});
+                return err;
+            };
+            line.appendSlice(arena, buf[0..n]) catch |err| {
+                _ = timer.stop();
+                return err;
+            };
+        }
+        if (timer.stop()) return fail("the HTTPS fixture server did not write its URL in {d} s", .{fixture_limit.toSeconds()});
+        const nl = std.mem.indexOfScalar(u8, line.items, '\n').?;
+        return .{ .child = child, .url = std.mem.trimEnd(u8, line.items[0..nl], "\r") };
+    }
+
+    /// Close stdin of the fixture and wait for its exit. The timer stops a fixture that does
+    /// not stop in time, and the function writes that.
+    fn stop(self: *HttpsUpstream) void {
+        const io = testing.io;
+        if (self.child.stdin) |f| f.close(io);
+        self.child.stdin = null;
+        var timer: KillTimer = .{ .io = io, .target = self.child.id.?, .limit = fixture_limit };
+        timer.start() catch {
+            self.child.kill(io);
+            return;
+        };
+        _ = self.child.wait(io) catch self.child.kill(io);
+        if (timer.stop()) std.debug.print("process test: the HTTPS fixture server did not stop in {d} s at the end of its stdin\n", .{fixture_limit.toSeconds()});
+    }
+};
+
+/// The time limit of the start and of the stop of the HTTPS fixture server.
+const fixture_limit: Io.Duration = .fromSeconds(15);
+
+/// A thread that stops a process when a phase does not end in `limit`. A stop of the process
+/// closes its pipes, thus each blocked read of the test ends.
+const KillTimer = struct {
+    io: Io,
+    target: std.process.Child.Id,
+    limit: Io.Duration,
+    done: std.atomic.Value(bool) = .init(false),
+    fired: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn start(self: *KillTimer) !void {
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+    }
+
+    /// End the timer. Returns true when the timer stopped the process.
+    fn stop(self: *KillTimer) bool {
+        self.done.store(true, .release);
+        if (self.thread) |t| t.join();
+        self.thread = null;
+        return self.fired.load(.acquire);
+    }
+
+    fn run(self: *KillTimer) void {
+        const deadline = Io.Timestamp.now(self.io, .awake).addDuration(self.limit);
+        while (!self.done.load(.acquire)) {
+            if (Io.Timestamp.now(self.io, .awake).nanoseconds >= deadline.nanoseconds) {
+                self.fired.store(true, .release);
+                Watchdog.killProcess(self.target);
+                return;
+            }
+            self.io.sleep(.fromMilliseconds(20), .awake) catch {};
+        }
+    }
+};
+
+/// A free port on 127.0.0.1 for the redirect URI of one test.
+fn freePort() !u16 {
+    const address: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var listener = try address.listen(testing.io, .{});
+    defer listener.deinit(testing.io);
+    return listener.socket.address.getPort();
+}
+
+/// The prefix of the sign-in line of the bridge on stderr.
+const sign_in_prefix = "mcp-bridge-vscode: sign in at ";
+
+/// Wait for the sign-in line number `index` (from 0) on stderr, and return its URL in `arena`.
+fn waitSignIn(b: *Bridge, arena: Allocator, index: usize) ![]const u8 {
+    const deadline = Io.Timestamp.now(b.io, .awake).addDuration(exchange_limit);
+    while (true) {
+        if (try b.err.lineAfter(b.io, arena, sign_in_prefix, index)) |url| return url;
+        if (b.err.eof.load(.acquire)) return fail("stderr ended without the sign-in line {d}", .{index + 1});
+        if (Io.Timestamp.now(b.io, .awake).nanoseconds >= deadline.nanoseconds) return fail("no sign-in line {d} in {d} s", .{ index + 1, exchange_limit.toSeconds() });
+        try b.io.sleep(.fromMilliseconds(10), .awake);
+    }
+}
+
+/// Open the URL of a sign-in as the browser of the user, and return the code of the redirect
+/// to the bridge. The authorization server of the fixture approves each request.
+fn approveSignIn(b: *Bridge, gpa: Allocator, arena: Allocator, url: []const u8) ![]const u8 {
+    const visit = try fixture.https.browse(b.io, gpa, arena, url, .{});
+    if (visit.status != 200) return fail("the redirect of the sign-in gave the status {d}: {s}", .{ visit.status, visit.url });
+    return (try mcp.auth.common.parseQuery(arena, visit.url)).get("code") orelse return fail("the redirect has no code: {s}", .{visit.url});
+}
+
+/// Check the URL of a sign-in as the bridge must give it (P1). The URL uses https and has
+/// visible ASCII characters only. It is at the origin of `upstream_url`, because the
+/// authorization server of the fixture has the origin of the upstream server. Its parameters
+/// start an authorization code flow with PKCE for the resource `upstream_url`, with the
+/// redirect URI `redirect_uri`. Returns the scopes.
+fn expectSignInUrl(arena: Allocator, url: []const u8, upstream_url: []const u8, redirect_uri: []const u8) ![]const u8 {
+    const origin = originOf(upstream_url);
+    if (!std.mem.startsWith(u8, origin, "https://")) return fail("the upstream URL does not use https: {s}", .{upstream_url});
+    if (!std.mem.startsWith(u8, url, origin) or url.len == origin.len or url[origin.len] != '/') return fail("the sign-in URL is not at the origin {s}: {s}", .{ origin, url });
+    for (url) |c| if (c < 0x21 or c > 0x7e) return fail("the sign-in URL has a character that is not visible ASCII: {s}", .{url});
+    if (std.mem.indexOfScalar(u8, url, '#') != null) return fail("the sign-in URL has a fragment: {s}", .{url});
+    const query = try mcp.auth.common.parseQuery(arena, url);
+    const expected = [_][2][]const u8{
+        .{ "response_type", "code" },
+        .{ "code_challenge_method", "S256" },
+        .{ "redirect_uri", redirect_uri },
+        .{ "resource", upstream_url },
+    };
+    for (expected) |e| {
+        const value: []const u8 = query.get(e[0]) orelse "";
+        if (!std.mem.eql(u8, value, e[1])) return fail("the parameter {s} of the sign-in URL is '{s}', not '{s}'", .{ e[0], value, e[1] });
+    }
+    for ([_][]const u8{ "client_id", "state", "code_challenge" }) |name| {
+        const value: []const u8 = query.get(name) orelse "";
+        if (value.len == 0) return fail("the sign-in URL has no {s}: {s}", .{ name, url });
+    }
+    return query.get("scope") orelse "";
+}
+
+/// The origin `https://host:port` of `url`.
+fn originOf(url: []const u8) []const u8 {
+    const scheme_end = (std.mem.indexOf(u8, url, "://") orelse return url) + 3;
+    const path = std.mem.indexOfScalarPos(u8, url, scheme_end, '/') orelse url.len;
+    return url[0..path];
 }

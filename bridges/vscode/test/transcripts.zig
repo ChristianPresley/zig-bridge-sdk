@@ -12,6 +12,10 @@
 //! - `input_test.zig`: the input requests of the upstream server and the answers of VS Code.
 //! - `notify_test.zig`: the list changes, the resource updates and the log messages of the
 //!   upstream server.
+//! - `oauth_test.zig`: the sign-in at an HTTPS upstream server.
+//! - `https_test.zig`: the HTTPS upstream server with the upstream configuration of the
+//!   executable. The tests cover the registration modes, the stored sign-ins and the step-up.
+//!   They also cover the stop of a sign-in, the trust, the icons and a proxy.
 const std = @import("std");
 
 test {
@@ -21,4 +25,6 @@ test {
     _ = @import("negative_test.zig");
     _ = @import("input_test.zig");
     _ = @import("notify_test.zig");
+    _ = @import("oauth_test.zig");
+    _ = @import("https_test.zig");
 }

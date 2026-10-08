@@ -280,3 +280,57 @@ test "a tool with an array output schema and array structured content" {
     try testing.expectEqualStrings("[1,2,3]", try h.firstText(call));
     try t.verify();
 }
+
+/// Icons of each kind for the icon transcripts: a `data:` icon, and `file:`, `https:` and
+/// `http:` icons.
+const icon_set =
+    \\[{"src":"data:image/png;base64,AA==","mimeType":"image/png"},{"src":"file:///home/u/icon.png"},{"src":"https://mcp.example.com/icon.png"},{"src":"http://127.0.0.1/icon.png"}]
+;
+const icons_discover = "{\"resultType\":\"complete\",\"supportedVersions\":[\"2026-07-28\"],\"capabilities\":{\"tools\":{}},\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"remote\",\"version\":\"1\",\"icons\":" ++ icon_set ++ "}}}";
+const icons_tools = "{\"resultType\":\"complete\",\"tools\":[{\"name\":\"a\",\"inputSchema\":{\"type\":\"object\"},\"icons\":" ++ icon_set ++ "},{\"name\":\"b\",\"inputSchema\":{\"type\":\"object\"},\"icons\":[{\"src\":\"file:///b.png\"}]}]}";
+const icons_call = "{\"resultType\":\"complete\",\"content\":[{\"type\":\"resource_link\",\"uri\":\"https://mcp.example.com/r\",\"name\":\"r\",\"icons\":" ++ icon_set ++ "}]}";
+const all_icons: []const []const u8 = &.{ "data:image/png;base64,AA==", "file:///home/u/icon.png", "https://mcp.example.com/icon.png", "http://127.0.0.1/icon.png" };
+
+test "a remote upstream server: only the data icons reach VS Code" {
+    try expectIcons(true);
+}
+
+test "a local upstream server: each icon reaches VS Code" {
+    try expectIcons(false);
+}
+
+/// The icons of the server information, of a tool list and of a resource link. A remote
+/// upstream server keeps only the `data:` icons, and a local upstream server keeps each icon.
+fn expectIcons(remote: bool) !void {
+    const t = try Transcript.create(.{ .remote = remote });
+    defer t.destroy();
+    t.tap.setScript(.{ .result = icons_discover });
+    const init = try h.expectResult(try t.call(1, h.vscode_initialize));
+    try t.send(h.initialized);
+    t.tap.setScript(.{ .result = icons_tools });
+    const list = try h.expectResult(try t.request(2, "tools/list", "{}"));
+    t.tap.setScript(.{ .result = icons_call });
+    const call = try h.expectResult(try t.request(3, "tools/call", "{\"name\":\"a\",\"arguments\":{}}"));
+
+    const expected = if (remote) all_icons[0..1] else all_icons;
+    try expectSources(expected, init.object.get("serverInfo").?);
+    const tools = list.object.get("tools").?.array.items;
+    try expectSources(expected, tools[0]);
+    // A tool without a data icon has no icons.
+    const b_icons: []const []const u8 = if (remote) &.{} else &.{"file:///b.png"};
+    try expectSources(b_icons, tools[1]);
+    try expectSources(expected, call.object.get("content").?.array.items[0]);
+    if (remote) for (0..t.count()) |i| {
+        for ([_][]const u8{ "file:///home/u/icon.png", "https://mcp.example.com/icon.png", "http://127.0.0.1/icon.png", "file:///b.png" }) |src| {
+            try testing.expect(std.mem.indexOf(u8, t.text(i), src) == null);
+        }
+    };
+    try t.verify();
+}
+
+/// Check the `src` of each icon of `holder`. No icon means no `icons` member.
+fn expectSources(expected: []const []const u8, holder: Value) !void {
+    const icons = holder.object.get("icons") orelse return testing.expectEqual(@as(usize, 0), expected.len);
+    try testing.expectEqual(expected.len, icons.array.items.len);
+    for (expected, icons.array.items) |e, icon| try testing.expectEqualStrings(e, icon.object.get("src").?.string);
+}

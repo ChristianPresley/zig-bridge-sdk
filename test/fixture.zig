@@ -13,11 +13,17 @@
 //!
 //! `touch` tells the listen streams that a resource changed. `log` sends log messages at four
 //! levels. The server declares `logging`.
+//!
+//! `https` has the HTTPS variant of the server: the same tools behind a TLS listener, with an
+//! optional OAuth authorization server in the same process.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const mcp = @import("mcp");
+
+/// The HTTPS variant of the server.
+pub const https = @import("fixture_https.zig");
 
 /// The name in the `serverInfo` of the server.
 pub const server_name = "bridge-fixture-server";
@@ -105,6 +111,19 @@ pub const log_levels = [_]mcp.types.LoggingLevel{ .debug, .info, .warning, .@"er
 /// The logger name of the log messages of the tool `log`.
 pub const log_logger = "fixture";
 
+/// The name of the tool of the option `guarded`. Behind the authorization server of the HTTPS
+/// variant, a call of this tool needs the scope `https.step_up_scope`.
+pub const guarded_tool = "guarded";
+/// The text of the result of the tool `guarded`.
+pub const guarded_text = "guarded: allowed";
+
+/// The largest text of the tool `big`.
+pub const max_big_bytes = 64 << 20;
+/// The input schema of the tool `big`.
+pub const big_schema =
+    \\{"type":"object","properties":{"bytes":{"type":"integer","minimum":1,"maximum":67108864,"description":"The size of the text in bytes"}},"required":["bytes"],"additionalProperties":false}
+;
+
 pub const Options = struct {
     /// The number of generated tools. Their names are `tool_0` to `tool_<N-1>`. With more tools
     /// than `limits.page_size`, the result of `tools/list` has more than one page.
@@ -123,6 +142,12 @@ pub const Options = struct {
     array_output: bool = false,
     /// The limits of the server. A test can set a small `page_size`.
     limits: mcp.Limits = .{},
+    /// Register the tool `guarded`. The HTTPS variant sets this option. Its authorization
+    /// server then asks for a step-up for each call of the tool.
+    guarded: bool = false,
+    /// Register the tool `big`. Its result has a text of `bytes` bytes, up to `max_big_bytes`.
+    /// The HTTPS variant sets this option for the tests of large responses.
+    big: bool = false,
 };
 
 pub const BuildError = mcp.Server.InitError || mcp.Server.RegisterError;
@@ -201,6 +226,12 @@ fn register(server: *mcp.Server, options: Options) mcp.Server.RegisterError!void
     try server.addToolJson(.{ .name = "touch", .description = "Tell the subscribers that a resource changed", .input_schema = touch_schema }, touch);
     try server.addToolJson(.{ .name = "log", .description = "Send log messages at the levels debug, info, warning and error", .annotations = read_only }, logMessages);
     try server.addResource(.{ .uri = notes_uri, .name = "notes", .mime_type = "text/plain" }, readNotes);
+    if (options.guarded) {
+        try server.addToolJson(.{ .name = guarded_tool, .description = "A tool that needs the scope mcp:write behind the authorization server", .annotations = read_only }, guarded);
+    }
+    if (options.big) {
+        try server.addToolJson(.{ .name = "big", .description = "Send back a text of the given size", .annotations = read_only, .input_schema = big_schema }, big);
+    }
     var i: u32 = 0;
     while (i < options.many_tools) : (i += 1) {
         var name_buf: [32]u8 = undefined;
@@ -404,6 +435,26 @@ fn readNotes(ctx: *mcp.RequestContext, uri: []const u8) anyerror!mcp.Outcome(mcp
     return .{ .complete = .{ .contents = contents } };
 }
 
+/// The tool `guarded`. The authorization server of the HTTPS variant checks the scope before
+/// the call comes to the server. Thus the tool itself does no check.
+fn guarded(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    _ = args;
+    try ctx.checkCancel();
+    return .{ .complete = try mcp.CallToolResult.text(ctx.arena, guarded_text, .{}) };
+}
+
+/// The tool `big`: a text of `bytes` times the letter x.
+fn big(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
+    const bytes: Value = if (args == .object) args.object.get("bytes") orelse .null else .null;
+    if (bytes != .integer or bytes.integer < 1 or bytes.integer > max_big_bytes) return error.InvalidParams;
+    try ctx.checkCancel();
+    const text = try ctx.arena.alloc(u8, @intCast(bytes.integer));
+    @memset(text, 'x');
+    const content = try ctx.arena.alloc(mcp.types.ContentBlock, 1);
+    content[0] = .{ .text = .{ .text = text } };
+    return .{ .complete = .{ .content = content } };
+}
+
 /// The handler of the tools `tool_<i>`. It sends the name of the tool back.
 fn generated(ctx: *mcp.RequestContext, args: Value) anyerror!mcp.Outcome(mcp.CallToolResult) {
     _ = args;
@@ -581,6 +632,10 @@ fn complete(ctx: *mcp.RequestContext, params: mcp.types.CompleteRequestParams) a
 const testing = std.testing;
 const Harness = mcp.transport.memory.Harness;
 
+test {
+    _ = https;
+}
+
 const test_meta =
     \\"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"t","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}
 ;
@@ -623,6 +678,8 @@ test "tools/list has pages with many tools and the result names every tool" {
     for (names.items) |n| {
         try testing.expect(!std.mem.eql(u8, n, "crash"));
         try testing.expect(!std.mem.eql(u8, n, "shutdown"));
+        try testing.expect(!std.mem.eql(u8, n, guarded_tool));
+        try testing.expect(!std.mem.eql(u8, n, "big"));
     }
 }
 

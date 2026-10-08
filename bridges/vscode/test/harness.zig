@@ -82,6 +82,13 @@ pub const Transcript = struct {
         frontend: Frontend.Options = .{},
         /// Add an MCP App, a text resource and the Tasks extension to the fixture server.
         extras: bool = true,
+        /// The tap has the kind of the Streamable HTTP transport. Thus the bridge sees a
+        /// remote upstream server (`Upstream.isRemote`).
+        remote: bool = false,
+        /// The upstream server of the front end in place of the tap, for example
+        /// `vscode.upstreamConfig` with the URL of an HTTPS server. The tap then sees no
+        /// request, and `verify` checks only the frames of the bridge.
+        upstream: ?Upstream.Config = null,
     };
 
     /// One request of the test.
@@ -106,7 +113,7 @@ pub const Transcript = struct {
             .link = undefined,
             .upstream = undefined,
             .frontend = undefined,
-            .tap = .{ .io = io, .gpa = gpa },
+            .tap = .{ .io = io, .gpa = gpa, .remote = options.remote },
             .arena_state = .init(gpa),
         };
         errdefer self.arena_state.deinit();
@@ -115,7 +122,7 @@ pub const Transcript = struct {
         if (options.extras) try addExtras(self.server, self.arena_state.allocator());
         self.link = .init(io, gpa, self.server);
         self.tap.inner = self.link.transport();
-        self.upstream = try Upstream.init(io, gpa, self.upstreamConfig());
+        self.upstream = try Upstream.init(io, gpa, options.upstream orelse self.upstreamConfig());
         errdefer self.upstream.deinit();
         self.frontend = .init(io, gpa, self.upstream, &vscode.profile, .{ .ptr = self, .write = write }, options.frontend);
         return self;
@@ -547,6 +554,9 @@ pub const Tap = struct {
     base: usize = 0,
     /// The script of the next listen stream, or null. Guarded by `lock`.
     listen_script: ?*ListenScript = null,
+    /// The tap has the kind of the Streamable HTTP transport, and not the kind of the memory
+    /// transport.
+    remote: bool = false,
 
     /// What the tap does with the next requests.
     pub const Script = union(enum) {
@@ -664,11 +674,13 @@ pub const Tap = struct {
     }
 
     fn transport(self: *Tap) Transport.ClientTransport {
-        return .{ .ptr = self, .vtable = &vtable };
+        return .{ .ptr = self, .vtable = if (self.remote) &remote_vtable else &vtable };
     }
 
     // The tap stands for the memory transport to the fixture server, thus it has its kind.
     const vtable: Transport.ClientTransport.VTable = .{ .kind = .memory, .exchange = onExchange, .notify = onNotify };
+    // A remote tap stands for the transport to a remote server.
+    const remote_vtable: Transport.ClientTransport.VTable = .{ .kind = .streamable_http, .exchange = onExchange, .notify = onNotify };
 
     fn onExchange(ptr: *anyopaque, io: Io, ex: *Transport.Exchange) Transport.ExchangeError!void {
         const self: *Tap = @ptrCast(@alignCast(ptr));
