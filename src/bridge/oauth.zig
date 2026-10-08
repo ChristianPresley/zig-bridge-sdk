@@ -790,6 +790,16 @@ fn lowerDeadline(value: *std.atomic.Value(i64), limit: i64) void {
     }
 }
 
+/// Accepts the next connection of `listener`. A cancel does not stop the accept. Only a
+/// connection ends it, for example the wake connection of `Receiver.stop`. On Windows, a cancel
+/// can arrive after the accept took a connection. Std then closes that connection, and a Debug
+/// build writes a stack trace of `error.Unexpected` to stderr.
+fn acceptUncancelable(io: Io, listener: *Io.net.Server) Io.net.Server.AcceptError!Io.net.Stream {
+    const prev = io.swapCancelProtection(.blocked);
+    defer _ = io.swapCancelProtection(prev);
+    return listener.accept(io);
+}
+
 /// Closes a connection with a reset on POSIX systems. Thus the port of the receiver keeps no
 /// connection in the `TIME_WAIT` state, and the next sign-in can listen on it again at once.
 fn abortiveClose(io: Io, stream: Io.net.Stream) void {
@@ -1128,7 +1138,7 @@ pub const Receiver = struct {
     fn acceptLoop(self: *Receiver) void {
         const io = self.io;
         while (!self.stopping.load(.acquire)) {
-            const stream = self.listener.accept(io) catch |e| switch (e) {
+            const stream = acceptUncancelable(io, &self.listener) catch |e| switch (e) {
                 error.Canceled, error.SocketNotListening => return,
                 else => {
                     io.sleep(.fromMilliseconds(10), .awake) catch return;
