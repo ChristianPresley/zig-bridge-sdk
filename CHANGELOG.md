@@ -4,20 +4,6 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
-Milestone M6 protects the sign-in on a POSIX host that other users share. On such a host, other users can read the arguments of the browser opener. Thus the browser now gets a one-time start URL in place of the authorization URL.
-
-### Security
-
-- `bridge`: the one-time start URL of `bridge.oauth` (M6). When `SignIn` opens a browser, it makes a token of 256 random bits with the secure random source of `Io`, as `OAuthClient` makes its `state`. `Receiver` serves the path `/start/<token>` on the redirect port. On each system, the browser opener gets only `http://127.0.0.1:<port>/start/<token>`. This also applies to `ShellExecuteW` on Windows.
-- `bridge`: the sign-in line on stderr still has the authorization URL (M6). With `--no-browser`, and for a URL elicitation after `notifications/initialized`, the receiver serves no start path.
-- `bridge`: the answers of the start path (M6). The first `GET` gets 303 to the checked authorization URL, with `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, no body and `Connection: close`. A second `GET` gets 410 and stops the sign-in with the reason `start_reused`. The wait ends after the receiver sent that page.
-- `bridge`: a start path with a different token gets 404 and does not stop the sign-in (M6). The compare of the token takes the same time for each token. The start path does not work after the time limit of the sign-in.
-- `bridge`: after the sign-in received a redirect with a code, a second `GET` of the start path cannot stop the sign-in (M6). The receiver then writes a warning, and its page tells the user that another program possibly signed in with a different account.
-- `bridge`: the error cause `sign_in_start_reused` (-32603) in `bridge.translate`. Its message names the host of the bridge and `--no-browser`.
-- `vscode`: the start URL and its residual risk in `SECURITY.md` and in `bridges/vscode/README.md`. Another local user can read the start URL and send the first `GET`. That user can then sign in with a different account before the browser of the user sends its `GET`. Then the bridge gets the code of that account. On a host that other users share, use `--no-browser`.
-- `vscode`: `bridges/vscode/README.md` has the new lines of the Output channel and the new error message of M6. The status sections of `README.md` and `bridges/vscode/README.md` name M6.
-- Repository: the tests of M6. The unit tests of `bridge.oauth` cover the start path and a guess of the token. They also cover a second `GET` during the wait and after the redirect, and the page before the stop. The transcript tests and a process test check that the opener gets only the start URL. In the process test, a `BROWSER` script starts `bridge-fixture-server --browse`, the browser of the test.
-
 ## [0.1.0] - 2026-10-08
 
 This section has the work of milestones M0 to M5. M0 is the scaffold: the package, the build, the tools and the documents. M1 is the runtime of the `vscode` bridge over stdio. M2 and M3 send the input requests and the notifications of the upstream server to the client. M4 adds an upstream server at an HTTPS URL, with the OAuth sign-in and the storage of the tokens. M5 puts the bridge into the executable of a zig-sdk server, so that one executable serves the two revisions.
@@ -25,6 +11,8 @@ This section has the work of milestones M0 to M5. M0 is the scaffold: the packag
 The bridge starts the upstream command, or it connects to the upstream server at a URL over Streamable HTTP. When the server at the URL asks for it, the bridge signs in at its authorization server. The bridge answers `initialize`, and forwards the requests for tools, prompts, resources and completion. It also forwards the progress notifications and the cancellations.
 
 When the upstream server asks for input, the bridge sends each input request to the client and sends the answers to the upstream server. A listen stream gives the list changes and the resource updates of the upstream server to the client. The log messages of the requests also go to the client. The pin of zig-sdk is the commit `8334b15` of zig-sdk pull request #31, before the tag `v0.4.0`.
+
+Milestone M6 protects the sign-in on a POSIX host that other users share. On such a host, other users can read the arguments of the browser opener. Thus the browser now gets a one-time start URL in place of the authorization URL.
 
 ### Added
 
@@ -130,6 +118,18 @@ When the upstream server asks for input, the bridge sends each input request to 
 
 - Package: the pin of zig-sdk moves to the commit `8334b1501644c9f8e1f65f7e24b1ef86b335093f` of the tag `v0.4.0` of zig-sdk. M3 and M4 used the commit `cda66dc616ce01ad69e8c7ea716416c324669a54` of zig-sdk 0.4.0 before its release. The new commit adds the HTTP/2 and gRPC fixes of zig-sdk 0.4.0 and `mcp.util.loopback`. The bridges do not use HTTP/2 or gRPC, thus their code has no change.
 - Repository: the CI workflows, the release workflow and `CONTRIBUTING.md` give `--test-timeout 10m` to `zig build test`. On Windows, a race of Zig 0.16.0 in parallel process starts can delay the answer of a test runner. Without the option, the build runner then reports a test runner that does not answer, although no test hangs.
+
+### Security
+
+- `bridge`: the one-time start URL of `bridge.oauth` (M6). When `SignIn` opens a browser, it makes a token of 256 random bits with the secure random source of `Io`, as `OAuthClient` makes its `state`. `Receiver` serves the path `/start/<token>` on the redirect port. On each system, the browser opener gets only `http://127.0.0.1:<port>/start/<token>`. This also applies to `ShellExecuteW` on Windows.
+- `bridge`: the sign-in line on stderr still has the authorization URL (M6). With `--no-browser`, and for a URL elicitation after `notifications/initialized`, the receiver serves no start path.
+- `bridge`: the answers of the start path (M6). The first `GET` gets 303 to the checked authorization URL, with `Cache-Control: no-store`, `Referrer-Policy: no-referrer`, no body and `Connection: close`. A second `GET` gets 410 and stops the sign-in with the reason `start_reused`. The wait ends after the receiver sent that page.
+- `bridge`: a start path with a different token gets 404 and does not stop the sign-in (M6). The compare of the token takes the same time for each token. The start path does not work after the time limit of the sign-in.
+- `bridge`: after the sign-in received a redirect with a code, a second `GET` of the start path cannot stop the sign-in (M6). The receiver then writes a warning, and its page tells the user that another program possibly signed in with a different account.
+- `bridge`: the error cause `sign_in_start_reused` (-32603) in `bridge.translate`. Its message names the host of the bridge and `--no-browser`.
+- `vscode`: the start URL and its residual risk in `SECURITY.md` and in `bridges/vscode/README.md`. Another local user can read the start URL and send the first `GET`. That user can then sign in with a different account before the browser of the user sends its `GET`. Then the bridge gets the code of that account. On a host that other users share, use `--no-browser`.
+- `vscode`: `bridges/vscode/README.md` has the new lines of the Output channel and the new error message of M6. The status sections of `README.md` and `bridges/vscode/README.md` name M6.
+- Repository: the tests of M6. The unit tests of `bridge.oauth` cover the start path and a guess of the token. They also cover a second `GET` during the wait and after the redirect, and the page before the stop. The transcript tests and a process test check that the opener gets only the start URL. In the process test, a `BROWSER` script starts `bridge-fixture-server --browse`, the browser of the test.
 
 [Unreleased]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/ChristianPresley/zig-bridge-sdk/releases/tag/v0.1.0
