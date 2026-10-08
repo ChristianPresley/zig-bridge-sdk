@@ -5,8 +5,9 @@
 //!   stderr or opens it.
 //! - `Opener` opens the browser. On Windows it calls `ShellExecuteW`. On POSIX systems it
 //!   starts `$BROWSER`, `open` or `xdg-open` with the URL as the only argument. It never starts
-//!   a shell.
-//! - `Receiver` receives the redirect of the browser on `127.0.0.1`.
+//!   a shell. The browser gets the one-time start URL, and not the authorization URL.
+//! - `Receiver` receives the redirect of the browser on `127.0.0.1`. It also serves the start
+//!   URL.
 //! - `SignIn` gives `OAuthClient` its `authorize` callback, and records the cause of a failure.
 //! - `Gate` decides how the URL gets to the user. Before `notifications/initialized` it opens
 //!   the browser. After it, the client gets a URL elicitation, and the user decides.
@@ -20,6 +21,30 @@
 //! Header values, the client secret, the token key, the tokens and the query of the redirect
 //! never go to stderr. The program that the POSIX opener starts gets no secret variable of
 //! the environment.
+//!
+//! On a POSIX host, each local user can read the arguments of each process. The authorization
+//! URL has the `state` and the `code_challenge` of the sign-in. With these values, another
+//! local user can sign in with a different account. The receiver accepts a redirect from each
+//! local user, thus the bridge then receives a code for that account.
+//!
+//! For this reason, the opener gets only the start URL `http://127.0.0.1:<port>/start/<token>`,
+//! on each system. The token has 256 random bits. The first `GET` of the start URL gets a
+//! redirect to the authorization URL. A second `GET` stops the sign-in, because another
+//! program possibly sent one of the two requests. This applies until `Receiver.wait` gives the
+//! redirect to its caller.
+//!
+//! A risk stays. Another local user can read the start URL and send the first `GET`. That user
+//! can then complete a sign-in with a different account before the browser of the user sends
+//! its `GET`. The same applies when the browser does not open. In these cases, the bridge
+//! receives a code for the account of the other user, and it shows no error. The browser of
+//! the user then gets an error page, or it cannot connect.
+//!
+//! On a host with other users, use `--no-browser` (`Authorizer.Options.no_browser`). Then the
+//! bridge opens no browser before `notifications/initialized`, and the user opens the URL of
+//! the sign-in line. This helps only when no program on that host gets the URL as an argument.
+//! For example, VS Code on that host starts `xdg-open` with the URL of a link that the user
+//! clicks. After `notifications/initialized`, the client gets the authorization URL also with
+//! `--no-browser`, and it opens the URL. On Linux, a `/proc` with `hidepid` also helps.
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
@@ -127,6 +152,37 @@ pub fn validAccount(label: []const u8) bool {
 /// host is always the literal `127.0.0.1`, never `localhost` and never `[::1]`.
 pub fn writeRedirectUri(buf: *[max_redirect_uri_len]u8, port: u16) []const u8 {
     return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}" ++ callback_path, .{port}) catch unreachable;
+}
+
+/// The start of the path of the one-time start URL. The token follows it.
+pub const start_path_prefix = "/start/";
+
+/// The number of random bytes of a start token: 256 bits, as the `state` of `OAuthClient`.
+pub const start_token_bytes = 32;
+
+/// The length of a start token: base64url without padding.
+pub const start_token_len = std.base64.url_safe_no_pad.Encoder.calcSize(start_token_bytes);
+
+/// The token of a start URL.
+pub const StartToken = [start_token_len]u8;
+
+/// The length of the longest start URL.
+pub const max_start_url_len = "http://127.0.0.1:65535".len + start_path_prefix.len + start_token_len;
+
+/// Makes a start token from the secure random source of `io`, as `OAuthClient` makes its
+/// `state`.
+pub fn newStartToken(io: Io) Io.RandomSecureError!StartToken {
+    var bytes: [start_token_bytes]u8 = undefined;
+    defer std.crypto.secureZero(u8, &bytes);
+    try io.randomSecure(&bytes);
+    var token: StartToken = undefined;
+    _ = std.base64.url_safe_no_pad.Encoder.encode(&token, &bytes);
+    return token;
+}
+
+/// Writes the start URL `http://127.0.0.1:<port>/start/<token>` into `buf` and returns it.
+pub fn writeStartUrl(buf: *[max_start_url_len]u8, port: u16, token: *const StartToken) []const u8 {
+    return std.fmt.bufPrint(buf, "http://127.0.0.1:{d}" ++ start_path_prefix ++ "{s}", .{ port, token }) catch unreachable;
 }
 
 /// The settings of `clientOptions`.
@@ -294,16 +350,33 @@ pub const OpenerError = error{
     Cooldown,
 } || Io.Cancelable;
 
+/// The destination of the URL that an opener gets.
+pub const Delivery = enum {
+    /// A browser. The opener gets the one-time start URL of the receiver, and not the
+    /// authorization URL. On a POSIX host, other local users can read the arguments of the
+    /// program that the opener starts.
+    browser,
+    /// The user, for example in a URL elicitation of the client. The opener gets the
+    /// authorization URL, because the user must see the full URL before the consent.
+    user,
+    /// No destination: the opener opens nothing. The opener gets the authorization URL, and
+    /// the receiver serves no start URL.
+    none,
+};
+
 /// Opens a URL in a browser. Tests give an opener of their own, and the tests never open a
 /// browser. `SignIn` checks the URL before it calls the opener.
 pub const Opener = struct {
     context: ?*anyopaque = null,
-    /// Opens `url`. The function gives `error.Canceled` only after a cancel point of `io` gave
-    /// it.
+    /// Opens `url`: the start URL for `Delivery.browser`, else the authorization URL. The
+    /// function gives `error.Canceled` only after a cancel point of `io` gave it.
     open: *const fn (context: ?*anyopaque, io: Io, url: []const u8) OpenerError!void,
     /// Optional. `SignIn` calls it with the checked URL before the receiver listens and before
     /// the sign-in line. An error ends the sign-in at once: there is no line and no receiver.
     check: ?*const fn (context: ?*anyopaque, url: []const u8) OpenerError!void = null,
+    /// Optional. `SignIn` calls it after `check` and before the receiver listens. It gives the
+    /// destination of the URL of this sign-in. Null gives `Delivery.browser`.
+    delivery: ?*const fn (context: ?*anyopaque) Delivery = null,
     /// Optional. `SignIn` calls it at the end of each sign-in that passed `check`, after the
     /// wait for the redirect. `outcome` is null after a redirect with a code. Else it is the
     /// cause of the failure.
@@ -790,11 +863,26 @@ pub const ErrorCode = struct {
 
 /// Receives the redirect of the browser on `127.0.0.1` for one sign-in. The receiver listens
 /// before the browser opens. Each connection has its own task with a limit of the request
-/// head and a time limit. Only a `GET` of the callback path with the expected `state` ends the
-/// wait. Each other request gets 404 or 400, and the wait continues.
+/// head and a time limit. Only a `GET` of the callback path with the expected `state` and a
+/// second `GET` of the start path end the wait. Each other request gets 404 or 400, and the
+/// wait continues.
 ///
 /// The receiver answers each request with a static page and `Connection: close`. It reads no
 /// request body, and the page has no text from the request.
+///
+/// With `Options.start`, the receiver also serves the one-time start path `/start/<token>`:
+///
+/// - The first `GET` gets `303 See Other` to the authorization URL, with
+///   `Cache-Control: no-store`, `Referrer-Policy: no-referrer` and no body.
+/// - A second `GET` gets 410 and a page that tells the user to start the sign-in again. It
+///   stops the wait with `error.StartReused`, because another program possibly sent one of the
+///   two requests. The wait ends after the receiver sent the page.
+/// - After the caller of `wait` took a redirect with a code, a second `GET` cannot stop the
+///   sign-in. The receiver then writes a warning, and the page of the 410 tells the user that
+///   another program possibly signed in with a different account.
+/// - A path with a different token gets 404, and the wait continues. Thus a guess cannot stop
+///   the sign-in. The compare of the token takes the same time for each token.
+/// - After `stop`, the start path does not work, as the callback path.
 pub const Receiver = struct {
     io: Io,
     gpa: Allocator,
@@ -805,12 +893,18 @@ pub const Receiver = struct {
     path: []const u8,
     /// The expected `state`, owned.
     state: []u8,
+    /// The token of the start path, or null when the receiver serves no start path.
+    start_token: ?StartToken = null,
+    /// The `Location` of the start path: the checked authorization URL, owned. It is empty
+    /// without a start path.
+    start_location: []u8 = &.{},
     stopping: std.atomic.Value(bool) = .init(false),
     accept_future: Io.Future(void),
     connections: Io.Group = .init,
     /// The number of connection tasks.
     active: std.atomic.Value(u32) = .init(0),
-    /// Guards `conns`, `closing`, `claimed`, `result` and `taken`.
+    /// Guards `conns`, `closing`, `claimed`, `result`, `taken`, `taken_code`, `start_used` and
+    /// `start_reused`.
     lock: Io.Mutex = .init,
     conns: std.DoublyLinkedList = .{},
     closing: bool = false,
@@ -819,8 +913,16 @@ pub const Receiver = struct {
     result: ?Callback = null,
     /// `wait` gave the redirect to its caller.
     taken: bool = false,
+    /// The redirect of `taken` has a code.
+    taken_code: bool = false,
+    /// The start path got its `GET`.
+    start_used: bool = false,
+    /// The start path got a second `GET` before `taken`. The wait ends with
+    /// `error.StartReused`.
+    start_reused: bool = false,
     aborted: std.atomic.Value(bool) = .init(false),
-    /// Set when `result` or `aborted` changes.
+    /// Set when `result` or `aborted` changes, and after the page of a second `GET` of the
+    /// start path (`Connection.work`).
     done: Io.Event = .unset,
 
     pub const Limits = struct {
@@ -842,7 +944,18 @@ pub const Receiver = struct {
         path: []const u8 = callback_path,
         /// The `state` of the authorization request.
         state: []const u8,
+        /// The one-time start path, or null.
+        start: ?Start = null,
         limits: Limits = .{},
+    };
+
+    /// The one-time start path `/start/<token>` of a browser.
+    pub const Start = struct {
+        /// A random token from `newStartToken`.
+        token: StartToken,
+        /// The checked authorization URL. The first `GET` of the start path gets it as
+        /// `Location`. It has only the bytes 0x21 to 0x7E (`validateAuthorizationUrl`).
+        location: []const u8,
     };
 
     /// The redirect that ended the wait.
@@ -884,6 +997,8 @@ pub const Receiver = struct {
         Timeout,
         /// `abort` stopped the wait.
         Aborted,
+        /// The start path got a second `GET`.
+        StartReused,
     } || Io.Cancelable;
 
     /// Listens on `127.0.0.1:<port>` and starts the accept loop. The receiver must not move
@@ -894,6 +1009,8 @@ pub const Receiver = struct {
         errdefer closeListener(io, &listener);
         const state = try gpa.dupe(u8, options.state);
         errdefer gpa.free(state);
+        const location: []u8 = if (options.start) |s| try gpa.dupe(u8, s.location) else &.{};
+        errdefer gpa.free(location);
         self.* = .{
             .io = io,
             .gpa = gpa,
@@ -902,6 +1019,8 @@ pub const Receiver = struct {
             .port = listener.socket.address.getPort(),
             .path = options.path,
             .state = state,
+            .start_token = if (options.start) |s| s.token else null,
+            .start_location = location,
             .accept_future = undefined,
         };
         self.accept_future = io.concurrent(acceptLoop, .{self}) catch |e| {
@@ -954,18 +1073,30 @@ pub const Receiver = struct {
         self.result = null;
         std.crypto.secureZero(u8, self.state);
         self.gpa.free(self.state);
+        if (self.start_token) |*token| std.crypto.secureZero(u8, token);
+        std.crypto.secureZero(u8, self.start_location);
+        self.gpa.free(self.start_location);
     }
 
-    /// The state of the wait, under the lock: the redirect, `error.Aborted` after `abort`,
-    /// `error.Timeout` after the caller took the redirect, or null. A connection task can
-    /// publish the redirect at each time, thus the function decides under the lock. After
-    /// `done` is set, the function never gives null.
-    fn poll(self: *Receiver) error{ Aborted, Timeout }!?Callback {
+    /// The state of the wait, under the lock. The function gives one of these values:
+    ///
+    /// - `error.StartReused` after a second `GET` of the start path. It wins over a redirect
+    ///   that the caller did not take.
+    /// - The redirect.
+    /// - `error.Aborted` after `abort`.
+    /// - `error.Timeout` after the caller took the redirect.
+    /// - Null.
+    ///
+    /// A connection task can publish the redirect at each time, thus the function decides
+    /// under the lock. After `done` is set, the function never gives null.
+    fn poll(self: *Receiver) error{ Aborted, Timeout, StartReused }!?Callback {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
+        if (self.start_reused) return error.StartReused;
         if (self.result) |callback| {
             self.result = null;
             self.taken = true;
+            self.taken_code = callback.outcome == .code;
             return callback;
         }
         if (self.aborted.load(.acquire)) return error.Aborted;
@@ -1022,7 +1153,20 @@ pub const Receiver = struct {
     }
 
     /// The answer to one request.
-    const Verdict = enum { accepted, not_found, bad_request, too_large };
+    const Verdict = enum {
+        /// The redirect with the expected `state`.
+        accepted,
+        /// The first `GET` of the start path.
+        start,
+        /// A second `GET` of the start path. It stops the wait.
+        start_reused,
+        /// A second `GET` of the start path after `wait` gave a redirect with a code to its
+        /// caller.
+        start_late,
+        not_found,
+        bad_request,
+        too_large,
+    };
 
     /// Decides the answer to one request head. A match claims the redirect and writes it to
     /// `claim`.
@@ -1036,6 +1180,9 @@ pub const Receiver = struct {
         if (!std.mem.eql(u8, version, "HTTP/1.1") and !std.mem.eql(u8, version, "HTTP/1.0")) return .bad_request;
         const query_start = std.mem.indexOfScalar(u8, target, '?');
         const path = target[0 .. query_start orelse target.len];
+        if (self.start_token != null and std.mem.startsWith(u8, path, start_path_prefix)) {
+            return self.evaluateStart(method, path[start_path_prefix.len..]);
+        }
         if (!std.mem.eql(u8, path, self.path)) return .not_found;
         if (!std.mem.eql(u8, method, "GET")) return .bad_request;
         const query = if (query_start) |q| target[q + 1 ..] else "";
@@ -1048,7 +1195,7 @@ pub const Receiver = struct {
 
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
-        if (self.claimed or self.closing) return .bad_request;
+        if (self.claimed or self.closing or self.start_reused) return .bad_request;
         const url = try std.fmt.allocPrint(self.gpa, "http://127.0.0.1:{d}{s}", .{ self.port, target });
         self.claimed = true;
         claim.* = .{
@@ -1059,6 +1206,43 @@ pub const Receiver = struct {
         return .accepted;
     }
 
+    /// Decides the answer to a request of the start path. `text` is the part of the path after
+    /// `start_path_prefix`.
+    fn evaluateStart(self: *Receiver, method: []const u8, text: []const u8) Verdict {
+        const token = self.start_token orelse return .not_found;
+        // A different token gets 404 and does not stop the wait. Thus a guess cannot stop the
+        // sign-in. The length of a token is not secret, and the compare of the bytes takes the
+        // same time for each token of that length.
+        if (text.len != start_token_len) return .not_found;
+        if (!std.crypto.timing_safe.eql(StartToken, text[0..start_token_len].*, token)) return .not_found;
+        if (!std.mem.eql(u8, method, "GET")) return .bad_request;
+        const verdict = self.useStart();
+        if (verdict == .start_late) log.warn("the start URL of the sign-in received a second request after the redirect. Another program possibly signed in with a different account. To be sure, run logout and sign in again", .{});
+        return verdict;
+    }
+
+    /// Records a `GET` of the start path with the correct token, under the lock.
+    fn useStart(self: *Receiver) Verdict {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        // At the deadline, `stop` starts. Then the start path does not work, as the callback.
+        if (self.closing) return .not_found;
+        if (self.start_used) {
+            // The caller has the redirect, thus the sign-in cannot stop. The code of the
+            // redirect possibly is for the account of another program.
+            if (self.taken) return if (self.taken_code) .start_late else .not_found;
+            // Another program possibly opened the start URL. Stop the sign-in. The connection
+            // wakes the waiter after the page (`Connection.work`).
+            self.start_reused = true;
+            return .start_reused;
+        }
+        // The redirect came without the start URL: the user opened the URL of the sign-in
+        // line. The sign-in needs no second authorization request.
+        if (self.claimed) return .not_found;
+        self.start_used = true;
+        return .start;
+    }
+
     const page =
         \\<!doctype html>
         \\<html><head><meta charset="utf-8"><title>Sign-in</title></head>
@@ -1066,18 +1250,52 @@ pub const Receiver = struct {
         \\
     ;
 
-    fn responseFor(verdict: Verdict) []const u8 {
-        return switch (verdict) {
+    const start_reused_page =
+        \\<!doctype html>
+        \\<html><head><meta charset="utf-8"><title>Sign-in</title></head>
+        \\<body><p>The start URL of the sign-in received a second request, thus the bridge stopped the sign-in. Another program on the host of the bridge possibly opened the URL. Start the sign-in again. When this occurs again on a host that other users share, use the option --no-browser of the bridge. You can close this page.</p></body></html>
+        \\
+    ;
+
+    const start_late_page =
+        \\<!doctype html>
+        \\<html><head><meta charset="utf-8"><title>Sign-in</title></head>
+        \\<body><p>The start URL of the sign-in received a second request after the bridge received the redirect. Another program on the host of the bridge possibly signed in with a different account. To be sure, sign out with the logout command of the bridge, and sign in again. You can close this page.</p></body></html>
+        \\
+    ;
+
+    /// The head of a page of the receiver without `content-length`.
+    const page_head = "content-type: text/html; charset=utf-8\r\ncache-control: no-store\r\n" ++
+        "referrer-policy: no-referrer\r\nx-content-type-options: nosniff\r\n" ++
+        "content-security-policy: default-src 'none'\r\n";
+
+    /// Writes the response for `verdict`. Only the `Location` of the start path comes from
+    /// outside the receiver: it is the checked authorization URL, and it has no line end.
+    fn writeResponse(self: *const Receiver, out: *Io.Writer, verdict: Verdict) Io.Writer.Error!void {
+        const text: []const u8 = switch (verdict) {
             .accepted => std.fmt.comptimePrint(
-                "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncache-control: no-store\r\n" ++
-                    "referrer-policy: no-referrer\r\nx-content-type-options: nosniff\r\n" ++
-                    "content-security-policy: default-src 'none'\r\ncontent-length: {d}\r\nconnection: close\r\n\r\n{s}",
+                "HTTP/1.1 200 OK\r\n" ++ page_head ++ "content-length: {d}\r\nconnection: close\r\n\r\n{s}",
                 .{ page.len, page },
+            ),
+            .start => {
+                try out.writeAll("HTTP/1.1 303 See Other\r\nlocation: ");
+                try out.writeAll(self.start_location);
+                try out.writeAll("\r\ncache-control: no-store\r\nreferrer-policy: no-referrer\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                return;
+            },
+            .start_reused => std.fmt.comptimePrint(
+                "HTTP/1.1 410 Gone\r\n" ++ page_head ++ "content-length: {d}\r\nconnection: close\r\n\r\n{s}",
+                .{ start_reused_page.len, start_reused_page },
+            ),
+            .start_late => std.fmt.comptimePrint(
+                "HTTP/1.1 410 Gone\r\n" ++ page_head ++ "content-length: {d}\r\nconnection: close\r\n\r\n{s}",
+                .{ start_late_page.len, start_late_page },
             ),
             .not_found => "HTTP/1.1 404 Not Found\r\ncontent-type: text/plain\r\ncontent-length: 10\r\nconnection: close\r\n\r\nnot found\n",
             .bad_request => "HTTP/1.1 400 Bad Request\r\ncontent-type: text/plain\r\ncontent-length: 12\r\nconnection: close\r\n\r\nbad request\n",
             .too_large => "HTTP/1.1 431 Request Header Fields Too Large\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
         };
+        try out.writeAll(text);
     }
 
     /// One connection. The connection task supervises the time limit, and a worker task reads
@@ -1145,9 +1363,13 @@ pub const Receiver = struct {
             const r = conn.receiver;
             const io = r.io;
             var claim: ?Callback = null;
+            // A second `GET` of the start path must wake the waiter.
+            var reused = false;
             defer {
-                // A claimed redirect always reaches the waiter, also after a failed write.
+                // A claimed redirect and the stop of a second `GET` of the start path always
+                // reach the waiter, also after a failed write.
                 if (claim) |callback| r.publish(callback);
+                if (reused) r.done.set(io);
                 conn.finished.store(true, .release);
                 conn.wake.set(io);
             }
@@ -1174,15 +1396,22 @@ pub const Receiver = struct {
                 },
                 error.HttpRequestTruncated, error.ReadFailed => return,
             };
+            reused = verdict == .start_reused;
             const out = &socket_writer.interface;
-            out.writeAll(responseFor(verdict)) catch return;
+            r.writeResponse(out, verdict) catch return;
             out.flush() catch return;
-            // The response is out. Thus the browser has the page before the receiver stops.
+            // The response is out. Thus the browser has the page before the receiver stops. The
+            // close grace starts first, because `stop` gives no grace to a connection without
+            // a response.
+            conn.startCloseGrace();
             if (claim) |callback| {
                 claim = null;
                 r.publish(callback);
             }
-            conn.startCloseGrace();
+            if (reused) {
+                reused = false;
+                r.done.set(io);
+            }
             _ = socket_reader.interface.discardRemaining() catch return;
             conn.client_closed = true;
         }
@@ -1227,6 +1456,9 @@ pub const Reason = enum {
     denied,
     /// The redirect has a different error.
     authorization_error,
+    /// The start URL got a second `GET`. Another program possibly opened it, thus the bridge
+    /// stopped the sign-in.
+    start_reused,
     /// An Io cancel stopped the sign-in, for example the cancel of the request.
     canceled,
     /// `SignIn.abort` stopped the sign-in, for example at the end of the input of the client.
@@ -1249,6 +1481,7 @@ fn textOf(reason: Reason) Text {
         .timeout => .{ .message = "The sign-in did not complete in {seconds} s." },
         .denied => .{ .message = "The authorization server refused the access." },
         .authorization_error => .{ .message = "The authorization server sent an error for the sign-in." },
+        .start_reused => .{ .message = "The start URL of the sign-in received a second request, thus the bridge stopped the sign-in. Another program on the host of the bridge possibly opened the URL. Start the sign-in again. When this occurs again on a host that other users share, use --no-browser." },
         .canceled => .{ .message = "The request stopped before the sign-in completed." },
         .closed => .{ .message = "The client closed the connection before the sign-in completed." },
     };
@@ -1315,11 +1548,16 @@ pub const Failure = struct {
 ///
 /// 1. It checks the authorization URL with `validateAuthorizationUrl`, and with `Opener.check`
 ///    when the opener has it.
-/// 2. It starts a `Receiver` on the redirect port before the browser opens.
-/// 3. It writes the line `<name>: sign in at <url>` to the output one time.
-/// 4. It opens the browser, unless `no_browser` is set.
-/// 5. It waits for the redirect until the time limit, a cancel or `abort`. Then it calls
-///    `Opener.finish` when the opener has it.
+/// 2. It gets the destination of the URL from `Opener.delivery`. For a browser, it makes a
+///    random start token with `newStartToken`.
+/// 3. It starts a `Receiver` on the redirect port before the browser opens. For a browser,
+///    the receiver also serves the start path `/start/<token>`.
+/// 4. It writes the line `<name>: sign in at <url>` to the output one time. The line has the
+///    authorization URL. Thus the user can open it when the browser does not open.
+/// 5. It opens the URL, unless `no_browser` is set. A browser gets only the start URL
+///    `http://127.0.0.1:<port>/start/<token>`. The user gets the authorization URL.
+/// 6. It waits for the redirect until the time limit, a cancel or `abort`. A second `GET` of
+///    the start URL also ends the wait. Then it calls `Opener.finish` when the opener has it.
 ///
 /// The callback records the cause of each failure (`lastFailure`) and writes the message of
 /// the failure to stderr. `OAuthClient` gives the error of the callback to the transport as
@@ -1345,7 +1583,10 @@ pub const SignIn = struct {
         redirect_port: u16 = default_redirect_port,
         /// The time limit of one sign-in, from the start of the receiver.
         timeout: Io.Duration = .fromSeconds(default_sign_in_timeout_s),
-        /// Write the sign-in line only, and open no browser.
+        /// Write the sign-in line only, and open no browser. The receiver then serves no start
+        /// path, and the user opens the URL of the sign-in line. The command line option
+        /// `--no-browser` does not set it: it sets `Authorizer.Options.no_browser`. The top of
+        /// this file tells the risk that stays on a host with other users.
         no_browser: bool = false,
         /// The opener of the browser. The bridge gives `SystemOpener.opener` with its
         /// environment, thus the browser gets no secret of the environment.
@@ -1441,10 +1682,27 @@ pub const SignIn = struct {
         // The defers below run first. Thus the receiver is closed when `finish` runs.
         defer if (opener.finish) |finish| finish(opener.context, self.failureReason());
 
+        // A browser gets the one-time start URL, and never the authorization URL. Without a
+        // token, the bridge does not open the browser: the user opens the URL of the line.
+        const delivery: Delivery = if (self.options.no_browser) .none else if (opener.delivery) |d| d(opener.context) else .browser;
+        var token: ?StartToken = null;
+        defer if (token) |*t| std.crypto.secureZero(u8, t);
+        if (delivery == .browser) {
+            token = newStartToken(io) catch |e| switch (e) {
+                error.Canceled => {
+                    canceled.* = true;
+                    return self.fail(.{ .reason = .canceled });
+                },
+                error.EntropyUnavailable => null,
+            };
+            if (token == null) log.warn("the bridge has no random data for the start URL, thus it does not open the browser", .{});
+        }
+
         var receiver: Receiver = undefined;
         receiver.start(io, self.gpa, .{
             .port = self.options.redirect_port,
             .state = state,
+            .start = if (token) |t| .{ .token = t, .location = url } else null,
             .limits = self.options.limits,
         }) catch |e| switch (e) {
             error.AddressInUse => return self.fail(.{ .reason = .address_in_use, .port = self.options.redirect_port }),
@@ -1465,7 +1723,13 @@ pub const SignIn = struct {
         const deadline: Io.Clock.Timestamp = .fromNow(io, .{ .raw = self.options.timeout, .clock = .awake });
         var browser_failed = false;
         if (!self.options.no_browser) {
-            opener.open(opener.context, io, url) catch |e| switch (e) {
+            var start_buf: [max_start_url_len]u8 = undefined;
+            const target: ?[]const u8 = switch (delivery) {
+                .browser => if (token) |*t| writeStartUrl(&start_buf, receiver.port, t) else null,
+                .user, .none => url,
+            };
+            const opened: OpenerError!void = if (target) |t| opener.open(opener.context, io, t) else error.BrowserLaunchFailed;
+            opened catch |e| switch (e) {
                 error.BrowserLaunchFailed => {
                     browser_failed = true;
                     if (self.options.opener_failure_fatal) return self.fail(.{ .reason = .browser_launch_failed });
@@ -1482,6 +1746,7 @@ pub const SignIn = struct {
                 .browser_failed = browser_failed,
             }),
             error.Aborted => return self.fail(.{ .reason = .closed }),
+            error.StartReused => return self.fail(.{ .reason = .start_reused }),
             error.Canceled => {
                 canceled.* = true;
                 return self.fail(.{ .reason = .canceled });
@@ -1594,10 +1859,12 @@ pub const default_consent_cooldown_s: u32 = 60;
 /// `SignIn`, which must have `no_browser = false`.
 ///
 /// - Before `notifications/initialized`, the gate opens the browser directly. This is the
-///   first sign-in, and the user configured the server for it.
+///   first sign-in, and the user configured the server for it. The browser gets the start URL
+///   (`Delivery.browser`).
 /// - After it (`useConsent`), the gate never opens the browser. It asks the client through
-///   `Consent`, and the client asks the user. After the redirect, the client gets the
-///   completion of its elicitation. Without `Consent`, each sign-in fails at once.
+///   `Consent`, and the client asks the user. The client gets the authorization URL
+///   (`Delivery.user`). After the redirect, the client gets the completion of its
+///   elicitation. Without `Consent`, each sign-in fails at once.
 /// - When the user declined a sign-in through the client, the gate asks no new question until
 ///   the cooldown ends. The same applies when such a sign-in failed after the question. The
 ///   cooldown applies to all scopes, because the upstream server chooses the scopes of each
@@ -1636,7 +1903,7 @@ pub const Gate = struct {
 
     /// The opener of the gate. The gate must stay at the same address while a sign-in uses it.
     pub fn opener(self: *Gate) Opener {
-        return .{ .context = self, .open = open, .check = check, .finish = finish };
+        return .{ .context = self, .open = open, .check = check, .delivery = delivery, .finish = finish };
     }
 
     /// Call it after `notifications/initialized`. From now on, the gate asks the user through
@@ -1658,6 +1925,20 @@ pub const Gate = struct {
         const consent = self.consent orelse return error.NoConsent;
         if (nowNs(self.io) < self.cooldown_until) return error.Cooldown;
         self.flow_consent = consent;
+    }
+
+    /// The destination of the sign-in that `check` accepted. The client gets the authorization
+    /// URL (`Delivery.user`), because the user must see the full URL before the consent. The
+    /// direct opener gets the start URL. Without a direct opener, the gate opens nothing.
+    fn delivery(context: ?*anyopaque) Delivery {
+        const self: *Gate = @ptrCast(@alignCast(context.?));
+        self.lock.lockUncancelable(self.io);
+        const asks = self.flow_consent != null;
+        self.lock.unlock(self.io);
+        if (asks) return .user;
+        const direct = self.direct orelse return .none;
+        const d = direct.delivery orelse return .browser;
+        return d(direct.context);
     }
 
     fn open(context: ?*anyopaque, io: Io, url: []const u8) OpenerError!void {
@@ -1823,7 +2104,8 @@ pub const Authorizer = struct {
         /// The time limit of one sign-in.
         timeout: Io.Duration = .fromSeconds(default_sign_in_timeout_s),
         /// Before `notifications/initialized`, write the sign-in line only and open no
-        /// browser.
+        /// browser. The receiver then serves no start path. After it, the client gets the
+        /// authorization URL also with this setting. This is `--no-browser`.
         no_browser: bool = false,
         /// The opener of the browser before `notifications/initialized`.
         opener: Opener = .system,
@@ -2956,6 +3238,21 @@ test "on Windows, the variables with secrets leave the environment of the proces
 const TestResponse = struct {
     status: u16,
     location: ?[]const u8 = null,
+    /// The whole head, in the arena of the request.
+    head: []const u8 = "",
+    /// The body of a response with `content-length`, in the arena of the request.
+    body: []const u8 = "",
+
+    /// The value of the header `name`, or null.
+    fn header(self: TestResponse, name: []const u8) ?[]const u8 {
+        var lines = std.mem.splitSequence(u8, self.head, "\r\n");
+        _ = lines.next();
+        while (lines.next()) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            if (std.ascii.eqlIgnoreCase(line[0..colon], name)) return std.mem.trim(u8, line[colon + 1 ..], " ");
+        }
+        return null;
+    }
 };
 
 /// Sends `request` to `127.0.0.1:<port>` on a new connection and reads the response head.
@@ -2975,17 +3272,19 @@ fn testReadHead(io: Io, arena: Allocator, stream: Io.net.Stream) !TestResponse {
     const in_buf = try arena.alloc(u8, 16 * 1024);
     var socket_reader = stream.reader(io, in_buf);
     var http_reader: std.http.Reader = .{ .in = &socket_reader.interface, .interface = undefined, .state = .ready, .max_head_len = in_buf.len };
-    const head = try http_reader.receiveHead();
+    const head = try arena.dupe(u8, try http_reader.receiveHead());
     if (head.len < 12 or !std.mem.startsWith(u8, head, "HTTP/1.")) return error.InvalidResponse;
     const status = try std.fmt.parseInt(u16, head[9..12], 10);
-    var location: ?[]const u8 = null;
-    var lines = std.mem.splitSequence(u8, head, "\r\n");
-    _ = lines.next();
-    while (lines.next()) |line| {
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-        if (std.ascii.eqlIgnoreCase(line[0..colon], "location")) location = try arena.dupe(u8, std.mem.trim(u8, line[colon + 1 ..], " "));
+    var response: TestResponse = .{ .status = status, .head = head };
+    response.location = response.header("location");
+    // A test that needs the body checks it. A reset after the head only loses the body.
+    if (response.header("content-length")) |text| {
+        const body = try arena.alloc(u8, try std.fmt.parseInt(usize, text, 10));
+        if (socket_reader.interface.readSliceAll(body)) |_| {
+            response.body = body;
+        } else |_| {}
     }
-    return .{ .status = status, .location = location };
+    return response;
 }
 
 /// The port and the target of an `http://127.0.0.1:<port>/...` URL.
@@ -3258,6 +3557,221 @@ test "the wait gives a redirect that came before it, then Timeout at once, and A
     try testing.expectError(error.Aborted, r.wait(testDeadline(io, 60_000)));
 }
 
+/// A start token for the receiver tests.
+const test_token: StartToken = ("0123456789" ** 4 ++ "abc").*;
+const test_location = "https://as.example/authorize?response_type=code&client_id=c1&state=st&code_challenge=abc&code_challenge_method=S256";
+
+fn testStartRequest(arena: Allocator, method: []const u8, path: []const u8) ![]const u8 {
+    return std.fmt.allocPrint(arena, "{s} {s} HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n\r\n", .{ method, path });
+}
+
+test "the first GET of the start path gets 303 to the authorization URL, and a second GET ends the wait" {
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var r: Receiver = undefined;
+    try r.start(io, testing.allocator, .{ .port = 0, .state = "st", .start = .{ .token = test_token, .location = test_location }, .limits = test_limits });
+    defer r.stop();
+    const path = start_path_prefix ++ test_token;
+
+    // Only GET uses the start path. HEAD and POST get 400 and do not use it.
+    try testing.expectEqual(@as(u16, 400), (try testExchange(io, arena, r.port, try testStartRequest(arena, "HEAD", path))).status);
+    try testing.expectEqual(@as(u16, 400), (try testExchange(io, arena, r.port, try testStartRequest(arena, "POST", path))).status);
+
+    // The first GET: 303 See Other to the authorization URL, no store, no referrer, no body.
+    const first = try testExchange(io, arena, r.port, try testStartRequest(arena, "GET", path));
+    try testExpectStartResponse(first);
+    try testing.expectEqualStrings(test_location, first.location.?);
+    try testing.expectEqual(@as(usize, 0), first.body.len);
+    try testing.expectError(error.Timeout, r.wait(testDeadline(io, 100)));
+
+    // The second GET: an error page that tells the user to start the sign-in again, and the
+    // wait ends at once.
+    const second = try testExchange(io, arena, r.port, try testStartRequest(arena, "GET", path ++ "?x=1"));
+    try testing.expectEqual(@as(u16, 410), second.status);
+    try testing.expect(second.location == null);
+    try testing.expectEqualStrings("no-store", second.header("cache-control").?);
+    try testing.expect(std.mem.startsWith(u8, second.header("content-type").?, "text/html"));
+    try testing.expect(std.mem.indexOf(u8, second.body, "Start the sign-in again.") != null);
+    try testing.expect(std.mem.indexOf(u8, second.body, "--no-browser") != null);
+    try testing.expectError(error.StartReused, r.wait(testDeadline(io, 5000)));
+
+    // After that, the redirect does not end the sign-in, and each GET of the start path gets
+    // the error page.
+    try testing.expectEqual(@as(u16, 400), try testGet(io, arena, r.port, "/callback?code=c&state=st"));
+    try testing.expectEqual(@as(u16, 410), try testGet(io, arena, r.port, path));
+    try testing.expectError(error.StartReused, r.wait(testDeadline(io, 5000)));
+}
+
+test "a different start token gets 404 and does not end the wait" {
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var r: Receiver = undefined;
+    try r.start(io, testing.allocator, .{ .port = 0, .state = "st", .start = .{ .token = test_token, .location = test_location }, .limits = test_limits });
+    defer r.stop();
+
+    // One different character at the start, in the middle and at the end, a different case, a
+    // shorter and a longer token, and no token. The compare takes the same time for each token
+    // of the correct length. A guess never ends the wait.
+    var wrong: std.ArrayList([]const u8) = .empty;
+    for ([_]usize{ 0, start_token_len / 2, start_token_len - 1 }) |i| {
+        var token = test_token;
+        token[i] = if (token[i] == 'z') 'y' else 'z';
+        try wrong.append(arena, try arena.dupe(u8, &token));
+    }
+    try wrong.append(arena, "0123456789" ** 4 ++ "ABC");
+    try wrong.append(arena, test_token[0 .. start_token_len - 1]);
+    try wrong.append(arena, test_token ++ "d");
+    try wrong.append(arena, "");
+    for (wrong.items) |token| {
+        const target = try std.mem.concat(arena, u8, &.{ start_path_prefix, token });
+        try testing.expectEqual(@as(u16, 404), try testGet(io, arena, r.port, target));
+    }
+    try testing.expectEqual(@as(u16, 404), try testGet(io, arena, r.port, "/start"));
+    try testing.expectEqual(@as(u16, 404), try testGet(io, arena, r.port, "/start/" ++ test_token ++ "/x"));
+    try testing.expectError(error.Timeout, r.wait(testDeadline(io, 100)));
+
+    // The start path still works one time, and the redirect ends the wait.
+    const first = try testExchange(io, arena, r.port, try testStartRequest(arena, "GET", start_path_prefix ++ test_token));
+    try testExpectStartResponse(first);
+    try testing.expectEqual(@as(u16, 200), try testGet(io, arena, r.port, "/callback?code=c&state=st"));
+    var callback = try r.wait(testDeadline(io, 5000));
+    callback.deinit(testing.allocator);
+}
+
+test "the start path refuses a GET after a redirect without the start URL" {
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var r: Receiver = undefined;
+    try r.start(io, testing.allocator, .{ .port = 0, .state = "st", .start = .{ .token = test_token, .location = test_location }, .limits = test_limits });
+    defer r.stop();
+    // The user opened the URL of the sign-in line, and the redirect came first. A late GET of
+    // the start path gets no second authorization request, and the redirect stays.
+    try testing.expectEqual(@as(u16, 200), try testGet(io, arena, r.port, "/callback?code=c&state=st"));
+    try testing.expectEqual(@as(u16, 404), try testGet(io, arena, r.port, start_path_prefix ++ test_token));
+    var callback = try r.wait(testDeadline(io, 5000));
+    defer callback.deinit(testing.allocator);
+    try testing.expectEqual(Receiver.Callback.Outcome.code, callback.outcome);
+}
+
+test "a second GET of the start path wakes a wait that waits, and its page arrives before the stop" {
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const path = start_path_prefix ++ test_token;
+    // Waits for the redirect with a long deadline, and stops the receiver at once after the
+    // wait, as `SignIn` does.
+    const Waiter = struct {
+        receiver: *Receiver,
+        waits: Io.Event = .unset,
+
+        fn run(self: *@This()) Receiver.WaitError!void {
+            defer self.receiver.stop();
+            self.waits.set(testing.io);
+            var callback = try self.receiver.wait(testDeadline(testing.io, 30_000));
+            callback.deinit(testing.allocator);
+        }
+    };
+    for (0..5) |_| {
+        var r: Receiver = undefined;
+        try r.start(io, testing.allocator, .{ .port = 0, .state = "st", .start = .{ .token = test_token, .location = test_location }, .limits = test_limits });
+        var waiter: Waiter = .{ .receiver = &r };
+        var task = try io.concurrent(Waiter.run, .{&waiter});
+        var awaited = false;
+        defer if (!awaited) task.cancel(io) catch {};
+        // The waiter waits in `wait` before the two requests, as `SignIn` after the opener.
+        if (!try waitUntil(io, &waiter.waits, testDeadline(io, 5000))) return error.TestUnexpectedResult;
+        try io.sleep(.fromMilliseconds(100), .awake);
+        try testExpectStartResponse(try testExchange(io, arena, r.port, try testStartRequest(arena, "GET", path)));
+
+        // The second GET wakes the waiter. The waiter stops the receiver at once, but the
+        // receiver sent the whole page first.
+        const start = nowNs(io);
+        const second = try testExchange(io, arena, r.port, try testStartRequest(arena, "GET", path));
+        try testing.expectEqual(@as(u16, 410), second.status);
+        try testing.expect(std.mem.indexOf(u8, second.body, "Start the sign-in again.") != null);
+        awaited = true;
+        try testing.expectError(error.StartReused, task.await(io));
+        // The deadline of the wait is 30 s. Only the wake can end it in this time.
+        try testing.expect(nowNs(io) - start < 5 * std.time.ns_per_s);
+    }
+}
+
+test "a second GET of the start path after the caller took a redirect with a code writes a warning and stops nothing" {
+    const saved_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = saved_level;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const path = start_path_prefix ++ test_token;
+    {
+        // Another program sent the first GET and the redirect, and the caller took the
+        // redirect. The sign-in cannot stop now. Thus the late GET of the browser of the user
+        // gets a page that tells the user about the different account.
+        var r: Receiver = undefined;
+        try r.start(io, testing.allocator, .{ .port = 0, .state = "st", .start = .{ .token = test_token, .location = test_location }, .limits = test_limits });
+        defer r.stop();
+        try testExpectStartResponse(try testExchange(io, arena, r.port, try testStartRequest(arena, "GET", path)));
+        try testing.expectEqual(@as(u16, 200), try testGet(io, arena, r.port, "/callback?code=c&state=st"));
+        var callback = try r.wait(testDeadline(io, 5000));
+        defer callback.deinit(testing.allocator);
+        try testing.expectEqual(Receiver.Callback.Outcome.code, callback.outcome);
+        const late = try testExchange(io, arena, r.port, try testStartRequest(arena, "GET", path));
+        try testing.expectEqual(@as(u16, 410), late.status);
+        try testing.expectEqualStrings("no-store", late.header("cache-control").?);
+        try testing.expect(std.mem.indexOf(u8, late.body, "different account") != null);
+        try testing.expect(std.mem.indexOf(u8, late.body, "stopped") == null);
+        // The caller keeps the redirect, and a new wait gives Timeout at once.
+        const start = nowNs(io);
+        try testing.expectError(error.Timeout, r.wait(testDeadline(io, 60_000)));
+        try testing.expect(nowNs(io) - start < std.time.ns_per_s);
+    }
+    {
+        // After a redirect with an error, the sign-in fails anyway. A late GET gets 404.
+        var r: Receiver = undefined;
+        try r.start(io, testing.allocator, .{ .port = 0, .state = "st", .start = .{ .token = test_token, .location = test_location }, .limits = test_limits });
+        defer r.stop();
+        try testExpectStartResponse(try testExchange(io, arena, r.port, try testStartRequest(arena, "GET", path)));
+        try testing.expectEqual(@as(u16, 200), try testGet(io, arena, r.port, "/callback?error=access_denied&state=st"));
+        var callback = try r.wait(testDeadline(io, 5000));
+        defer callback.deinit(testing.allocator);
+        try testing.expectEqual(Receiver.Callback.Outcome.denied, callback.outcome);
+        try testing.expectEqual(@as(u16, 404), try testGet(io, arena, r.port, path));
+    }
+    {
+        // Before the caller took the redirect, the same order stops the wait. The stop wins
+        // over the redirect.
+        var r: Receiver = undefined;
+        try r.start(io, testing.allocator, .{ .port = 0, .state = "st", .start = .{ .token = test_token, .location = test_location }, .limits = test_limits });
+        defer r.stop();
+        try testExpectStartResponse(try testExchange(io, arena, r.port, try testStartRequest(arena, "GET", path)));
+        try testing.expectEqual(@as(u16, 200), try testGet(io, arena, r.port, "/callback?code=c&state=st"));
+        try testing.expectEqual(@as(u16, 410), try testGet(io, arena, r.port, path));
+        try testing.expectError(error.StartReused, r.wait(testDeadline(io, 5000)));
+    }
+}
+
+test "a receiver without a start path answers each start path with 404" {
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var r: Receiver = undefined;
+    try r.start(io, testing.allocator, .{ .port = 0, .state = "st", .limits = test_limits });
+    defer r.stop();
+    try testing.expectEqual(@as(u16, 404), try testGet(io, arena, r.port, start_path_prefix ++ test_token));
+    try testing.expectEqual(@as(u16, 404), try testGet(io, arena, r.port, start_path_prefix ++ test_token));
+    try testing.expectError(error.Timeout, r.wait(testDeadline(io, 100)));
+}
+
 // -- SignIn tests -----------------------------------------------------------------------------
 
 /// Keeps the lines of `SignIn` and sets `written` at each line.
@@ -3291,17 +3805,27 @@ const TestBrowser = struct {
     /// The redirect port of the sign-in, for `redirect_code` and `redirect_denied`.
     port: u16 = 0,
     calls: std.atomic.Value(u32) = .init(0),
+    /// The URL that the opener got.
     url: std.ArrayList(u8) = .empty,
+    /// The `Location` of the first `GET` of the start URL, or empty.
+    location: std.ArrayList(u8) = .empty,
     opened: Io.Event = .unset,
+    /// Set after the first `GET` of the start URL in the mode `start_once`.
+    resolved: Io.Event = .unset,
     status: u16 = 0,
 
     const Mode = enum {
         /// GET the URL and follow the redirects into the receiver.
         follow,
-        /// Send the redirect with a code and the state of the URL to the receiver.
+        /// Send the redirect with a code and the state of the authorization URL to the
+        /// receiver.
         redirect_code,
         /// Send the redirect with `error=access_denied` to the receiver.
         redirect_denied,
+        /// GET the start URL two times, and keep the status of the second response.
+        start_twice,
+        /// GET the start URL one time, set `resolved` and send no redirect.
+        start_once,
         /// Only record the call.
         record,
         /// Give `BrowserLaunchFailed`.
@@ -3326,7 +3850,8 @@ const TestBrowser = struct {
         switch (self.mode) {
             .follow => self.status = testFollow(io, arena, url) catch 0,
             .redirect_code, .redirect_denied => {
-                const params = auth.common.parseQuery(arena, url) catch return error.BrowserLaunchFailed;
+                const authorization_url = self.resolveStart(io, arena, url) catch return error.BrowserLaunchFailed;
+                const params = auth.common.parseQuery(arena, authorization_url) catch return error.BrowserLaunchFailed;
                 const state = params.get("state") orelse return error.BrowserLaunchFailed;
                 const target = std.fmt.allocPrint(arena, "/callback?{s}&state={s}", .{
                     if (self.mode == .redirect_code) "code=test-code" else "error=access_denied",
@@ -3334,16 +3859,64 @@ const TestBrowser = struct {
                 }) catch return error.BrowserLaunchFailed;
                 self.status = testGet(io, arena, self.port, target) catch 0;
             },
+            .start_twice => {
+                _ = self.resolveStart(io, arena, url) catch return error.BrowserLaunchFailed;
+                const parts = testSplitUrl(url) catch return error.BrowserLaunchFailed;
+                self.status = testGet(io, arena, parts.port, parts.target) catch 0;
+            },
+            .start_once => {
+                _ = self.resolveStart(io, arena, url) catch return error.BrowserLaunchFailed;
+                self.resolved.set(io);
+            },
             .record => {},
             .fail => return error.BrowserLaunchFailed,
             .decline => return error.Declined,
         }
     }
 
+    /// The authorization URL behind the start URL `url`: the `Location` of its first `GET`.
+    /// The response must have the headers of the start path.
+    fn resolveStart(self: *TestBrowser, io: Io, arena: Allocator, url: []const u8) ![]const u8 {
+        const parts = try testSplitUrl(url);
+        if (!std.mem.startsWith(u8, parts.target, start_path_prefix)) return error.NotStartUrl;
+        const request = try std.fmt.allocPrint(arena, "GET {s} HTTP/1.1\r\nhost: 127.0.0.1:{d}\r\n\r\n", .{ parts.target, parts.port });
+        const response = try testExchange(io, arena, parts.port, request);
+        try testExpectStartResponse(response);
+        const location = response.location.?;
+        self.location.clearRetainingCapacity();
+        try self.location.appendSlice(testing.allocator, location);
+        return location;
+    }
+
     fn deinit(self: *TestBrowser) void {
         self.url.deinit(testing.allocator);
+        self.location.deinit(testing.allocator);
     }
 };
+
+/// Checks the response to the first `GET` of a start path. It must have the status 303 and a
+/// `Location`. It also must have no store, no referrer, no body and the end of the connection.
+fn testExpectStartResponse(response: TestResponse) !void {
+    try testing.expectEqual(@as(u16, 303), response.status);
+    try testing.expect(response.location != null);
+    try testing.expectEqualStrings("no-store", response.header("cache-control").?);
+    try testing.expectEqualStrings("no-referrer", response.header("referrer-policy").?);
+    try testing.expectEqualStrings("0", response.header("content-length").?);
+    try testing.expectEqualStrings("close", response.header("connection").?);
+}
+
+/// Checks that `url` is a start URL on `port`. Its token must have `start_token_len` base64url
+/// characters, and the URL must have no query. Returns the token.
+fn testExpectStartUrl(url: []const u8, port: u16) ![]const u8 {
+    var buf: [64]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&buf, "http://127.0.0.1:{d}" ++ start_path_prefix, .{port});
+    try testing.expect(std.mem.startsWith(u8, url, prefix));
+    const token = url[prefix.len..];
+    try testing.expectEqual(start_token_len, token.len);
+    for (token) |c| try testing.expect(std.ascii.isAlphanumeric(c) or c == '-' or c == '_');
+    try testing.expect(std.mem.indexOfScalar(u8, url, '?') == null);
+    return token;
+}
 
 fn testAuthorizationUrl(arena: Allocator, port: u16, state: []const u8) ![]const u8 {
     var buf: [max_redirect_uri_len]u8 = undefined;
@@ -3356,7 +3929,7 @@ fn testAuthorizationUrl(arena: Allocator, port: u16, state: []const u8) ![]const
     return aw.written();
 }
 
-test "a sign-in writes one line, opens the URL one time and returns the redirect" {
+test "a sign-in writes one line, opens the start URL one time and returns the redirect" {
     const io = testing.io;
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
@@ -3378,13 +3951,152 @@ test "a sign-in writes one line, opens the URL one time and returns the redirect
     const redirect = try sign_in.run(arena, url);
     const want = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/callback?code=test-code&state=state-1", .{port});
     try testing.expectEqualStrings(want, redirect);
+    // The line has the authorization URL, thus the user can open it without the browser.
     try testing.expectEqual(@as(usize, 1), out.count);
     const line = try std.fmt.allocPrint(arena, "mcp-bridge-test: sign in at {s}\n", .{url});
     try testing.expectEqualStrings(line, out.lines.items);
+    // The browser got only the start URL: no state and no code challenge. Its first GET gave
+    // the authorization URL.
     try testing.expectEqual(@as(u32, 1), browser.calls.load(.acquire));
-    try testing.expectEqualStrings(url, browser.url.items);
+    const first_token = try arena.dupe(u8, try testExpectStartUrl(browser.url.items, port));
+    try testing.expect(std.mem.indexOf(u8, browser.url.items, "state") == null);
+    try testing.expect(std.mem.indexOf(u8, browser.url.items, "code_challenge") == null);
+    try testing.expectEqualStrings(url, browser.location.items);
     try testing.expectEqual(@as(u16, 200), browser.status);
     try testing.expect(sign_in.lastFailure() == null);
+
+    // Each sign-in has a new token.
+    _ = try sign_in.run(arena, try testAuthorizationUrl(arena, port, "state-2"));
+    try testing.expectEqual(@as(u32, 2), browser.calls.load(.acquire));
+    try testing.expect(!std.mem.eql(u8, first_token, try testExpectStartUrl(browser.url.items, port)));
+}
+
+test "a start token has 256 random bits in base64url, and each token is new" {
+    const io = testing.io;
+    try testing.expectEqual(@as(usize, 43), start_token_len);
+    try testing.expect(start_token_bytes * 8 >= 128);
+    var tokens: [8]StartToken = undefined;
+    for (&tokens, 0..) |*t, i| {
+        t.* = try newStartToken(io);
+        for (t) |c| try testing.expect(std.ascii.isAlphanumeric(c) or c == '-' or c == '_');
+        var decoded: [start_token_bytes]u8 = undefined;
+        try std.base64.url_safe_no_pad.Decoder.decode(&decoded, t);
+        for (tokens[0..i]) |*other| try testing.expect(!std.mem.eql(u8, other, t));
+    }
+    var buf: [max_start_url_len]u8 = undefined;
+    const url = writeStartUrl(&buf, default_redirect_port, &tokens[0]);
+    try testing.expectEqualStrings(try testExpectStartUrl(url, default_redirect_port), &tokens[0]);
+    try testing.expectEqual(max_start_url_len, writeStartUrl(&buf, 65535, &tokens[1]).len);
+}
+
+test "a second GET of the start URL stops the sign-in with the reason start_reused" {
+    const saved_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = saved_level;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const port = try testFreePort(io);
+    var out: TestOutput = .{};
+    defer out.deinit();
+    var browser: TestBrowser = .{ .mode = .start_twice };
+    defer browser.deinit();
+    var sign_in: SignIn = .init(io, testing.allocator, .{ .name = "t", .redirect_port = port, .opener = browser.opener(), .output = out.output(), .limits = test_limits, .timeout = .fromSeconds(10) });
+    const url = try testAuthorizationUrl(arena, port, "st");
+    const start = nowNs(io);
+    try testing.expectError(error.SignInFailed, sign_in.run(arena, url));
+    // The wait ended at the second GET, and not at the time limit.
+    try testing.expect(nowNs(io) - start < 5 * std.time.ns_per_s);
+    const failure = sign_in.lastFailure().?;
+    try testing.expectEqual(Reason.start_reused, failure.reason);
+    try testing.expectEqualStrings(url, browser.location.items);
+    try testing.expectEqual(@as(u16, 410), browser.status);
+    const message = try std.fmt.allocPrint(arena, "{f}", .{&failure});
+    try testing.expect(std.mem.indexOf(u8, message, "second request") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "Start the sign-in again.") != null);
+    // The message names the host of the bridge and the option to use.
+    try testing.expect(std.mem.indexOf(u8, message, "on the host of the bridge") != null);
+    try testing.expect(std.mem.indexOf(u8, message, "--no-browser") != null);
+}
+
+test "a second GET of the start URL during the wait stops the sign-in at once" {
+    const saved_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = saved_level;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const port = try testFreePort(io);
+    var out: TestOutput = .{};
+    defer out.deinit();
+    // The browser sends only the first GET. The opener returns, and the sign-in waits.
+    var browser: TestBrowser = .{ .mode = .start_once };
+    defer browser.deinit();
+    const timeout: Io.Duration = .fromSeconds(30);
+    var sign_in: SignIn = .init(io, testing.allocator, .{ .name = "t", .redirect_port = port, .opener = browser.opener(), .output = out.output(), .limits = test_limits, .timeout = timeout });
+    // Another program sends the second GET while the sign-in waits.
+    const Other = struct {
+        status: u16 = 0,
+        page: std.ArrayList(u8) = .empty,
+
+        fn run(self: *@This(), b: *TestBrowser) void {
+            const tio = testing.io;
+            if (!(waitUntil(tio, &b.resolved, testDeadline(tio, 10_000)) catch false)) return;
+            tio.sleep(.fromMilliseconds(200), .awake) catch return;
+            var a: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer a.deinit();
+            const parts = testSplitUrl(b.url.items) catch return;
+            const request = testStartRequest(a.allocator(), "GET", parts.target) catch return;
+            const response = testExchange(tio, a.allocator(), parts.port, request) catch return;
+            self.status = response.status;
+            self.page.appendSlice(testing.allocator, response.body) catch {};
+        }
+    };
+    var other: Other = .{};
+    defer other.page.deinit(testing.allocator);
+    var task = try io.concurrent(Other.run, .{ &other, &browser });
+    var awaited = false;
+    defer if (!awaited) task.await(io);
+    const start = nowNs(io);
+    try testing.expectError(error.SignInFailed, sign_in.run(arena, try testAuthorizationUrl(arena, port, "st")));
+    const elapsed = nowNs(io) - start;
+    awaited = true;
+    task.await(io);
+    try testing.expectEqual(Reason.start_reused, sign_in.lastFailure().?.reason);
+    // The time limit of the sign-in is 30 s. Only the second GET can end it this early.
+    try testing.expect(elapsed < 5 * std.time.ns_per_s);
+    // The other program got the whole page, although the sign-in stopped the receiver.
+    try testing.expectEqual(@as(u16, 410), other.status);
+    try testing.expect(std.mem.indexOf(u8, other.page.items, "Start the sign-in again.") != null);
+}
+
+test "the start URL stops working at the deadline, as the callback" {
+    const saved_level = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = saved_level;
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const port = try testFreePort(io);
+    var out: TestOutput = .{};
+    defer out.deinit();
+    var silent: TestBrowser = .{ .mode = .record };
+    defer silent.deinit();
+    var sign_in: SignIn = .init(io, testing.allocator, .{ .name = "t", .redirect_port = port, .opener = silent.opener(), .output = out.output(), .limits = test_limits, .timeout = .fromMilliseconds(300) });
+    try testing.expectError(error.SignInFailed, sign_in.run(arena, try testAuthorizationUrl(arena, port, "st")));
+    try testing.expectEqual(Reason.timeout, sign_in.lastFailure().?.reason);
+    // After the deadline, the receiver closed the port: a new receiver can listen on it. The
+    // old start URL then gets 404 and no redirect, and it does not end the new wait.
+    _ = try testExpectStartUrl(silent.url.items, port);
+    const parts = try testSplitUrl(silent.url.items);
+    var next: Receiver = undefined;
+    try next.start(io, testing.allocator, .{ .port = port, .state = "st", .start = .{ .token = try newStartToken(io), .location = test_location }, .limits = test_limits });
+    defer next.stop();
+    try testing.expectEqual(@as(u16, 404), try testGet(io, arena, port, parts.target));
+    try testing.expectError(error.Timeout, next.wait(testDeadline(io, 100)));
 }
 
 test "with no_browser the opener does not run, and the redirect from the sign-in line works" {
@@ -3419,6 +4131,42 @@ test "with no_browser the opener does not run, and the redirect from the sign-in
     try testing.expect(std.mem.endsWith(u8, redirect, "/callback?code=k&state=st-2"));
     try testing.expectEqual(@as(u32, 0), browser.calls.load(.acquire));
     try testing.expectEqual(@as(usize, 1), out.count);
+}
+
+test "with no_browser the receiver serves no start path" {
+    const io = testing.io;
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const port = try testFreePort(io);
+    var out: TestOutput = .{};
+    defer out.deinit();
+    var sign_in: SignIn = .init(io, testing.allocator, .{ .name = "t", .redirect_port = port, .no_browser = true, .output = out.output(), .limits = test_limits });
+    const Helper = struct {
+        /// The number of start paths that did not get 404.
+        others: std.atomic.Value(u32) = .init(0),
+
+        fn run(self: *@This(), o: *TestOutput, p: u16) void {
+            o.written.wait(testing.io) catch return;
+            var a: std.heap.ArenaAllocator = .init(testing.allocator);
+            defer a.deinit();
+            // Each start path gets 404, and the sign-in goes on.
+            for ([_][]const u8{ start_path_prefix, start_path_prefix ++ "A" ** start_token_len, start_path_prefix ++ "x" }) |target| {
+                const status = testGet(testing.io, a.allocator(), p, target) catch 0;
+                if (status != 404) _ = self.others.fetchAdd(1, .acq_rel);
+            }
+            _ = testGet(testing.io, a.allocator(), p, "/callback?code=k&state=st-3") catch {};
+        }
+    };
+    var helper: Helper = .{};
+    var task = try io.concurrent(Helper.run, .{ &helper, &out, port });
+    defer task.await(io);
+    const url = try testAuthorizationUrl(arena, port, "st-3");
+    const redirect = try sign_in.run(arena, url);
+    try testing.expect(std.mem.endsWith(u8, redirect, "/callback?code=k&state=st-3"));
+    try testing.expectEqual(@as(u32, 0), helper.others.load(.acquire));
+    // The line has the authorization URL.
+    try testing.expectEqualStrings(try std.fmt.allocPrint(arena, "t: sign in at {s}\n", .{url}), out.lines.items);
 }
 
 test "a URL that is not valid gives no line, no browser and the reason invalid_url" {
@@ -3729,10 +4477,13 @@ test "OAuthClient signs in through the receiver with the identity of the bridge"
     const redirect_field = try std.fmt.allocPrint(arena, "\"redirect_uris\":[\"http://127.0.0.1:{d}/callback\"]", .{port});
     try testing.expect(std.mem.indexOf(u8, register, redirect_field) != null);
 
-    // One sign-in line, one browser call, and the browser saw the page of the receiver.
+    // One sign-in line with the authorization URL, one browser call with the start URL, and
+    // the browser saw the page of the receiver.
     try testing.expectEqual(@as(usize, 1), out.count);
-    try testing.expect(std.mem.startsWith(u8, out.lines.items, "mcp-bridge-vscode: sign in at http://127.0.0.1:"));
+    const line_start = try std.fmt.allocPrint(arena, "mcp-bridge-vscode: sign in at http://127.0.0.1:{d}/authorize?", .{server.port});
+    try testing.expect(std.mem.startsWith(u8, out.lines.items, line_start));
     try testing.expectEqual(@as(u32, 1), browser.calls.load(.acquire));
+    _ = try testExpectStartUrl(browser.url.items, port);
     try testing.expectEqual(@as(u16, 200), browser.status);
     try testing.expectEqual(@as(u32, 1), server.token_requests);
 
@@ -4038,6 +4789,8 @@ const TestConsent = struct {
     asks: std.atomic.Value(u32) = .init(0),
     lock: Io.Mutex = .init,
     completed: std.ArrayList(Ticket) = .empty,
+    /// The URL of the last question.
+    url: std.ArrayList(u8) = .empty,
 
     const ticket: Ticket = 7;
     const vtable: Consent.VTable = .{ .ask = ask, .complete = complete };
@@ -4050,6 +4803,12 @@ const TestConsent = struct {
         _ = timeout;
         const self: *TestConsent = @ptrCast(@alignCast(context));
         _ = self.asks.fetchAdd(1, .acq_rel);
+        {
+            self.lock.lockUncancelable(testing.io);
+            defer self.lock.unlock(testing.io);
+            self.url.clearRetainingCapacity();
+            try self.url.appendSlice(testing.allocator, url);
+        }
         if (self.mode == .decline) return error.Declined;
         var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
         defer arena_state.deinit();
@@ -4069,6 +4828,7 @@ const TestConsent = struct {
 
     fn deinit(self: *TestConsent) void {
         self.completed.deinit(testing.allocator);
+        self.url.deinit(testing.allocator);
     }
 };
 
@@ -4090,21 +4850,61 @@ test "the gate opens the browser before notifications/initialized, and asks the 
     defer gate.deinit();
     var sign_in: SignIn = .init(io, testing.allocator, .{ .name = "t", .redirect_port = port, .opener = gate.opener(), .output = out.output(), .limits = test_limits, .timeout = .fromSeconds(10) });
 
-    _ = try sign_in.run(arena, try testAuthorizationUrl(arena, port, "s1"));
+    const first_url = try testAuthorizationUrl(arena, port, "s1");
+    _ = try sign_in.run(arena, first_url);
     try testing.expectEqual(@as(u32, 1), browser.calls.load(.acquire));
+    // The browser got the start URL, and the start URL gave the authorization URL.
+    _ = try testExpectStartUrl(browser.url.items, port);
+    try testing.expectEqualStrings(first_url, browser.location.items);
 
     var client: TestConsent = .{ .mode = .accept, .port = port };
     defer client.deinit();
     gate.useConsent(client.consent());
-    const redirect = try sign_in.run(arena, try testAuthorizationUrl(arena, port, "s2"));
+    const second_url = try testAuthorizationUrl(arena, port, "s2");
+    const redirect = try sign_in.run(arena, second_url);
     try testing.expect(std.mem.endsWith(u8, redirect, "/callback?code=consent-code&state=s2"));
-    // The bridge did not open the browser. The client got the question, and the completion
-    // after the redirect.
+    // The bridge did not open the browser. The client got the question with the full
+    // authorization URL, and the completion after the redirect.
     try testing.expectEqual(@as(u32, 1), browser.calls.load(.acquire));
     try testing.expectEqual(@as(u32, 1), client.asks.load(.acquire));
+    try testing.expectEqualStrings(second_url, client.url.items);
     try testing.expectEqualSlices(Ticket, &.{TestConsent.ticket}, client.completed.items);
     // Each sign-in writes its line.
     try testing.expectEqual(@as(usize, 2), out.count);
+}
+
+test "the gate gives the start URL to the browser, the authorization URL to the client, and no destination without a browser" {
+    const io = testing.io;
+    const url = "https://as.example/authorize?state=s";
+    var browser: TestBrowser = .{ .mode = .record };
+    defer browser.deinit();
+    var client: TestConsent = .{ .mode = .decline };
+    defer client.deinit();
+    // The system opener and a test browser without `delivery` get the start URL.
+    try testing.expect(Opener.system.delivery == null);
+    try testing.expect(browser.opener().delivery == null);
+    {
+        var gate: Gate = .init(io, browser.opener(), .fromSeconds(10), .fromSeconds(60));
+        defer gate.deinit();
+        const o = gate.opener();
+        try o.check.?(o.context, url);
+        try testing.expectEqual(Delivery.browser, o.delivery.?(o.context));
+        o.finish.?(o.context, null);
+        gate.useConsent(client.consent());
+        try o.check.?(o.context, url);
+        try testing.expectEqual(Delivery.user, o.delivery.?(o.context));
+        o.finish.?(o.context, .canceled);
+    }
+    {
+        // `--no-browser`: the gate opens nothing before notifications/initialized.
+        var gate: Gate = .init(io, null, .fromSeconds(10), .fromSeconds(60));
+        defer gate.deinit();
+        const o = gate.opener();
+        try o.check.?(o.context, url);
+        try testing.expectEqual(Delivery.none, o.delivery.?(o.context));
+        o.finish.?(o.context, null);
+    }
+    try testing.expectEqual(@as(u32, 0), browser.calls.load(.acquire));
 }
 
 test "a declined sign-in starts a cooldown for all scopes, a failure before the question starts none, and without consent each sign-in fails at once" {
@@ -4311,6 +5111,9 @@ test "the authorizer records the error of a challenge, and a stored token needs 
         try authorizer.provider().handleChallenge(arena, url, 401, null, 1);
         try testing.expectEqualStrings("fake-access-token", authorizer.provider().token(arena).?);
         try testing.expectEqual(@as(u32, 1), browser.calls.load(.acquire));
+        // Before notifications/initialized, the browser gets the start URL.
+        _ = try testExpectStartUrl(browser.url.items, port);
+        try testing.expectEqual(@as(u16, 200), browser.status);
         try testing.expect(!authorizer.interactive());
         // The answered challenge counts, and the hook ran one time.
         try testing.expectEqual(@as(u64, 1), authorizer.answered.load(.acquire));
