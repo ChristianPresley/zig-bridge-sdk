@@ -4,6 +4,8 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-08
+
 This section has the work of milestones M0 to M5. M0 is the scaffold: the package, the build, the tools and the documents. M1 is the runtime of the `vscode` bridge over stdio. M2 and M3 send the input requests and the notifications of the upstream server to the client. M4 adds an upstream server at an HTTPS URL, with the OAuth sign-in and the storage of the tokens. M5 puts the bridge into the executable of a zig-sdk server, so that one executable serves the two revisions.
 
 The bridge starts the upstream command, or it connects to the upstream server at a URL over Streamable HTTP. When the server at the URL asks for it, the bridge signs in at its authorization server. The bridge answers `initialize`, and forwards the requests for tools, prompts, resources and completion. It also forwards the progress notifications and the cancellations.
@@ -115,4 +117,5 @@ When the upstream server asks for input, the bridge sends each input request to 
 - Package: the pin of zig-sdk moves to the commit `8334b1501644c9f8e1f65f7e24b1ef86b335093f` of the tag `v0.4.0` of zig-sdk. M3 and M4 used the commit `cda66dc616ce01ad69e8c7ea716416c324669a54` of zig-sdk 0.4.0 before its release. The new commit adds the HTTP/2 and gRPC fixes of zig-sdk 0.4.0 and `mcp.util.loopback`. The bridges do not use HTTP/2 or gRPC, thus their code has no change.
 - Repository: the CI workflows, the release workflow and `CONTRIBUTING.md` give `--test-timeout 10m` to `zig build test`. On Windows, a race of Zig 0.16.0 in parallel process starts can delay the answer of a test runner. Without the option, the build runner then reports a test runner that does not answer, although no test hangs.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-bridge-sdk/commits/main
+[Unreleased]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/ChristianPresley/zig-bridge-sdk/releases/tag/v0.1.0
