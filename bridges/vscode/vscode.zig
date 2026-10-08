@@ -1,6 +1,10 @@
 //! The bridge for Visual Studio Code (VS Code). VS Code speaks MCP revision 2025-11-25. This
 //! bridge lets it use a server of revision 2026-07-28.
 //!
+//! `serve` is the bridge of the executable `mcp-bridge-vscode`: it starts the upstream server
+//! or connects to its URL. `serveStdio` puts the bridge into the executable of a zig-sdk
+//! server, so that one executable serves the two revisions.
+//!
 //! Visual Studio Code and VS Code are trademarks of Microsoft Corporation. This project has no
 //! affiliation with Microsoft, and Microsoft does not endorse it.
 const std = @import("std");
@@ -100,6 +104,81 @@ pub fn serve(io: Io, gpa: Allocator, options: ServeOptions) !bridge.Frontend.Run
     var frontend: bridge.Frontend = .init(io, gpa, upstream, &profile, .writer(&stdout.interface), frontendOptions(options));
     defer frontend.deinit();
     return frontend.run(&stdin.interface);
+}
+
+/// The settings of `serveStdio`. The two paths take their limits from
+/// `server.options.limits`, not from the defaults of `mcp-bridge-vscode`.
+pub const StdioOptions = struct {
+    /// The answer to a `server/discover` request before the first other request. With the
+    /// default `.answer`, the server answers, and the Copilot harness takes the modern path.
+    /// With `.refuse`, the Copilot harness gets -32601 and takes the legacy path.
+    discover: bridge.embed.Discover = .answer,
+    /// The time that the requests in flight get at the end of stdin. Null uses
+    /// `limits.shutdown_grace` of the server.
+    shutdown_grace: ?Io.Duration = null,
+};
+
+/// Serve `server` over stdin and stdout until the end of stdin, for VS Code and for each
+/// client of revision 2026-07-28. Call it in place of
+/// `mcp.transport.stdio.serve`. Stdout carries only JSON-RPC messages.
+///
+/// The first request of the client selects the path (`bridge.embed.serveStdioAuto`):
+///
+/// - `initialize` selects the legacy path. The bridge with `profile` serves VS Code, and the
+///   upstream server of the bridge is `server` in the same process.
+/// - Each other request selects the modern path, the stdio transport of zig-sdk.
+/// - A `server/discover` before the first other request selects no path (`StdioOptions`).
+///
+/// The two paths use the limits of `server.options.limits`: the line length, the depth, the
+/// requests in flight and `shutdown_grace`. They have these differences:
+///
+/// - On the legacy path, a line that is too long gets -32600. On the first line and on the
+///   modern path, the function drops it without a response.
+/// - On the legacy path, a handler sees `ctx.kind == .memory`, and the rate limits of the
+///   server see no caller (`Peer.unknown`). On the modern path, a handler sees `.stdio`, and
+///   the rate limits see one caller for the connection.
+/// - On the two paths, a request above the limit of requests in flight gets -32603 at once.
+///
+/// On the legacy path, the bridge speaks to `server` through
+/// `mcp.transport.memory.ClientLink`. The link has these limits:
+///
+/// - The handler of a request runs on the task of the request of VS Code. Only the cancel
+///   token of that request stops the handler: a `notifications/cancelled` of VS Code, or the
+///   end of stdin.
+/// - The time limits of the requests do not apply in the process. The wait for the answers of
+///   VS Code to an input request keeps its limit of 1 h.
+/// - The listen callback of the bridge only translates the event and writes it under the
+///   output lock. A change of the server, for example `setToolEnabled`, writes its list change
+///   to VS Code on the task that makes the change, before the result. While VS Code does not
+///   read stdout, each event and each new listen stream of the server waits. zig-sdk 0.4.0
+///   sends the acknowledgment of a listen stream before the first event of the stream.
+///
+/// By default, the Copilot harness of VS Code cannot complete a tool of `server` that asks for
+/// input. The harness sends `server/discover` first and takes the modern path, but it has no
+/// MRTR until copilot-cli issue 4834 closes. With `.discover = .refuse`, the harness takes the
+/// legacy path, and the bridge does the MRTR rounds for it. A client of revision 2026-07-28
+/// that needs a `server/discover` result then cannot use the server. A client that sends its
+/// requests without `server/discover` still takes the modern path.
+///
+/// The function returns after the end of stdin and a bounded stop. The requests in flight get
+/// at most `shutdown_grace`. Then the function fires the cancel tokens of the requests that
+/// are left, and it cancels their tasks. Only a handler that does not examine its cancel token
+/// and has no cancel point can still keep the process alive. The function arms no watchdog.
+/// At the return, the server has no listen stream.
+///
+/// Take `mcp` from this package (`vscode.mcp`, or the `mcp` module of the package in
+/// `build.zig`). Then `server` has the type `*mcp.Server` of the bridge.
+pub fn serveStdio(io: Io, gpa: Allocator, server: *mcp.Server, options: StdioOptions) !void {
+    const in_buf = try gpa.alloc(u8, server.options.limits.stdio.read_buffer);
+    defer gpa.free(in_buf);
+    var out_buf: [64 << 10]u8 = undefined;
+    var stdin = Io.File.stdin().readerStreaming(io, in_buf);
+    var stdout = Io.File.stdout().writerStreaming(io, &out_buf);
+    _ = try bridge.embed.serveStdioAuto(io, gpa, server, &stdin.interface, &stdout.interface, .{
+        .profile = &profile,
+        .discover = options.discover,
+        .shutdown_grace = options.shutdown_grace,
+    });
 }
 
 /// The configuration of the upstream server that `serve` makes from `options`. With a
@@ -237,4 +316,12 @@ test "the OAuth identity of the VS Code bridge stays the same" {
     try std.testing.expectEqualStrings("vscode", identity.product);
     try std.testing.expectEqualStrings(profile.name, identity.bridge_name);
     try std.testing.expectEqualStrings("https://christianpresley.github.io/zig-bridge-sdk/vscode/client.json", client_metadata_url);
+}
+
+test "serveStdio refuses no server/discover by default, and it takes the mcp.Server of the package" {
+    const options: StdioOptions = .{};
+    try std.testing.expectEqual(bridge.embed.Discover.answer, options.discover);
+    try std.testing.expect(options.shutdown_grace == null);
+    // The process tests run the function in `bridge-embedded-server`.
+    _ = &serveStdio;
 }
