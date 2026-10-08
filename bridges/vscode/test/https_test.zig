@@ -4,9 +4,10 @@
 //! sign-in. The upstream server is the HTTPS variant of the fixture server with its
 //! authorization server (`fixture.https`). The bridge trusts only the CA of the test.
 //!
-//! The tests replace only the opener of the browser. The browser of the tests follows the
-//! redirects of the authorization server into the real loopback receiver of the bridge. It
-//! never opens a real browser.
+//! The tests replace only the opener of the browser. The browser of the tests gets the start URL
+//! of the receiver. It follows the redirect of the start URL and the redirects of the
+//! authorization server into the real loopback receiver of the bridge. It never opens a real
+//! browser.
 //!
 //! The tests cover these parts:
 //!
@@ -14,10 +15,13 @@
 //! - The file store across a new start, the accounts, logout, and a client that the
 //!   authorization server forgot.
 //! - The step-up of a tool through a URL elicitation, and the cases without a browser.
+//! - The one-time start URL of the browser, a guess of its token and a second request of it.
+//! - The program of `BROWSER` on a POSIX system.
 //! - The end of the input and a cancel during the wait for the browser.
 //! - A server certificate of a CA that the bridge does not trust, and `--ca-file`.
 //! - The icons of a remote server, and an HTTPS proxy of the environment.
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
@@ -105,6 +109,7 @@ fn errorMessage(frame: Value) []const u8 {
 
 /// The browser of the tests. It never opens a real browser.
 const Browser = struct {
+    /// Guarded by `lock`, because a test can change it between two sign-ins.
     mode: Mode = .follow,
     /// The proxy of the hosts that are not loopback hosts, or null.
     through: ?proxy.Proxy = null,
@@ -114,12 +119,43 @@ const Browser = struct {
     lock: Io.Mutex = .init,
     /// The status of the last page of the last visit. Guarded by `lock`.
     last_status: u16 = 0,
+    /// The URL of the last page of the last visit. Guarded by `lock`.
+    last_url: std.ArrayList(u8) = .empty,
+    /// Each URL that the bridge gave to the browser, in the order of the calls. Guarded by
+    /// `lock`.
+    opened: std.ArrayList([]u8) = .empty,
+    /// The status of each start path with a wrong token, for `guess`. Guarded by `lock`.
+    guesses: std.ArrayList(u16) = .empty,
+    /// The two responses of the start URL, for `start_twice`. Guarded by `lock`.
+    twice: Twice = .{},
 
     const Mode = enum {
         /// GET the URL and follow the redirects into the receiver of the bridge.
         follow,
         /// Only count the call. The redirect never arrives.
         silent,
+        /// GET start paths with a wrong token first, as a program that guesses. Then follow
+        /// the URL.
+        guess,
+        /// GET the start URL two times without a redirect: first as another program, then as
+        /// the browser of the user. Then follow the `Location` of the first response.
+        start_twice,
+    };
+
+    /// What the browser saw in the mode `start_twice`.
+    const Twice = struct {
+        first_status: u16 = 0,
+        /// The `Location` of the first response.
+        location: std.ArrayList(u8) = .empty,
+        /// The `Cache-Control` of the first response.
+        cache_control: std.ArrayList(u8) = .empty,
+        /// The `Referrer-Policy` of the first response.
+        referrer_policy: std.ArrayList(u8) = .empty,
+        second_status: u16 = 0,
+        /// The page of the second response.
+        second_body: std.ArrayList(u8) = .empty,
+        /// The status of the last page after the browser followed `location`.
+        late_status: u16 = 0,
     };
 
     fn opener(self: *Browser) oauth.Opener {
@@ -129,11 +165,35 @@ const Browser = struct {
     fn open(context: ?*anyopaque, io: Io, url: []const u8) oauth.OpenerError!void {
         const self: *Browser = @ptrCast(@alignCast(context.?));
         _ = self.calls.fetchAdd(1, .acq_rel);
-        if (self.mode == .silent) return;
-        self.visit(io, url) catch |e| switch (e) {
-            error.Canceled => return error.Canceled,
-            else => return error.BrowserLaunchFailed,
+        const mode = self.record(url);
+        const result: anyerror!void = switch (mode) {
+            .silent => return,
+            .follow => self.visit(io, url),
+            .guess => self.guess(io, url),
+            .start_twice => self.startTwice(io, url),
         };
+        result catch |e| switch (e) {
+            error.Canceled => return error.Canceled,
+            else => {
+                std.debug.print("\nthe browser of the test failed in the mode {t}: {t}\n", .{ mode, e });
+                return error.BrowserLaunchFailed;
+            },
+        };
+    }
+
+    /// Keep a copy of `url`, and return the mode.
+    fn record(self: *Browser, url: []const u8) Mode {
+        self.lock.lockUncancelable(testing.io);
+        defer self.lock.unlock(testing.io);
+        const copy = testing.allocator.dupe(u8, url) catch return self.mode;
+        self.opened.append(testing.allocator, copy) catch testing.allocator.free(copy);
+        return self.mode;
+    }
+
+    fn setMode(self: *Browser, mode: Mode) void {
+        self.lock.lockUncancelable(testing.io);
+        defer self.lock.unlock(testing.io);
+        self.mode = mode;
     }
 
     /// Follow `url` into the receiver, as the browser of the user does.
@@ -144,6 +204,46 @@ const Browser = struct {
         self.lock.lockUncancelable(io);
         defer self.lock.unlock(io);
         self.last_status = v.status;
+        self.last_url.clearRetainingCapacity();
+        try self.last_url.appendSlice(testing.allocator, v.url);
+    }
+
+    /// GET the start paths of `wrongTokens` on the receiver of the start URL `url`, and keep
+    /// their statuses. Then follow `url`.
+    fn guess(self: *Browser, io: Io, url: []const u8) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const split = (std.mem.indexOf(u8, url, oauth.start_path_prefix) orelse return error.TestNoStartUrl) + oauth.start_path_prefix.len;
+        for (try wrongTokens(arena, url[split..])) |token| {
+            const response = try loopbackGet(io, arena, try std.mem.concat(arena, u8, &.{ url[0..split], token }));
+            self.lock.lockUncancelable(io);
+            defer self.lock.unlock(io);
+            try self.guesses.append(testing.allocator, response.status);
+        }
+        try self.visit(io, url);
+    }
+
+    /// GET the start URL `url` two times, and then follow the `Location` of the first
+    /// response. Keep the three results.
+    fn startTwice(self: *Browser, io: Io, url: []const u8) !void {
+        var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const first = try loopbackGet(io, arena, url);
+        const second = try loopbackGet(io, arena, url);
+        const location = first.header("location") orelse return error.TestNoLocation;
+        const late = try https.browse(io, testing.allocator, arena, location, .{ .trust_pem = self.trust_pem, .through = self.through });
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        const gpa = testing.allocator;
+        self.twice.first_status = first.status;
+        try self.twice.location.appendSlice(gpa, location);
+        try self.twice.cache_control.appendSlice(gpa, first.header("cache-control") orelse "");
+        try self.twice.referrer_policy.appendSlice(gpa, first.header("referrer-policy") orelse "");
+        self.twice.second_status = second.status;
+        try self.twice.second_body.appendSlice(gpa, second.body);
+        self.twice.late_status = late.status;
     }
 
     fn count(self: *Browser) u32 {
@@ -155,7 +255,129 @@ const Browser = struct {
         defer self.lock.unlock(testing.io);
         return self.last_status;
     }
+
+    /// A copy of the URL of the last page of the last visit, in `arena`.
+    fn lastUrl(self: *Browser, arena: Allocator) ![]const u8 {
+        self.lock.lockUncancelable(testing.io);
+        defer self.lock.unlock(testing.io);
+        return arena.dupe(u8, self.last_url.items);
+    }
+
+    /// A copy of the URL of the call `index` (from 0), in `arena`.
+    fn openedUrl(self: *Browser, arena: Allocator, index: usize) ![]const u8 {
+        self.lock.lockUncancelable(testing.io);
+        defer self.lock.unlock(testing.io);
+        if (index >= self.opened.items.len) return error.TestNoBrowserCall;
+        return arena.dupe(u8, self.opened.items[index]);
+    }
+
+    fn deinit(self: *Browser) void {
+        const gpa = testing.allocator;
+        for (self.opened.items) |url| gpa.free(url);
+        self.opened.deinit(gpa);
+        self.last_url.deinit(gpa);
+        self.guesses.deinit(gpa);
+        self.twice.location.deinit(gpa);
+        self.twice.cache_control.deinit(gpa);
+        self.twice.referrer_policy.deinit(gpa);
+        self.twice.second_body.deinit(gpa);
+    }
 };
+
+/// One response of the loopback receiver of the bridge.
+const LoopbackResponse = struct {
+    status: u16,
+    /// The status line and the header fields.
+    head: []const u8,
+    body: []const u8,
+
+    /// The value of the header field `name`, or null.
+    fn header(self: LoopbackResponse, name: []const u8) ?[]const u8 {
+        var lines = std.mem.splitSequence(u8, self.head, "\r\n");
+        _ = lines.next();
+        while (lines.next()) |line| {
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            if (std.ascii.eqlIgnoreCase(line[0..colon], name)) return std.mem.trim(u8, line[colon + 1 ..], " ");
+        }
+        return null;
+    }
+};
+
+/// Sends one `GET` request for `url` (`http://127.0.0.1:<port>/<path>`) and reads the response.
+/// The function does not follow a redirect. The result is in `arena`.
+fn loopbackGet(io: Io, arena: Allocator, url: []const u8) !LoopbackResponse {
+    const prefix = "http://127.0.0.1:";
+    if (!std.mem.startsWith(u8, url, prefix)) return error.TestNotLoopback;
+    const rest = url[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return error.TestNotLoopback;
+    const port = try std.fmt.parseInt(u16, rest[0..slash], 10);
+    const address: Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    const stream = try address.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var out_buf: [1024]u8 = undefined;
+    var socket_writer = stream.writer(io, &out_buf);
+    try socket_writer.interface.print("GET {s} HTTP/1.1\r\nhost: 127.0.0.1:{d}\r\naccept: text/html\r\nconnection: close\r\n\r\n", .{ rest[slash..], port });
+    try socket_writer.interface.flush();
+    const in_buf = try arena.alloc(u8, 16 * 1024);
+    var socket_reader = stream.reader(io, in_buf);
+    var http_reader: std.http.Reader = .{ .in = &socket_reader.interface, .interface = undefined, .state = .ready, .max_head_len = in_buf.len };
+    const head = try arena.dupe(u8, try http_reader.receiveHead());
+    if (head.len < 12 or !std.mem.startsWith(u8, head, "HTTP/1.")) return error.TestBadResponse;
+    var response: LoopbackResponse = .{ .status = try std.fmt.parseInt(u16, head[9..12], 10), .head = head, .body = "" };
+    if (response.header("content-length")) |text| {
+        const body = try arena.alloc(u8, try std.fmt.parseInt(usize, text, 10));
+        try socket_reader.interface.readSliceAll(body);
+        response.body = body;
+    }
+    return response;
+}
+
+/// Returns tokens that are not `token`, in `arena`. Three tokens have one different character:
+/// at the start, in the middle and at the end. The other tokens have a different case, one
+/// character less or one character more. The list also has an empty token and a token with a
+/// longer path.
+fn wrongTokens(arena: Allocator, token: []const u8) ![]const []const u8 {
+    if (token.len < 2) return error.TestShortToken;
+    var list: std.ArrayList([]const u8) = .empty;
+    for ([_]usize{ 0, token.len / 2, token.len - 1 }) |i| {
+        const copy = try arena.dupe(u8, token);
+        copy[i] = if (copy[i] == 'A') 'B' else 'A';
+        try list.append(arena, copy);
+    }
+    for (token, 0..) |c, i| if (std.ascii.isAlphabetic(c)) {
+        const copy = try arena.dupe(u8, token);
+        copy[i] = if (std.ascii.isUpper(c)) std.ascii.toLower(c) else std.ascii.toUpper(c);
+        try list.append(arena, copy);
+        break;
+    };
+    try list.append(arena, token[0 .. token.len - 1]);
+    try list.append(arena, try std.mem.concat(arena, u8, &.{ token, "A" }));
+    try list.append(arena, "");
+    try list.append(arena, try std.mem.concat(arena, u8, &.{ token, "/x" }));
+    return list.items;
+}
+
+/// Checks that `url` is the start URL of the receiver on `port`, and returns its token. The URL
+/// is `http://127.0.0.1:<port>/start/<token>`, and the token has `oauth.start_token_len`
+/// characters of base64url. The URL has no query. Thus it has no `state` and no
+/// `code_challenge`, and other local users cannot read them in the arguments of a process.
+fn expectStartUrl(arena: Allocator, url: []const u8, port: u16) ![]const u8 {
+    const prefix = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}" ++ oauth.start_path_prefix, .{port});
+    if (!std.mem.startsWith(u8, url, prefix)) {
+        std.debug.print("\nthe browser got a URL that is not the start URL on port {d}: {s}\n", .{ port, url });
+        return error.TestNotStartUrl;
+    }
+    const token = url[prefix.len..];
+    try testing.expectEqual(oauth.start_token_len, token.len);
+    for (token) |c| try testing.expect(std.ascii.isAlphanumeric(c) or c == '-' or c == '_');
+    for ([_][]const u8{ "?", "state=", "code_challenge", "redirect_uri", "client_id" }) |part| {
+        if (contains(url, part)) {
+            std.debug.print("\nthe start URL has '{s}': {s}\n", .{ part, url });
+            return error.TestStartUrlHasQuery;
+        }
+    }
+    return token;
+}
 
 /// Keeps the sign-in lines of the bridge.
 const Lines = struct {
@@ -246,6 +468,8 @@ const Remote = struct {
         port: ?u16 = null,
         browser: Browser.Mode = .follow,
         timeout: Io.Duration = .fromSeconds(30),
+        /// The opener of the bridge. Null gives the browser of the test.
+        opener: ?oauth.Opener = null,
     };
 
     /// Make the bridge for `server`. Release it with `destroy`.
@@ -278,7 +502,7 @@ const Remote = struct {
                 .ca_bundle = &self.bundle,
                 .proxy = options.proxy,
                 .timeout = s.timeout,
-                .opener = self.browser.opener(),
+                .opener = s.opener orelse self.browser.opener(),
                 .output = self.lines.output(),
             });
         }
@@ -299,11 +523,17 @@ const Remote = struct {
         if (self.signs_in) self.authorizer.deinit();
         self.bundle.deinit(gpa);
         self.lines.deinit();
+        self.browser.deinit();
         gpa.destroy(self);
     }
 
     fn redirectUri(self: *const Remote) []const u8 {
         return self.authorizer.redirectUri();
+    }
+
+    /// The redirect port of the sign-in.
+    fn redirectPort(self: *const Remote) u16 {
+        return self.authorizer.sign_in.options.redirect_port;
     }
 
     /// Send `line`, the `initialize` request, and expect a result. Then send
@@ -858,6 +1088,224 @@ test "a declined step-up gives -32603, and with a client without URL elicitation
         try testing.expectEqualStrings("5", try harness.firstText(try harness.expectResult(try t.call(3, try addLine(t.arena(), 3)))));
         try t.verify();
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The one-time start URL
+// ---------------------------------------------------------------------------------------------
+
+/// The `initialize` request of VS Code with the id 2, for a second `initialize` after a failed
+/// one.
+const vscode_initialize_2 = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"initialize\",\"params\":" ++ harness.vscode_initialize_params ++ "}";
+
+test "the browser gets only the one-time start URL, and the start URL leads to the sign-in and the redirect" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const server = try https.HttpsServer.start(gpa, io, .{ .oauth = .{} });
+    defer server.stop();
+    var memory: mcp.auth.MemoryTokenStorage = .init(io, gpa);
+    defer memory.deinit();
+    const r = try Remote.create(server, .{ .sign_in = .{ .storage = memory.storage() } });
+    defer r.destroy();
+    const t = r.t;
+    const arena = t.arena();
+
+    _ = try r.initialize(harness.vscode_initialize);
+    try testing.expectEqual(@as(u32, 1), r.browser.count());
+    // The opener got only the start URL: no state, no code challenge and no query.
+    const start_url = try r.browser.openedUrl(arena, 0);
+    _ = try expectStartUrl(arena, start_url, r.redirectPort());
+    // The sign-in line has the authorization URL with its state and its code challenge. Thus a
+    // user can open it when the browser does not open.
+    const line_url = try r.expectSignInLine(server, 0);
+    const query = try mcp.auth.common.parseQuery(arena, line_url);
+    const state: []const u8 = query.get("state") orelse "";
+    const code_challenge: []const u8 = query.get("code_challenge") orelse "";
+    try testing.expect(state.len > 0);
+    try testing.expect(code_challenge.len > 0);
+    try testing.expectEqualStrings(r.redirectUri(), query.get("redirect_uri").?);
+    // The start URL led through the authorization server to the redirect with the code and the
+    // state of the sign-in line, and the receiver answered with its page.
+    try testing.expectEqual(@as(u16, 200), r.browser.lastStatus());
+    const redirect = try r.browser.lastUrl(arena);
+    try testing.expect(std.mem.startsWith(u8, redirect, try std.fmt.allocPrint(arena, "{s}?", .{r.redirectUri()})));
+    const redirect_query = try mcp.auth.common.parseQuery(arena, redirect);
+    const code: []const u8 = redirect_query.get("code") orelse "";
+    try testing.expect(code.len > 0);
+    try testing.expectEqualStrings(state, redirect_query.get("state").?);
+
+    try testing.expectEqualStrings("5", try harness.firstText(try harness.expectResult(try t.call(2, try addLine(arena, 2)))));
+    try t.verify();
+}
+
+test "a start path with a wrong token gets 404, and the sign-in goes on and completes" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const server = try https.HttpsServer.start(gpa, io, .{ .oauth = .{} });
+    defer server.stop();
+    var memory: mcp.auth.MemoryTokenStorage = .init(io, gpa);
+    defer memory.deinit();
+    const r = try Remote.create(server, .{ .sign_in = .{ .storage = memory.storage(), .browser = .guess } });
+    defer r.destroy();
+    const t = r.t;
+    const arena = t.arena();
+
+    // The browser first sends the guesses of another program. A guess never stops the
+    // sign-in, thus the real start URL still works.
+    _ = try r.initialize(harness.vscode_initialize);
+    _ = try expectStartUrl(arena, try r.browser.openedUrl(arena, 0), r.redirectPort());
+    const guesses = blk: {
+        r.browser.lock.lockUncancelable(io);
+        defer r.browser.lock.unlock(io);
+        break :blk try arena.dupe(u16, r.browser.guesses.items);
+    };
+    try testing.expectEqual((try wrongTokens(arena, "x" ** oauth.start_token_len)).len, guesses.len);
+    for (guesses) |status| try testing.expectEqual(@as(u16, 404), status);
+    try testing.expectEqual(@as(u16, 200), r.browser.lastStatus());
+    try testing.expectEqual(@as(u32, 1), r.browser.count());
+    try testing.expectEqualStrings("5", try harness.firstText(try harness.expectResult(try t.call(2, try addLine(arena, 2)))));
+    try t.verify();
+}
+
+test "a second request of the start URL stops the sign-in at once, the redirect after it gets no token, and a new initialize gets a new start URL" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const saved = harness.quiet();
+    defer testing.log_level = saved;
+    const server = try https.HttpsServer.start(gpa, io, .{ .oauth = .{} });
+    defer server.stop();
+    var memory: mcp.auth.MemoryTokenStorage = .init(io, gpa);
+    defer memory.deinit();
+    // The time limit of the sign-in is much longer than the wait of the test. Thus only the
+    // second request can stop the sign-in in time.
+    const r = try Remote.create(server, .{ .sign_in = .{ .storage = memory.storage(), .browser = .start_twice, .timeout = .fromSeconds(120) } });
+    defer r.destroy();
+    const t = r.t;
+    const arena = t.arena();
+
+    // Another program sends the first request, and the browser of the user sends the second.
+    const started = now(io);
+    const failed = try t.call(1, harness.vscode_initialize);
+    try expectWithin(since(io, started), stop_bound, "the stop of the sign-in at the second request of the start URL");
+    try harness.expectError(failed, -32603, bridge.translate.messageOf(.sign_in_start_reused), "sign_in_start_reused");
+    try testing.expect(harness.errorDetail(failed) == null);
+    try testing.expectEqual(bridge.Frontend.State.awaiting_initialize, t.frontend.state());
+    // The problem of the authorizer has the reason of the sign-in.
+    try testing.expectEqual(oauth.Reason.start_reused, r.authorizer.sign_in.lastFailure().?.reason);
+
+    const first_start = try r.browser.openedUrl(arena, 0);
+    const first_token = try expectStartUrl(arena, first_start, r.redirectPort());
+    const first_line = try r.expectSignInLine(server, 0);
+    {
+        r.browser.lock.lockUncancelable(io);
+        defer r.browser.lock.unlock(io);
+        const twice = &r.browser.twice;
+        // The first request got the redirect to the authorization URL of the sign-in line,
+        // without a store and without a referrer.
+        try testing.expectEqual(@as(u16, 303), twice.first_status);
+        try testing.expectEqualStrings(first_line, twice.location.items);
+        try testing.expectEqualStrings("no-store", twice.cache_control.items);
+        try testing.expectEqualStrings("no-referrer", twice.referrer_policy.items);
+        // The second request got the page that tells the user to start the sign-in again.
+        try testing.expectEqual(@as(u16, 410), twice.second_status);
+        try testing.expect(contains(twice.second_body.items, "Start the sign-in again."));
+        // The redirect of the authorization server came after the stop. The receiver refused
+        // it, thus the bridge got no code for the account of the other program.
+        try testing.expectEqual(@as(u16, 400), twice.late_status);
+    }
+
+    // A new initialize starts a new sign-in with a new start URL, and the sign-in completes.
+    r.browser.setMode(.follow);
+    _ = try harness.expectResult(try t.call(2, vscode_initialize_2));
+    try t.send(harness.initialized);
+    try testing.expectEqual(bridge.Frontend.State.ready, t.frontend.state());
+    try t.waitListening(1);
+    try testing.expectEqual(@as(u32, 2), r.browser.count());
+    const second_token = try expectStartUrl(arena, try r.browser.openedUrl(arena, 1), r.redirectPort());
+    try testing.expect(!std.mem.eql(u8, first_token, second_token));
+    try testing.expectEqual(@as(u32, 2), r.lines.count());
+    try testing.expect(!std.mem.eql(u8, first_line, try r.expectSignInLine(server, 1)));
+    try testing.expectEqual(@as(u16, 200), r.browser.lastStatus());
+    try testing.expectEqualStrings("5", try harness.firstText(try harness.expectResult(try t.call(3, try addLine(arena, 3)))));
+    try t.verify();
+}
+
+/// Waits for the file at `path`, and returns its text in `arena`.
+fn waitFile(io: Io, arena: Allocator, path: []const u8) ![]const u8 {
+    const until = now(io).addDuration(.{ .raw = wait_limit, .clock = .awake });
+    while (true) {
+        if (Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(64 * 1024))) |text| {
+            return text;
+        } else |e| switch (e) {
+            error.FileNotFound => {},
+            else => return e,
+        }
+        if (now(io).durationTo(until).raw.nanoseconds <= 0) {
+            std.debug.print("\nno file {s} in {d} s\n", .{ path, wait_limit.toSeconds() });
+            return error.TestTimeout;
+        }
+        try io.sleep(.fromMilliseconds(5), .awake);
+    }
+}
+
+test "on a POSIX system, the program of BROWSER gets only the start URL as its argument, and the sign-in completes through that URL" {
+    switch (builtin.os.tag) {
+        // On Windows, the opener of the system opens the real browser.
+        .windows, .wasi => return error.SkipZigTest,
+        else => {},
+    }
+    const io = testing.io;
+    const gpa = testing.allocator;
+    const server = try https.HttpsServer.start(gpa, io, .{ .oauth = .{} });
+    defer server.stop();
+    var memory: mcp.auth.MemoryTokenStorage = .init(io, gpa);
+    defer memory.deinit();
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    // The program writes its arguments to a file and ends. Other local users can read these
+    // arguments. The rename makes the file complete in one step.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    if (std.mem.indexOfScalar(u8, dir, '\'') != null) return error.TestPathHasQuote;
+    const record = try std.fs.path.join(arena, &.{ dir, "argv.txt" });
+    const script = try std.fs.path.join(arena, &.{ dir, "browser.sh" });
+    try Io.Dir.cwd().writeFile(io, .{
+        .sub_path = script,
+        .data = try std.fmt.allocPrint(arena, "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$@\" > '{s}.part' && mv '{s}.part' '{s}'\n", .{ record, record, record }),
+    });
+    try Io.Dir.cwd().setFilePermissions(io, script, .fromMode(0o700), .{});
+    var environ = try testing.environ.createMap(gpa);
+    defer environ.deinit();
+    try environ.put("BROWSER", script);
+    const system: oauth.SystemOpener = .{ .environ_map = &environ };
+
+    const r = try Remote.create(server, .{ .sign_in = .{ .storage = memory.storage(), .opener = system.opener() } });
+    defer r.destroy();
+    const t = r.t;
+    try t.send(harness.vscode_initialize);
+    // The program got one argument: the start URL.
+    const argv = try waitFile(io, arena, record);
+    var lines = std.mem.splitScalar(u8, argv, '\n');
+    try testing.expectEqualStrings("1", lines.next().?);
+    const start_url = lines.next().?;
+    try testing.expectEqualStrings("", lines.rest());
+    _ = try expectStartUrl(arena, start_url, r.redirectPort());
+    // The test is the browser of the user: it opens that argument.
+    try r.browser.visit(io, start_url);
+    try testing.expectEqual(@as(u16, 200), r.browser.lastStatus());
+    _ = try harness.expectResult(try t.waitResponse(1));
+    try t.waitIdle();
+    try t.send(harness.initialized);
+    try t.waitListening(1);
+    // The sign-in line has the authorization URL, and the test browser got no call.
+    const line_url = try r.expectSignInLine(server, 0);
+    try testing.expect(contains(line_url, "code_challenge="));
+    try testing.expectEqual(@as(u32, 0), r.browser.count());
+    try testing.expectEqualStrings("5", try harness.firstText(try harness.expectResult(try t.call(2, try addLine(arena, 2)))));
+    try t.verify();
 }
 
 // ---------------------------------------------------------------------------------------------

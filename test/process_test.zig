@@ -8,6 +8,11 @@
 //! into the loopback receiver of the bridge. The bridge gets `--no-browser`, and a token store
 //! that never uses the keychain of the host.
 //!
+//! On a POSIX system, one test of the URL form opens the browser. The environment variable
+//! `BROWSER` names a script of the test. The script records its arguments, and then
+//! `bridge-fixture-server --browse` opens the start URL. On Windows, the opener of the system
+//! starts the real browser, thus that test does not run there.
+//!
 //! The tests of `vscode.serveStdio` start `bridge-embedded-server`. That executable has the
 //! server of `bridge-fixture-server` and the bridge in one process. VS Code speaks to it over
 //! the pipes, and a client of revision 2026-07-28 speaks to it through
@@ -1232,6 +1237,96 @@ test "the URL form signs in: the sign-in line has the URL, the redirect reaches 
     }
     // The only stderr lines are the lines of the bridge: the HTTP upstream server has no
     // stderr in this process.
+    try expectTaggedLines(b);
+}
+
+/// The length of the token of a start URL: 32 random bytes in base64url without padding.
+const start_token_len = std.base64.url_safe_no_pad.Encoder.calcSize(32);
+
+test "the URL form opens the program of BROWSER with only the start URL, and that browser signs in" {
+    switch (builtin.os.tag) {
+        // On Windows, the opener of the system starts the real browser. The other tests of the
+        // URL form use --no-browser.
+        .windows, .wasi => return error.SkipZigTest,
+        else => {},
+    }
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const paths = try Paths.get(arena);
+
+    var upstream: HttpsUpstream = try .start(arena, paths.fixture, &.{"--oauth"}, null);
+    defer upstream.stop();
+    // The browser of the test: a script that writes its arguments to a file. Then the fixture
+    // server opens the first argument, follows each redirect and trusts the test CA.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(testing.io, ".", arena);
+    for ([_][]const u8{ dir, paths.fixture }) |path| {
+        if (std.mem.indexOfScalar(u8, path, '\'') != null) return fail("the path has a quote: {s}", .{path});
+    }
+    const record = try std.fs.path.join(arena, &.{ dir, "argv.txt" });
+    const script = try std.fs.path.join(arena, &.{ dir, "browser.sh" });
+    try Io.Dir.cwd().writeFile(testing.io, .{
+        .sub_path = script,
+        .data = try std.fmt.allocPrint(arena, "#!/bin/sh\nprintf '%s\\n' \"$#\" \"$@\" > '{s}'\nexec '{s}' --browse \"$1\"\n", .{ record, paths.fixture }),
+    });
+    try Io.Dir.cwd().setFilePermissions(testing.io, script, .fromMode(0o700), .{});
+    var environ = try bridgeEnviron(gpa);
+    defer environ.deinit();
+    try environ.put("BROWSER", script);
+
+    const port = try freePort();
+    const redirect_uri = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/callback", .{port});
+    // No --no-browser: the bridge starts the program of BROWSER.
+    const b = try Bridge.spawnWith(gpa, &.{ paths.bridge, "--log-level", "debug", "--token-store", "memory", "--ca-file", fixture.https.ca_file, "--redirect-port", try std.fmt.allocPrint(arena, "{d}", .{port}), "--sign-in-timeout", "30", upstream.url }, &environ);
+    defer b.deinit();
+    errdefer b.failed = true;
+
+    b.watchdog.arm("initialize", exchange_limit);
+    try b.send(vscode_initialize);
+    // The sign-in line has the authorization URL, for a user whose browser does not open.
+    const line_url = try waitSignIn(b, arena, 0);
+    _ = try expectSignInUrl(arena, line_url, upstream.url, redirect_uri);
+    const result = try expectResult(try b.response(arena, 1));
+    try testing.expectEqualStrings("2025-11-25", mcp.json.getString(result, "protocolVersion") orelse "");
+    try b.send(initialized);
+
+    b.watchdog.arm("tools/call", exchange_limit);
+    try b.send(
+        \\{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":3}}}
+    );
+    try testing.expectEqualStrings("5", try firstText(try expectResult(try b.response(arena, 2))));
+
+    const start = Io.Timestamp.now(b.io, .awake);
+    b.closeStdin();
+    const exit = try b.finish(start);
+    try expectExit(exit, 0);
+    try expectWithin(exit.elapsed, exit_bound, "the stop at the end of stdin after a sign-in through BROWSER");
+    _ = try expectFrames(arena, b.out.items);
+
+    // The program got one argument: the start URL. Other local users can read the arguments
+    // of a process, thus the argument has no state and no code challenge.
+    const argv = try Io.Dir.cwd().readFileAlloc(testing.io, record, arena, .limited(64 * 1024));
+    var lines = std.mem.splitScalar(u8, argv, '\n');
+    if (!std.mem.eql(u8, lines.next() orelse "", "1")) return fail("the program of BROWSER did not get exactly one argument: {s}", .{argv});
+    const start_url = lines.next() orelse "";
+    if (lines.rest().len != 0) return fail("the program of BROWSER got more than one line: {s}", .{argv});
+    const prefix = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/start/", .{port});
+    if (!std.mem.startsWith(u8, start_url, prefix)) return fail("the argument is not the start URL on port {d}: {s}", .{ port, start_url });
+    const token = start_url[prefix.len..];
+    if (token.len != start_token_len) return fail("the token of the start URL has {d} characters, not {d}", .{ token.len, start_token_len });
+    for (token) |c| if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return fail("the token of the start URL is not base64url: {s}", .{token});
+    for ([_][]const u8{ "?", "state=", "code_challenge", "redirect_uri" }) |part| {
+        if (std.mem.indexOf(u8, start_url, part) != null) return fail("the start URL has '{s}': {s}", .{ part, start_url });
+    }
+    // One sign-in, and the browser opened. The fixture server wrote no line, thus each stderr
+    // line is a line of the bridge.
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, b.err.bytes.items, sign_in_prefix));
+    try expectNoStderr(b, "the browser did not open");
+    try expectNoStderr(b, "browser opener");
+    try expectStderr(b, "the tokens stay in memory (--token-store memory)");
     try expectTaggedLines(b);
 }
 

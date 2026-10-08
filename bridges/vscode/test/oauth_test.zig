@@ -1,7 +1,8 @@
 //! The sign-in at an HTTPS upstream server. The upstream server is the HTTPS variant of the
 //! fixture server with its authorization server (`fixture.https`). The bridge and its upstream
-//! client trust only the test CA. The test replaces only the opener of the browser: it follows
-//! the redirects of the authorization server into the real loopback receiver of the bridge.
+//! client trust only the test CA. The test replaces only the opener of the browser. It gets the
+//! start URL of the receiver. It follows the redirect of the start URL and the redirects of the
+//! authorization server into the real loopback receiver of the bridge.
 //!
 //! The tests cover these parts:
 //!
@@ -41,6 +42,8 @@ const Browser = struct {
     lock: Io.Mutex = .init,
     /// The URL of the last page of the last visit: the redirect URI with the code.
     last: std.ArrayList(u8) = .empty,
+    /// The URL that the bridge gave to the browser in the last call. Guarded by `lock`.
+    opened: std.ArrayList(u8) = .empty,
 
     const Mode = enum {
         /// GET the URL and follow the redirects into the receiver of the bridge.
@@ -56,6 +59,12 @@ const Browser = struct {
     fn open(context: ?*anyopaque, io: Io, url: []const u8) oauth.OpenerError!void {
         const self: *Browser = @ptrCast(@alignCast(context.?));
         _ = self.calls.fetchAdd(1, .acq_rel);
+        {
+            self.lock.lockUncancelable(io);
+            defer self.lock.unlock(io);
+            self.opened.clearRetainingCapacity();
+            self.opened.appendSlice(testing.allocator, url) catch {};
+        }
         if (self.mode == .silent) return;
         self.visit(io, url) catch |e| switch (e) {
             error.Canceled => return error.Canceled,
@@ -78,8 +87,16 @@ const Browser = struct {
         return self.calls.load(.acquire);
     }
 
+    /// A copy of the URL of the last call, in `arena`.
+    fn openedUrl(self: *Browser, arena: Allocator) ![]const u8 {
+        self.lock.lockUncancelable(testing.io);
+        defer self.lock.unlock(testing.io);
+        return arena.dupe(u8, self.opened.items);
+    }
+
     fn deinit(self: *Browser) void {
         self.last.deinit(testing.allocator);
+        self.opened.deinit(testing.allocator);
     }
 };
 
@@ -220,6 +237,14 @@ test "the first sign-in opens the browser during initialize, and a step-up asks 
     try testing.expectEqual(@as(u32, 1), s.lines.count.load(.acquire));
     const line_start = try std.fmt.allocPrint(arena, "mcp-bridge-vscode: sign in at {s}", .{server.issuer().?});
     try testing.expect(std.mem.startsWith(u8, s.lines.text.items, line_start));
+    // The line has the authorization URL, and the browser got only the one-time start URL of
+    // the receiver, without a query.
+    try testing.expect(std.mem.indexOf(u8, s.lines.text.items, "code_challenge=") != null);
+    const opened = try s.browser.openedUrl(arena);
+    const start_prefix = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}{s}", .{ s.port, oauth.start_path_prefix });
+    try testing.expect(std.mem.startsWith(u8, opened, start_prefix));
+    try testing.expectEqual(start_prefix.len + oauth.start_token_len, opened.len);
+    try testing.expect(std.mem.indexOfScalar(u8, opened, '?') == null);
     // The registration has the name of the bridge and its exact redirect URI.
     const registered = try server.registrations(arena);
     try testing.expectEqual(@as(usize, 1), registered.len);

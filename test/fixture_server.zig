@@ -38,6 +38,12 @@
 //! - `--deny`: the authorization server denies each authorization request.
 //! - `--token-lifetime S`: the lifetime of the access tokens in seconds.
 //! - `--no-refresh-tokens`: the authorization server issues no refresh tokens.
+//!
+//! With `--browse URL`, the process is the browser of a test. It sends a `GET` request to the
+//! URL and follows each redirect with `fixture.https.browse`, and it trusts only the test CA. A
+//! test gives it to the bridge through the environment variable `BROWSER`. The exit code is 0
+//! when the last page has the status 200, else 1. After `browse_limit_s` seconds, the process
+//! stops with the exit code 3. The option does not go with other options.
 const std = @import("std");
 const mcp = @import("mcp");
 const fixture = @import("fixture");
@@ -70,6 +76,7 @@ const usage =
     \\           [--oauth [--no-registration] [--cimd] [--ca-file PATH] [--deny]
     \\                    [--token-lifetime S] [--no-refresh-tokens]]
     \\           [--bearer-env VAR]
+    \\       bridge-fixture-server --browse URL
     \\
 ;
 
@@ -92,6 +99,13 @@ pub fn main(init: std.process.Init) !u8 {
     var bearer_variable: ?[]const u8 = null;
     // The options that need `--oauth`, for the check after the loop.
     var oauth_option: ?[]const u8 = null;
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--browse")) {
+        if (args.len != 3) {
+            std.debug.print("bridge-fixture-server: --browse needs one URL and no other option\n{s}", .{usage});
+            return 2;
+        }
+        return browse(gpa, io, init.arena.allocator(), args[2]);
+    }
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
@@ -192,6 +206,35 @@ fn parseNumber(comptime T: type, option: []const u8, text: []const u8) ?T {
         std.debug.print("bridge-fixture-server: {s} needs a number, not '{s}'\n{s}", .{ option, text, usage });
         return null;
     };
+}
+
+/// The time limit of `--browse`, in seconds. Thus a visit that does not end cannot keep the
+/// stderr of the bridge open.
+const browse_limit_s = 30;
+
+/// Opens `url` as the browser of a test, and returns the exit code. The process writes no line
+/// when the last page has the status 200. The URL can have a secret, thus no line has it.
+fn browse(gpa: std.mem.Allocator, io: std.Io, arena: std.mem.Allocator, url: []const u8) u8 {
+    const timer = std.Thread.spawn(.{}, stopAtBrowseLimit, .{io}) catch |e| {
+        std.log.err("the time limit of --browse did not start: {t}", .{e});
+        return 1;
+    };
+    timer.detach();
+    const visit = fixture.https.browse(io, gpa, arena, url, .{}) catch |e| {
+        std.log.err("the visit of --browse failed: {t}", .{e});
+        return 1;
+    };
+    if (visit.status != 200) {
+        std.log.err("the last page of --browse has the status {d}", .{visit.status});
+        return 1;
+    }
+    return 0;
+}
+
+fn stopAtBrowseLimit(io: std.Io) void {
+    io.sleep(.fromSeconds(browse_limit_s), .awake) catch {};
+    std.log.err("the visit of --browse did not end in {d} s", .{browse_limit_s});
+    std.process.exit(3);
 }
 
 /// Serve over HTTPS until the end of stdin. The first line on stdout is the URL of the MCP
