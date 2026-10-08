@@ -1,7 +1,7 @@
 //! The translation between revision 2025-11-25 of the client and revision 2026-07-28 of the
 //! upstream server. It has the capabilities, the `initialize` result, the parameters of a
-//! forwarded request, the results and the error table. The functions do no I/O. They take an
-//! arena, and that arena owns each value that they return.
+//! forwarded request, the results, the icon rule and the error table. The functions do no
+//! I/O. They take an arena, and that arena owns each value that they return.
 const std = @import("std");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
@@ -11,6 +11,7 @@ const mcp = @import("mcp");
 const types = mcp.types;
 const bridge = @import("../bridge.zig");
 const legacy = @import("legacy.zig");
+const oauth = @import("oauth.zig");
 const Profile = bridge.Profile;
 
 // ---------------------------------------------------------------------------------------------
@@ -150,6 +151,8 @@ pub const InitOpts = struct {
     /// The `serverInfo.version` when the discover result has no server information.
     fallback_version: []const u8 = bridge.version,
     mask: ReplyMask = .{},
+    /// The icons of `serverInfo` that the result keeps. See `IconRule`.
+    icons: IconRule = .all,
 };
 
 /// Make the `initialize` result of revision 2025-11-25 from the raw `server/discover` result
@@ -160,7 +163,7 @@ pub const InitOpts = struct {
 ///   and `extensions` of the discover result, after `opts.mask`. The result never has `tasks`
 ///   and never has the Tasks extension.
 /// - `serverInfo`: the server information in `_meta` of the discover result, or the fallback
-///   name and version.
+///   name and version. Its icons obey `opts.icons`.
 /// - `instructions`: a copy, when the discover result has them.
 pub fn initializeResult(arena: Allocator, discover_raw: Value, opts: InitOpts) Allocator.Error!Value {
     const empty: Value = .{ .object = .empty };
@@ -210,7 +213,14 @@ fn serverInfo(arena: Allocator, meta: ?Value, opts: InitOpts) Allocator.Error!Va
     if (meta) |m| if (m == .object) if (m.object.get(mcp.protocol.meta.key_server_info)) |info| {
         if (try validServerInfo(arena, info)) {
             var out: ObjectMap = .empty;
-            for (server_info_keys) |key| if (info.object.get(key)) |v| try out.put(arena, key, v);
+            for (server_info_keys) |key| if (info.object.get(key)) |v| {
+                if (opts.icons == .data_only and std.mem.eql(u8, key, "icons")) {
+                    // A copy, because the tree of the discover result stays as it is.
+                    if (try dataIcons(arena, v)) |icons| try out.put(arena, key, icons);
+                    continue;
+                }
+                try out.put(arena, key, v);
+            };
             return .{ .object = out };
         }
     };
@@ -592,6 +602,99 @@ const Walker = struct {
 };
 
 // ---------------------------------------------------------------------------------------------
+// Icons
+// ---------------------------------------------------------------------------------------------
+
+/// The icons that the results for the client keep.
+pub const IconRule = enum {
+    /// Keep each icon. Use it for an upstream server that is a local process.
+    all,
+    /// Keep only the icons with a `data:` URI. Use it for a remote upstream server, for
+    /// example over HTTP. VS Code starts the bridge as a local process. Thus it ignores the
+    /// `http:` and `https:` icons of the bridge, and it trusts its `file:` icons. The icons of
+    /// a remote server must never get the trust of a local process.
+    data_only,
+};
+
+/// Apply `rule` to the icons of a result of `method` for the client. Use it after
+/// `shapeResult`. The function changes the tree of `result` in place.
+///
+/// The function examines the items of a `tools/list`, `prompts/list`, `resources/list` or
+/// `resources/templates/list` result. It also examines the resource links in the `content` of
+/// a `tools/call` result and in the `messages` of a `prompts/get` result. With `.data_only`,
+/// an item loses each icon without a `data:` URI. An item without an icon loses its `icons`
+/// member.
+pub fn filterIcons(method: []const u8, result: *Value, rule: IconRule) void {
+    if (rule == .all or result.* != .object) return;
+    const obj = &result.object;
+    if (iconListMember(method)) |member| {
+        const items = obj.getPtr(member) orelse return;
+        if (items.* != .array) return;
+        for (items.array.items) |*item| keepDataIcons(item);
+    } else if (std.mem.eql(u8, method, "tools/call")) {
+        const content = obj.getPtr("content") orelse return;
+        if (content.* != .array) return;
+        for (content.array.items) |*block| if (isResourceLink(block.*)) keepDataIcons(block);
+    } else if (std.mem.eql(u8, method, "prompts/get")) {
+        const messages = obj.getPtr("messages") orelse return;
+        if (messages.* != .array) return;
+        for (messages.array.items) |*message| {
+            if (message.* != .object) continue;
+            const block = message.object.getPtr("content") orelse continue;
+            if (isResourceLink(block.*)) keepDataIcons(block);
+        }
+    }
+}
+
+/// The member of a list result whose items can have icons, or null.
+fn iconListMember(method: []const u8) ?[]const u8 {
+    const lists = [_]struct { []const u8, []const u8 }{
+        .{ "tools/list", "tools" },
+        .{ "prompts/list", "prompts" },
+        .{ "resources/list", "resources" },
+        .{ "resources/templates/list", "resourceTemplates" },
+    };
+    for (lists) |l| if (std.mem.eql(u8, l[0], method)) return l[1];
+    return null;
+}
+
+fn isResourceLink(block: Value) bool {
+    return std.mem.eql(u8, mcp.json.getString(block, "type") orelse "", "resource_link");
+}
+
+/// Remove each icon of the `icons` member of `item` that does not have a `data:` URI. An
+/// `icons` member that is not an array, or that has no icon after the change, goes away.
+fn keepDataIcons(item: *Value) void {
+    if (item.* != .object) return;
+    const icons = item.object.getPtr("icons") orelse return;
+    if (icons.* == .array) {
+        var i: usize = 0;
+        while (i < icons.array.items.len) {
+            if (isDataIcon(icons.array.items[i])) i += 1 else _ = icons.array.orderedRemove(i);
+        }
+        if (icons.array.items.len != 0) return;
+    }
+    _ = item.object.orderedRemove("icons");
+}
+
+/// A copy of the icon array `icons` with only the icons that have a `data:` URI. Null when no
+/// icon stays, or when `icons` is not an array.
+fn dataIcons(arena: Allocator, icons: Value) Allocator.Error!?Value {
+    if (icons != .array) return null;
+    var out: std.json.Array = .init(arena);
+    for (icons.array.items) |icon| if (isDataIcon(icon)) try out.append(icon);
+    if (out.items.len == 0) return null;
+    return .{ .array = out };
+}
+
+/// True when the `src` of `icon` is a `data:` URI. The scheme ignores case (RFC 3986 section
+/// 3.1).
+fn isDataIcon(icon: Value) bool {
+    const src = mcp.json.getString(icon, "src") orelse return false;
+    return std.ascii.startsWithIgnoreCase(src, "data:");
+}
+
+// ---------------------------------------------------------------------------------------------
 // Notifications
 // ---------------------------------------------------------------------------------------------
 
@@ -692,6 +795,7 @@ pub const Cause = enum {
     invalid_request,
     invalid_meta,
     spawn_failed,
+    connect_failed,
     discover_failed,
     upstream_exited,
     not_initialized,
@@ -707,6 +811,27 @@ pub const Cause = enum {
     too_many_input_requests,
     input_timeout,
     invalid_client_answer,
+    // The causes of the sign-in at an HTTP upstream server. Their messages have placeholders,
+    // thus `signInError` makes their errors.
+    sign_in_failed,
+    sign_in_timeout,
+    sign_in_denied,
+    sign_in_error,
+    sign_in_invalid_url,
+    browser_launch_failed,
+    redirect_port_unavailable,
+    registration_unavailable,
+    registration_failed,
+    issuer_not_registered,
+    invalid_client_metadata_url,
+    access_refused,
+    reauthorization_required,
+    sandbox,
+
+    /// True for a cause of the sign-in.
+    pub fn isSignIn(cause: Cause) bool {
+        return @intFromEnum(cause) >= @intFromEnum(Cause.sign_in_failed);
+    }
 };
 
 /// The error object of a JSON-RPC error response to the client. `jsonStringify` writes the
@@ -787,6 +912,7 @@ pub fn codeOf(cause: Cause) i64 {
         .not_connected,
         .task_cancelled,
         .spawn_failed,
+        .connect_failed,
         .discover_failed,
         .upstream_exited,
         .too_many_requests,
@@ -794,6 +920,20 @@ pub fn codeOf(cause: Cause) i64 {
         .too_many_input_requests,
         .input_timeout,
         .invalid_client_answer,
+        .sign_in_failed,
+        .sign_in_timeout,
+        .sign_in_denied,
+        .sign_in_error,
+        .sign_in_invalid_url,
+        .browser_launch_failed,
+        .redirect_port_unavailable,
+        .registration_unavailable,
+        .registration_failed,
+        .issuer_not_registered,
+        .invalid_client_metadata_url,
+        .access_refused,
+        .reauthorization_required,
+        .sandbox,
         => Code.internal_error.int(),
     };
 }
@@ -826,6 +966,7 @@ pub fn messageOf(cause: Cause) []const u8 {
         .invalid_request => .{ .message = "The bridge cannot send the parameters of the request to the upstream server." },
         .invalid_meta => .{ .message = "The request has a _meta key that the bridge cannot send to the upstream server." },
         .spawn_failed => .{ .message = "The bridge cannot start the upstream server. Examine the command in the configuration of the server. See the Output channel of the server." },
+        .connect_failed => .{ .message = "The bridge cannot make the client for the URL of the upstream server. Examine the URL, the proxy variables and the CA certificates. See the Output channel of the server." },
         .discover_failed => .{ .message = "The upstream server did not answer server/discover. It is not an MCP server of revision 2026-07-28, or it does not respond. See the Output channel of the server." },
         .upstream_exited => .{ .message = "The upstream server process stopped. See the Output channel of the server." },
         .not_initialized => .{ .message = "The client did not initialize the connection. Send initialize first." },
@@ -841,8 +982,121 @@ pub fn messageOf(cause: Cause) []const u8 {
         .too_many_input_requests => .{ .message = "The upstream server asked for more inputs at one time than the limit of the bridge." },
         .input_timeout => .{ .message = "The client did not answer the input request of the upstream server in time." },
         .invalid_client_answer => .{ .message = "The client sent an answer that is not valid for the input request of the upstream server." },
+        .sign_in_failed => .{ .message = "The sign-in at the authorization server of the upstream server failed. See the Output channel of the server." },
+        .sign_in_timeout => .{ .message = "The sign-in did not complete in {seconds} s. The URL of the sign-in is in the Output channel of the server. To get more time, set --sign-in-timeout. During initialize, also set --discover-timeout. When the authorization server shows no sign-in page, it possibly does not know the stored client. Then run \"{name} logout <url>\" with the URL of this server, and restart the server." },
+        .sign_in_denied => .{ .message = "The authorization server refused the access. Restart the server to sign in again." },
+        .sign_in_error => .{ .message = "The authorization server sent an error for the sign-in. See the Output channel of the server." },
+        .sign_in_invalid_url => .{ .message = "The authorization server sent an authorization URL that is not valid. The bridge did not open it. See the Output channel of the server." },
+        .browser_launch_failed => .{ .message = "The bridge cannot open a browser for the sign-in. See the Output channel of the server." },
+        .redirect_port_unavailable => .{ .message = "The bridge cannot listen on the redirect port {port}. Stop the program that uses the port, or set a different port with --redirect-port. Each server with a sign-in needs its own port." },
+        .registration_unavailable => .{ .message = "The authorization server has no client registration that the bridge can use. Register a client with the redirect URI {redirect_uri} at the authorization server. Then give its client ID with --client-id and its issuer with --client-issuer." },
+        .registration_failed => .{ .message = "The authorization server refused the registration of the client. Register a client with the redirect URI {redirect_uri} at the authorization server. Then give its client ID with --client-id and its issuer with --client-issuer." },
+        .issuer_not_registered => .{ .message = "The client ID of --client-id is not for the authorization server of the upstream server. Give a client ID of this authorization server with --client-id, and its issuer with --client-issuer." },
+        .invalid_client_metadata_url => .{ .message = "The URL of --client-metadata-url is not valid for a client ID metadata document. Use an https URL with a path." },
+        .access_refused => .{ .message = "The upstream server refused the access after the sign-in. The account possibly does not have the necessary permissions. See the Output channel of the server." },
+        .reauthorization_required => .{ .message = "The upstream server needs a new sign-in, and the client did not open the URL of the sign-in. Restart the server to sign in again." },
+        .sandbox => .{ .message = "The upstream server needs a sign-in, but the bridge runs in the sandbox of VS Code. The sandbox blocks the browser and the redirect port of the sign-in. Disable the sandbox for this server." },
     };
     return text.message;
+}
+
+/// The values of the placeholders in the messages of the sign-in causes.
+pub const SignInValues = struct {
+    /// `{redirect_uri}`: the redirect URI of the bridge.
+    redirect_uri: []const u8 = "",
+    /// `{port}`: the redirect port.
+    port: u16 = 0,
+    /// `{seconds}`: the time limit of the sign-in.
+    seconds: u64 = 0,
+    /// `{name}`: the name of the executable.
+    name: []const u8 = "",
+};
+
+/// The error of the bridge for a cause of the sign-in (`Cause.isSignIn`). The message is the
+/// message of `messageOf` with the values of its placeholders, in `arena`. Without memory, the
+/// message keeps its placeholders.
+pub fn signInError(arena: Allocator, cause: Cause, values: SignInValues, detail: ?[]const u8) RpcError {
+    var out = errorFor(cause, detail);
+    out.message = fillTemplate(arena, out.message, values) catch out.message;
+    return out;
+}
+
+/// The error for the client after a challenge of the upstream server that the bridge did not
+/// answer (`oauth.Authorizer.problemSince`). The message names the option to use and, for a
+/// registration, the redirect URI. `values` gives the redirect URI and the name of the
+/// executable. The problem gives the port and the time limit. A message never has the URL of
+/// the upstream server, because its path or its query can hold a key. The model can read the
+/// message.
+pub fn problemError(arena: Allocator, problem: oauth.Problem, values: SignInValues) RpcError {
+    var v = values;
+    const Pick = struct { Cause, ?[]const u8 };
+    const pick: Pick = switch (problem.err) {
+        error.AuthorizationFailed => pick: {
+            const f = problem.sign_in orelse break :pick .{ .sign_in_failed, "AuthorizationFailed" };
+            v.port = f.port;
+            v.seconds = f.seconds;
+            break :pick switch (f.reason) {
+                .invalid_url => .{ .sign_in_invalid_url, null },
+                .address_in_use, .listen_failed => .{ .redirect_port_unavailable, @tagName(f.reason) },
+                .browser_launch_failed => .{ .browser_launch_failed, null },
+                .declined, .no_consent, .cooldown => .{ .reauthorization_required, @tagName(f.reason) },
+                .timeout => .{ .sign_in_timeout, null },
+                .denied => .{ .sign_in_denied, null },
+                .authorization_error => .{ .sign_in_error, if (f.error_code.slice()) |code| std.fmt.allocPrint(arena, "error {s}", .{code}) catch null else null },
+                .canceled, .closed => .{ .sign_in_failed, @tagName(f.reason) },
+                .sandbox => .{ .sandbox, null },
+            };
+        },
+        error.RegistrationUnavailable => .{ .registration_unavailable, null },
+        error.RegistrationFailed => .{ .registration_failed, answerDetail(arena, problem.answer) },
+        error.IssuerNotRegistered => .{ .issuer_not_registered, null },
+        error.InvalidClientMetadataUrl => .{ .invalid_client_metadata_url, null },
+        error.TooManyAttempts => .{ .access_refused, std.fmt.allocPrint(arena, "HTTP status {d}", .{problem.status}) catch null },
+        error.TokenRequestFailed => .{ .sign_in_failed, answerDetail(arena, problem.answer) orelse "TokenRequestFailed" },
+        else => |e| .{ .sign_in_failed, @errorName(e) },
+    };
+    return signInError(arena, pick[0], v, pick[1]);
+}
+
+/// The text of a failed registration or token request for `RpcError.detail`: the step, the
+/// HTTP status and the `error` code. The text has no description of the server.
+fn answerDetail(arena: Allocator, answer: ?oauth.Problem.Answer) ?[]const u8 {
+    const a = answer orelse return null;
+    const step = switch (a.step) {
+        .registration => "registration",
+        .token => "token request",
+        .refresh => "refresh",
+    };
+    if (a.code.slice()) |code| return std.fmt.allocPrint(arena, "{s}: HTTP status {d}, error {s}", .{ step, a.status, code }) catch null;
+    return std.fmt.allocPrint(arena, "{s}: HTTP status {d}", .{ step, a.status }) catch null;
+}
+
+fn fillTemplate(arena: Allocator, template: []const u8, values: SignInValues) Allocator.Error![]const u8 {
+    var aw: Io.Writer.Allocating = .init(arena);
+    const w = &aw.writer;
+    var rest = template;
+    while (std.mem.indexOfScalar(u8, rest, '{')) |open| {
+        w.writeAll(rest[0..open]) catch return error.OutOfMemory;
+        const close = std.mem.indexOfScalarPos(u8, rest, open, '}') orelse {
+            rest = rest[open..];
+            break;
+        };
+        const name = rest[open + 1 .. close];
+        const written = if (std.mem.eql(u8, name, "redirect_uri"))
+            w.writeAll(values.redirect_uri)
+        else if (std.mem.eql(u8, name, "port"))
+            w.print("{d}", .{values.port})
+        else if (std.mem.eql(u8, name, "seconds"))
+            w.print("{d}", .{values.seconds})
+        else if (std.mem.eql(u8, name, "name"))
+            w.writeAll(values.name)
+        else
+            w.writeAll(rest[open .. close + 1]);
+        written catch return error.OutOfMemory;
+        rest = rest[close + 1 ..];
+    }
+    w.writeAll(rest) catch return error.OutOfMemory;
+    return aw.written();
 }
 
 /// The error of the bridge for `cause`, with the code of `codeOf`, the message of `messageOf`
@@ -1705,6 +1959,7 @@ test "error table" {
     try testing.expectEqual(@as(i64, -32602), errorFor(.invalid_request, null).code);
     try testing.expectEqual(@as(i64, -32602), errorFor(.invalid_meta, null).code);
     try testing.expectEqual(@as(i64, -32603), errorFor(.discover_failed, null).code);
+    try testing.expectEqual(@as(i64, -32603), errorFor(.connect_failed, null).code);
     try testing.expectEqual(@as(i64, -32603), errorFor(.undeclared_input_request, null).code);
     try testing.expectEqual(@as(i64, -32603), errorFor(.too_many_input_requests, null).code);
     try testing.expectEqual(@as(i64, -32603), errorFor(.invalid_client_answer, null).code);
@@ -1721,6 +1976,131 @@ test "error table" {
     }
     try testing.expect(!hasResponse(.canceled));
     try testing.expect(hasResponse(.timeout));
+}
+
+test "the sign-in errors name the option, the redirect URI and the port" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const values: SignInValues = .{ .redirect_uri = "http://127.0.0.1:41894/callback", .name = "mcp-bridge-vscode" };
+    const Case = struct { problem: oauth.Problem, cause: Cause, has: []const []const u8, detail: ?[]const u8 = null };
+    const cases = [_]Case{
+        .{
+            .problem = .{ .generation = 1, .status = 401, .err = error.RegistrationUnavailable },
+            .cause = .registration_unavailable,
+            .has = &.{ "--client-id", "--client-issuer", "http://127.0.0.1:41894/callback" },
+        },
+        .{
+            .problem = .{ .generation = 1, .status = 401, .err = error.RegistrationFailed, .answer = .{ .step = .registration, .status = 400, .code = .init("invalid_redirect_uri") } },
+            .cause = .registration_failed,
+            .has = &.{ "--client-id", "http://127.0.0.1:41894/callback" },
+            .detail = "registration: HTTP status 400, error invalid_redirect_uri",
+        },
+        .{
+            .problem = .{ .generation = 1, .status = 401, .err = error.IssuerNotRegistered },
+            .cause = .issuer_not_registered,
+            .has = &.{ "--client-issuer", "--client-id" },
+        },
+        .{
+            .problem = .{ .generation = 1, .status = 401, .err = error.InvalidClientMetadataUrl },
+            .cause = .invalid_client_metadata_url,
+            .has = &.{"--client-metadata-url"},
+        },
+        .{
+            .problem = .{ .generation = 1, .status = 401, .err = error.AuthorizationFailed, .sign_in = .{ .reason = .timeout, .seconds = 300 } },
+            .cause = .sign_in_timeout,
+            .has = &.{ "300 s", "--sign-in-timeout", "--discover-timeout", "\"mcp-bridge-vscode logout <url>\"" },
+        },
+        .{
+            .problem = .{ .generation = 1, .status = 401, .err = error.AuthorizationFailed, .sign_in = .{ .reason = .sandbox } },
+            .cause = .sandbox,
+            .has = &.{"sandbox"},
+        },
+        .{
+            .problem = .{ .generation = 1, .status = 401, .err = error.AuthorizationFailed, .sign_in = .{ .reason = .address_in_use, .port = 41894 } },
+            .cause = .redirect_port_unavailable,
+            .has = &.{ "41894", "--redirect-port" },
+            .detail = "address_in_use",
+        },
+        .{
+            .problem = .{ .generation = 1, .status = 401, .err = error.AuthorizationFailed, .sign_in = .{ .reason = .denied } },
+            .cause = .sign_in_denied,
+            .has = &.{"Restart the server"},
+        },
+        .{
+            .problem = .{ .generation = 1, .status = 401, .err = error.AuthorizationFailed, .sign_in = .{ .reason = .authorization_error, .error_code = .init("invalid_scope") } },
+            .cause = .sign_in_error,
+            .has = &.{"error for the sign-in"},
+            .detail = "error invalid_scope",
+        },
+        .{
+            .problem = .{ .generation = 1, .status = 403, .err = error.AuthorizationFailed, .sign_in = .{ .reason = .declined } },
+            .cause = .reauthorization_required,
+            .has = &.{"new sign-in"},
+            .detail = "declined",
+        },
+        .{
+            .problem = .{ .generation = 1, .status = 401, .err = error.AuthorizationFailed, .sign_in = .{ .reason = .no_consent } },
+            .cause = .reauthorization_required,
+            .has = &.{"Restart the server"},
+            .detail = "no_consent",
+        },
+        .{
+            .problem = .{ .generation = 1, .status = 401, .err = error.AuthorizationFailed, .sign_in = .{ .reason = .invalid_url } },
+            .cause = .sign_in_invalid_url,
+            .has = &.{"did not open it"},
+        },
+        .{
+            .problem = .{ .generation = 1, .status = 401, .err = error.AuthorizationFailed, .sign_in = .{ .reason = .browser_launch_failed } },
+            .cause = .browser_launch_failed,
+            .has = &.{"browser"},
+        },
+        .{
+            .problem = .{ .generation = 1, .status = 403, .err = error.TooManyAttempts },
+            .cause = .access_refused,
+            .has = &.{"after the sign-in"},
+            .detail = "HTTP status 403",
+        },
+        .{
+            .problem = .{ .generation = 1, .status = 401, .err = error.TokenRequestFailed, .answer = .{ .step = .token, .status = 400, .code = .init("invalid_grant") } },
+            .cause = .sign_in_failed,
+            .has = &.{"Output channel"},
+            .detail = "token request: HTTP status 400, error invalid_grant",
+        },
+        .{
+            .problem = .{ .generation = 1, .status = 401, .err = error.NoResourceMetadata },
+            .cause = .sign_in_failed,
+            .has = &.{"Output channel"},
+            .detail = "NoResourceMetadata",
+        },
+        // A text of the authorization server that is not a code of RFC 6749 stays out.
+        .{
+            .problem = .{ .generation = 1, .status = 401, .err = error.RegistrationFailed, .answer = .{ .step = .registration, .status = 400, .code = .init("<b>bad</b>") } },
+            .cause = .registration_failed,
+            .has = &.{"--client-id"},
+            .detail = "registration: HTTP status 400",
+        },
+    };
+    for (cases) |case| {
+        const e = problemError(arena, case.problem, values);
+        try testing.expectEqual(case.cause, e.cause.?);
+        try testing.expectEqual(@as(i64, -32603), e.code);
+        try testing.expect(case.cause.isSignIn());
+        try testing.expect(std.mem.endsWith(u8, e.message, "."));
+        // Each placeholder has its value.
+        try testing.expect(std.mem.indexOfScalar(u8, e.message, '{') == null);
+        for (case.has) |needle| {
+            if (std.mem.indexOf(u8, e.message, needle) == null) {
+                std.debug.print("the message of {t} has no \"{s}\": {s}\n", .{ case.cause, needle, e.message });
+                return error.TestUnexpectedResult;
+            }
+        }
+        if (case.detail) |d| try testing.expectEqualStrings(d, e.detail.?) else try testing.expect(e.detail == null);
+    }
+    const sandbox = signInError(arena, .sandbox, .{}, null);
+    try testing.expect(std.mem.indexOf(u8, sandbox.message, "sandbox") != null);
+    try testing.expect(!Cause.invalid_client_answer.isSignIn());
+    try testing.expect(Cause.sandbox.isSignIn());
 }
 
 test "error table covers each member of RequestError" {
@@ -1794,4 +2174,98 @@ test "a time limit as text" {
     try testing.expectEqualStrings("60 s", try std.fmt.bufPrint(&buf, "{f}", .{TimeLimit{ .duration = .fromSeconds(60) }}));
     try testing.expectEqualStrings("300 ms", try std.fmt.bufPrint(&buf, "{f}", .{TimeLimit{ .duration = .fromMilliseconds(300) }}));
     try testing.expectEqualStrings("1500 ms", try std.fmt.bufPrint(&buf, "{f}", .{TimeLimit{ .duration = .fromMilliseconds(1500) }}));
+}
+
+/// Icons of each kind: a `data:` URI, `file:`, `https:` and `http:` URIs, a scheme in
+/// uppercase and an icon without `src`.
+const mixed_icons =
+    \\[{"src":"data:image/png;base64,AA==","mimeType":"image/png"},{"src":"file:///home/u/.ssh/id_rsa"},
+    \\{"src":"https://mcp.example.com/icon.png"},{"src":"http://mcp.example.com/icon.png"},
+    \\{"src":"DATA:image/svg+xml;base64,PHN2Zy8+"},{"src":"FILE:///etc/passwd"},{"mimeType":"image/png"}]
+;
+const kept_icons =
+    \\[{"src":"data:image/png;base64,AA==","mimeType":"image/png"},{"src":"DATA:image/svg+xml;base64,PHN2Zy8+"}]
+;
+/// The icons of `mixed_icons` with a `src`. A server information with an icon without `src`
+/// is not valid, and the result then has the fallback name.
+const server_icons =
+    \\[{"src":"data:image/png;base64,AA==","mimeType":"image/png"},{"src":"file:///home/u/.ssh/id_rsa"},
+    \\{"src":"https://mcp.example.com/icon.png"},{"src":"http://mcp.example.com/icon.png"},
+    \\{"src":"DATA:image/svg+xml;base64,PHN2Zy8+"},{"src":"FILE:///etc/passwd"}]
+;
+
+test "the server information of a remote upstream server keeps only the data icons" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const discover = try parse(arena, "{\"capabilities\":{},\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"s\",\"version\":\"1\",\"icons\":" ++ server_icons ++ "}}}");
+    const remote = try initializeResult(arena, discover, .{ .profile = &test_profile, .fallback_name = "f", .icons = .data_only });
+    try expectJson(arena, "{\"name\":\"s\",\"version\":\"1\",\"icons\":" ++ kept_icons ++ "}", remote.object.get("serverInfo").?);
+    // The discover result stays as it is, and the rule `all` keeps each icon.
+    const local = try initializeResult(arena, discover, .{ .profile = &test_profile, .fallback_name = "f" });
+    try testing.expectEqual(@as(usize, 6), local.object.get("serverInfo").?.object.get("icons").?.array.items.len);
+    const again = try initializeResult(arena, discover, .{ .profile = &test_profile, .fallback_name = "f", .icons = .data_only });
+    try testing.expectEqual(@as(usize, 2), again.object.get("serverInfo").?.object.get("icons").?.array.items.len);
+    // Without a data icon, the server information has no icons.
+    inline for ([_][]const u8{
+        \\[{"src":"file:///icon.png"},{"src":"https://a.example/i.png"}]
+        ,
+        \\[]
+    }) |icons| {
+        const only_urls = try parse(arena, "{\"capabilities\":{},\"_meta\":{\"io.modelcontextprotocol/serverInfo\":{\"name\":\"s\",\"version\":\"1\",\"icons\":" ++ icons ++ "}}}");
+        const result = try initializeResult(arena, only_urls, .{ .profile = &test_profile, .fallback_name = "f", .icons = .data_only });
+        try expectJson(arena,
+            \\{"name":"s","version":"1"}
+        , result.object.get("serverInfo").?);
+    }
+}
+
+test "the list results of a remote upstream server keep only the data icons" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const cases = [_]struct { method: []const u8, member: []const u8 }{
+        .{ .method = "tools/list", .member = "tools" },
+        .{ .method = "prompts/list", .member = "prompts" },
+        .{ .method = "resources/list", .member = "resources" },
+        .{ .method = "resources/templates/list", .member = "resourceTemplates" },
+    };
+    for (cases) |case| {
+        const text = try std.fmt.allocPrint(arena,
+            \\{{"{s}":[{{"name":"a","icons":{s}}},{{"name":"b","icons":[{{"src":"file:///b.png"}}]}},{{"name":"c"}},{{"name":"d","icons":"file:///d.png"}}]}}
+        , .{ case.member, mixed_icons });
+        var result = try parse(arena, text);
+        filterIcons(case.method, &result, .data_only);
+        try expectJson(arena, try std.fmt.allocPrint(arena,
+            \\{{"{s}":[{{"name":"a","icons":{s}}},{{"name":"b"}},{{"name":"c"}},{{"name":"d"}}]}}
+        , .{ case.member, kept_icons }), result);
+        // The rule `all` changes nothing.
+        var unchanged = try parse(arena, text);
+        filterIcons(case.method, &unchanged, .all);
+        try expectJson(arena, try mcp.json.writeAlloc(arena, try parse(arena, text)), unchanged);
+    }
+}
+
+test "the resource links of a remote upstream server keep only the data icons" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var call = try parse(arena, "{\"content\":[{\"type\":\"text\",\"text\":\"x\",\"icons\":[{\"src\":\"file:///t\"}]},{\"type\":\"resource_link\",\"uri\":\"file:///r\",\"name\":\"r\",\"icons\":" ++ mixed_icons ++ "}]}");
+    filterIcons("tools/call", &call, .data_only);
+    // Only a resource link has icons in revision 2025-11-25. The other blocks stay as they are.
+    try expectJson(arena, "{\"content\":[{\"type\":\"text\",\"text\":\"x\",\"icons\":[{\"src\":\"file:///t\"}]},{\"type\":\"resource_link\",\"uri\":\"file:///r\",\"name\":\"r\",\"icons\":" ++ kept_icons ++ "}]}", call);
+    var prompt = try parse(arena,
+        \\{"messages":[{"role":"user","content":{"type":"resource_link","uri":"file:///r","name":"r","icons":[{"src":"https://a.example/i.png"}]}},{"role":"user","content":{"type":"text","text":"t"}},7]}
+    );
+    filterIcons("prompts/get", &prompt, .data_only);
+    try expectJson(arena,
+        \\{"messages":[{"role":"user","content":{"type":"resource_link","uri":"file:///r","name":"r"}},{"role":"user","content":{"type":"text","text":"t"}},7]}
+    , prompt);
+    // A result of another method and a result that is not an object stay as they are.
+    var other = try parse(arena, "{\"contents\":[{\"uri\":\"file:///r\",\"icons\":[{\"src\":\"file:///i\"}]}]}");
+    filterIcons("resources/read", &other, .data_only);
+    try expectJson(arena, "{\"contents\":[{\"uri\":\"file:///r\",\"icons\":[{\"src\":\"file:///i\"}]}]}", other);
+    var scalar: Value = .{ .integer = 1 };
+    filterIcons("tools/list", &scalar, .data_only);
+    try testing.expectEqual(@as(i64, 1), scalar.integer);
 }

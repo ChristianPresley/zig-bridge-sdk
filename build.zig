@@ -90,8 +90,12 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run all tests");
     const test_vscode_step = b.step("test-vscode", "Run the tests of the vscode bridge");
 
+    // The tests of `bridge.Upstream` read the test CA from `test/fixtures/tls` in the current
+    // directory. Thus the tests run in the root also for `zig build test` in a subdirectory.
     const bridge_tests = b.addTest(.{ .root_module = bridge, .test_runner = test_runner, .use_llvm = use_llvm });
-    test_step.dependOn(&b.addRunArtifact(bridge_tests).step);
+    const run_bridge_tests = b.addRunArtifact(bridge_tests);
+    run_bridge_tests.setCwd(b.path("."));
+    test_step.dependOn(&run_bridge_tests.step);
 
     const vscode_tests = b.addTest(.{ .root_module = vscode, .test_runner = test_runner, .use_llvm = use_llvm });
     const run_vscode_tests = b.addRunArtifact(vscode_tests);

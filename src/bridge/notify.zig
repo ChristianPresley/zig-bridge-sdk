@@ -37,6 +37,9 @@
 //!   the new streams after longer waits. The owner task opens no new stream after a
 //!   cancellation, after a JSON-RPC error and after the end of the upstream server. A change of
 //!   the URIs can open a stream again.
+//! - Over HTTP, a stream can fail with the status 401 or 403: its sign-in did not complete.
+//!   With a sign-in (`Options.sign_ins`), the owner task then waits for the next sign-in of
+//!   another request. `Listener.signedIn` wakes it, and it opens a new stream.
 //! - At the end of the input, `stop` cancels each stream. The front end waits for the end of
 //!   `run`, at most `shutdown_grace`, and then it closes the upstream client.
 //!
@@ -103,6 +106,12 @@ pub const Options = struct {
     /// A stream that lives for this time after its first acknowledgment resets the wait to
     /// `backoff` at its end. After a shorter stream, the wait stays long.
     stable: Io.Duration = .fromSeconds(10),
+    /// The number of challenges that the sign-in of an HTTP upstream server answered
+    /// (`oauth.Authorizer.answered`), or null without a sign-in. A stream that fails with
+    /// the HTTP status 401 or 403 means a sign-in that did not complete. Then the listener
+    /// opens no new stream until this number changes, and `Listener.signedIn` wakes it. It
+    /// never opens a new stream on a timer, because each new stream could ask the user again.
+    sign_ins: ?*const std.atomic.Value(u64) = null,
 
     fn hasLists(self: Options) bool {
         return self.tools or self.prompts or self.resources;
@@ -192,12 +201,15 @@ pub const Listener = struct {
     /// acknowledgment, and after a loss until the next acknowledgment.
     gap: bool = true,
     /// False after a cancellation, a JSON-RPC error or the end of the upstream server. Then
-    /// only a change opens a stream.
+    /// only a change opens a stream. Also false while `sign_in_wait` is set.
     reopen: bool = true,
     /// The wait before the next new stream after a loss.
     backoff: Io.Duration = .fromMilliseconds(500),
     /// The time of the next new stream after a loss, or null for at once.
     retry_at: ?Io.Clock.Timestamp = null,
+    /// After a stream that failed with 401 or 403: the value of `Options.sign_ins` at its end.
+    /// The listener opens a new stream when the value changes. Else null.
+    sign_in_wait: ?u64 = null,
 
     /// The reason of the cancellation of a stream that a change replaced.
     const replaced_reason = "the bridge replaced the listen stream";
@@ -233,6 +245,13 @@ pub const Listener = struct {
     /// True from `start` to the end of `run`.
     pub fn isRunning(self: *const Listener) bool {
         return self.running.load(.acquire);
+    }
+
+    /// Wake the owner task after a sign-in. When a stream failed with 401 or 403 and the
+    /// number of `Options.sign_ins` changed, the owner task opens a new stream. Another task
+    /// can call it at each time. The function does not wait.
+    pub fn signedIn(self: *Listener) void {
+        self.wake.set(self.io);
     }
 
     /// Stop the listener: the owner task cancels each stream, waits for their tasks and
@@ -281,6 +300,7 @@ pub const Listener = struct {
             if (self.isStopping()) return;
             // A change waits until the change before it ends.
             while (self.next == null) self.begin(self.takeChange() orelse break);
+            self.resumeAfterSignIn();
             self.reconnect();
             const timeout: Io.Timeout = if (self.waitUntil()) |at| .{ .deadline = at } else .none;
             self.wake.waitTimeout(self.io, timeout) catch |e| switch (e) {
@@ -360,6 +380,7 @@ pub const Listener = struct {
         self.gap = false;
         self.reopen = true;
         self.retry_at = null;
+        self.sign_in_wait = null;
         if (s.change) |c| self.complete(c, .changed);
     }
 
@@ -427,6 +448,27 @@ pub const Listener = struct {
                 } else log.warn("the upstream server refused the listen stream. The bridge sends no more list changes.", .{});
                 self.reopen = false;
             },
+            // An HTTP status without a JSON-RPC message, for example 503 from a proxy while
+            // the upstream server restarts. Only a status that can change makes a new stream.
+            error.InvalidResponse => {
+                const status = s.diag.http_status orelse 0;
+                if (transientStatus(status)) {
+                    log.warn("the listen stream ended with the HTTP status {d}. A new stream follows in {f}.", .{ status, translate.TimeLimit{ .duration = self.backoff } });
+                    return self.scheduleRetry();
+                }
+                // The sign-in of the stream did not complete, for example because the user
+                // declined it. A later sign-in of another request makes the token usable.
+                if (status == 401 or status == 403) if (self.options.sign_ins) |count| {
+                    log.warn("the listen stream failed with the HTTP status {d}. A new stream follows after the next sign-in.", .{status});
+                    self.reopen = false;
+                    self.sign_in_wait = count.load(.acquire);
+                    return;
+                };
+                if (status == 0) {
+                    log.warn("the listen stream failed: {t}. The bridge sends no more list changes.", .{e});
+                } else log.warn("the listen stream failed with the HTTP status {d}. The bridge sends no more list changes.", .{status});
+                self.reopen = false;
+            },
             else => {
                 log.warn("the listen stream failed: {t}. The bridge sends no more list changes.", .{e});
                 self.reopen = false;
@@ -441,6 +483,12 @@ pub const Listener = struct {
             error.Closed => translate.errorFor(if (self.upstream.gone()) .upstream_exited else .closed, "subscriptions/listen"),
             else => translate.errorFor(translate.causeOf(e), "subscriptions/listen"),
         };
+    }
+
+    /// True for an HTTP status that can change for the same request. These are 408, 429, and
+    /// each status from 500 to 599 except 501 (not implemented).
+    fn transientStatus(status: u16) bool {
+        return status == 408 or status == 429 or (status >= 500 and status <= 599 and status != 501);
     }
 
     fn scheduleRetry(self: *Listener) void {
@@ -507,6 +555,18 @@ pub const Listener = struct {
             },
         }
         return out.items;
+    }
+
+    /// After a stream that failed with 401 or 403: allow a new stream when a sign-in completed
+    /// after the end of that stream.
+    fn resumeAfterSignIn(self: *Listener) void {
+        const seen = self.sign_in_wait orelse return;
+        const count = self.options.sign_ins orelse return;
+        if (count.load(.acquire) == seen) return;
+        log.info("a sign-in completed. The bridge opens the listen stream again.", .{});
+        self.sign_in_wait = null;
+        self.reopen = true;
+        self.retry_at = null;
     }
 
     /// Open a stream after a loss, or the first stream, when it is time.
@@ -942,6 +1002,8 @@ const FakeServer = struct {
         /// With `end = .wait`, a frame after the cancellation, or null. An upstream server
         /// can write an event before it reads the cancellation.
         late: ?[]const u8 = null,
+        /// The HTTP status of `end = .http_status`.
+        status: u16 = 401,
 
         const End = enum {
             /// Wait for the cancellation.
@@ -952,6 +1014,9 @@ const FakeServer = struct {
             result,
             /// Send a JSON-RPC error.
             rpc_error,
+            /// Answer with the HTTP status `status` and no JSON-RPC message, as the HTTP
+            /// client transport does after a challenge that the sign-in did not answer.
+            http_status,
         };
     };
 
@@ -1069,7 +1134,7 @@ const FakeServer = struct {
         const self: *FakeServer = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, ex.method, "subscriptions/listen")) return error.Closed;
         const index, const plan = self.record(io, ex) catch return error.OutOfMemory;
-        if (!plan.ack) return end(ex, plan.end);
+        if (!plan.ack) return end(ex, plan);
         if (plan.ack_after) |other| try self.waitNote(io, other);
         // The note and the open stream come before the acknowledgment, because the listener
         // can cancel the old stream at once after it.
@@ -1092,7 +1157,7 @@ const FakeServer = struct {
         // The listen streams use `inline_notifications`, thus the callback ran.
         self.note("acked {d}", .{index});
         for (plan.events) |e| deliver(ex, e) catch return error.InvalidFrame;
-        if (plan.end != .wait) return end(ex, plan.end);
+        if (plan.end != .wait) return end(ex, plan);
         // At most ten seconds, so that a failed test does not stop the test run.
         var i: usize = 0;
         while (!ex.cancel.isCancelled() and i < 10_000) : (i += 1) try io.sleep(.fromMilliseconds(1), .awake);
@@ -1113,12 +1178,16 @@ const FakeServer = struct {
         }
     }
 
-    fn end(ex: *Transport.Exchange, how: Attempt.End) Transport.ExchangeError!void {
-        switch (how) {
+    fn end(ex: *Transport.Exchange, plan: Attempt) Transport.ExchangeError!void {
+        switch (plan.end) {
             .wait => unreachable,
             .closed => return error.Closed,
             .result => deliver(ex, "{\"jsonrpc\":\"2.0\",\"id\":{sid},\"result\":{\"resultType\":\"complete\",\"_meta\":{\"io.modelcontextprotocol/subscriptionId\":{sid}}}}") catch return error.InvalidFrame,
             .rpc_error => deliver(ex, "{\"jsonrpc\":\"2.0\",\"id\":{sid},\"error\":{\"code\":-32603,\"message\":\"Subscription filter too large\"}}") catch return error.InvalidFrame,
+            .http_status => {
+                ex.http_status = plan.status;
+                return error.HttpStatus;
+            },
         }
     }
 
@@ -1268,6 +1337,44 @@ fn expectMethods(expected: []const []const u8, actual: []const []const u8) !void
     }
     std.debug.print("\nexpected the methods {f}, got {f}\n", .{ std.json.fmt(expected, .{}), std.json.fmt(actual, .{}) });
     return error.TestExpectedEqual;
+}
+
+test "an HTTP status that can change makes a new listen stream" {
+    for ([_]u16{ 408, 429, 500, 502, 503, 504, 599 }) |status| try testing.expect(Listener.transientStatus(status));
+    for ([_]u16{ 0, 200, 202, 400, 401, 403, 404, 405, 413, 501, 600 }) |status| try testing.expect(!Listener.transientStatus(status));
+}
+
+test "a stream that gets 401 or 403 waits for the next sign-in and not for a timer, and without a sign-in it stops" {
+    for ([_]u16{ 401, 403 }) |status| {
+        var sign_ins: std.atomic.Value(u64) = .init(0);
+        var options = all_lists;
+        options.sign_ins = &sign_ins;
+        const t = try TestListener.create(&.{.{ .ack = false, .end = .http_status, .status = status }}, options, null);
+        defer t.destroy();
+        try t.fake.waitAttempts(1);
+        // Many times the longest wait of a loss: no new stream on a timer.
+        try testing.io.sleep(.fromMilliseconds(200), .awake);
+        try testing.expectEqual(@as(usize, 1), t.fake.attemptCount());
+        // A wake without a new sign-in opens no stream.
+        t.listener.signedIn();
+        try testing.io.sleep(.fromMilliseconds(50), .awake);
+        try testing.expectEqual(@as(usize, 1), t.fake.attemptCount());
+        // A sign-in of another request opens the stream again. The client gets the list
+        // changes of the gap.
+        _ = sign_ins.fetchAdd(1, .release);
+        t.listener.signedIn();
+        try t.waitAcks(1);
+        try testing.expectEqual(@as(usize, 2), t.fake.attemptCount());
+        try t.host.waitFor(list_changes.len);
+        try expectMethods(&list_changes, try t.host.methods(t.arena()));
+    }
+    // Without a sign-in, the status stops the new streams, also after a wake.
+    const t = try TestListener.create(&.{.{ .ack = false, .end = .http_status, .status = 401 }}, all_lists, null);
+    defer t.destroy();
+    try t.fake.waitAttempts(1);
+    t.listener.signedIn();
+    try testing.io.sleep(.fromMilliseconds(200), .awake);
+    try testing.expectEqual(@as(usize, 1), t.fake.attemptCount());
 }
 
 test "only the four events go to the client, without the subscription id" {

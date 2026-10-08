@@ -11,7 +11,10 @@
 //! - An own line reader keeps the start and the end of a line that is too long. The front end
 //!   then finds the id of the request in that text and answers with that id.
 //! - A watcher task examines the upstream server. When the upstream server stops, the front
-//!   end answers each request in flight with -32603 and stops.
+//!   end answers each request in flight with -32603 and stops. An HTTP upstream server never
+//!   stops in this sense: a failed request gets -32603, and the front end continues.
+//! - The results of a remote upstream server keep only the `data:` icons
+//!   (`translate.IconRule`).
 //! - At the end of the input, the front end cancels the requests in flight and waits for them
 //!   for at most `shutdown_grace`.
 //! - The front end sends the input requests of the upstream server to the client as requests
@@ -25,6 +28,10 @@
 //! - Each upstream request has the log level of `logging/setLevel` and the `_meta` keys of the
 //!   client that the profile allows. The log messages of the upstream server go to the client
 //!   as `notifications/message` (`forwardLog`).
+//! - An HTTP upstream server can ask for a sign-in (`Options.sign_in`). Before
+//!   `notifications/initialized`, the bridge opens the browser. After it, the client gets a URL
+//!   elicitation of the bridge instead (`oauth.Gate`). A failed sign-in gives an error that
+//!   names its cause and the option to use.
 //!
 //! A canceled request gets no response. Each task writes its frames under one lock, thus the
 //! frames do not mix. This output lock is the last lock in each lock order.
@@ -44,6 +51,7 @@ const legacy = @import("legacy.zig");
 const translate = @import("translate.zig");
 const input = @import("input.zig");
 const notify = @import("notify.zig");
+const oauth = @import("oauth.zig");
 const Upstream = @import("Upstream.zig");
 const Profile = bridge.Profile;
 const TimeLimit = translate.TimeLimit;
@@ -90,6 +98,9 @@ listener: notify.Listener,
 declared: translate.Declared = .{},
 /// True after the start of the listener. Guarded by `in_flight_lock`.
 listening: bool = false,
+/// True when the `initialize` request of the client declared URL elicitation. `runInitialize`
+/// sets it before the state becomes `ready`.
+client_url_elicitation: bool = false,
 
 /// The lifecycle of the connection.
 pub const State = enum(u8) {
@@ -206,6 +217,17 @@ pub const Options = struct {
     /// The longest wait before a new listen stream after a loss.
     listen_max_backoff: Io.Duration = .fromSeconds(30),
     hooks: Hooks = .{},
+    /// The sign-in at an HTTP upstream server, or null. Its provider must be the `auth` of
+    /// the upstream configuration. The front end uses it for these steps:
+    ///
+    /// - `initialize`: when a sign-in can start, `server/discover` gets also the time limit of
+    ///   the sign-in. In the sandbox of VS Code, `initialize` fails at once instead.
+    /// - `notifications/initialized`: from then on, a sign-in uses a URL elicitation of the
+    ///   client (`oauth.Consent`). The bridge then never opens a browser.
+    /// - A request that failed at a challenge gets the error of the sign-in, with the option to
+    ///   use.
+    /// - The end of the input stops a sign-in that waits.
+    sign_in: ?*oauth.Authorizer = null,
 };
 
 const default_limits: mcp.Limits = .{};
@@ -218,6 +240,8 @@ const eof_cancel_reason = "the client closed the connection";
 const upstream_exit_reason = "the upstream server stopped";
 /// The cancellation reason of a request of the bridge whose answer did not come in time.
 const input_timeout_reason = "no answer in time";
+/// The cancellation reason of the URL elicitation of a sign-in that stopped.
+const sign_in_stop_reason = "the sign-in stopped";
 
 /// A task that waits for the answers of the client also wakes after this time. The reader
 /// and a cancellation wake it earlier.
@@ -292,6 +316,8 @@ pub fn init(io: Io, gpa: Allocator, upstream: *Upstream, profile: *const Profile
 /// not release the upstream.
 pub fn deinit(self: *Frontend) void {
     self.shutdown();
+    // No request runs now, thus the sign-in calls the hook no more.
+    if (self.options.sign_in) |a| a.setAnswerHook(null);
     self.listener.deinit();
     self.in_flight.deinit(self.gpa);
     self.pending.deinit(self.gpa);
@@ -640,6 +666,7 @@ fn handleNotification(self: *Frontend, arena: Allocator, n: Message.Notification
     switch (legacy.classifyNotification(n.method)) {
         .initialized => {
             log.debug("the client sent notifications/initialized", .{});
+            self.startConsent();
             self.startListener();
         },
         .roots_list_changed => {},
@@ -671,13 +698,32 @@ fn startListener(self: *Frontend) void {
     defer self.in_flight_lock.unlock(self.io);
     if (!self.admitting or self.listening) return;
     self.listening = true;
+    // After a sign-in, a listen stream that failed at its own sign-in opens again.
+    if (self.options.sign_in) |a| a.setAnswerHook(.{ .context = self, .call = signedIn });
     self.listener.start(&self.group, .{ .context = self, .vtable = &host_vtable }, .{
         .tools = d.tools_list_changed,
         .prompts = d.prompts_list_changed,
         .resources = d.resources_list_changed,
         .backoff = self.options.listen_backoff,
         .max_backoff = self.options.listen_max_backoff,
+        .sign_ins = if (self.options.sign_in) |a| &a.answered else null,
     }) catch |e| log.warn("cannot start the listen stream: {t}. The client gets no list changes.", .{e});
+}
+
+/// The hook of the sign-in after each answered challenge: wake the listener.
+fn signedIn(context: *anyopaque) void {
+    const self: *Frontend = @ptrCast(@alignCast(context));
+    self.listener.signedIn();
+}
+
+/// After `notifications/initialized`, the sign-in asks the client through a URL elicitation
+/// when the client declared URL elicitation. Else each later sign-in fails at once. A
+/// notification before the `initialize` result changes nothing.
+fn startConsent(self: *Frontend) void {
+    const a = self.options.sign_in orelse return;
+    if (self.lifecycle.load(.acquire) != .ready) return;
+    if (!self.client_url_elicitation) log.info("the client did not declare URL elicitation: a later sign-in fails, and a restart of the server signs in again", .{});
+    a.useConsent(if (self.client_url_elicitation) self.consent() else null);
 }
 
 /// The functions of the front end for the listener.
@@ -772,16 +818,37 @@ fn runInitialize(self: *Frontend, slot: *Slot) void {
     log.info("initialize from {s} {s}", .{ params.clientInfo.name, params.clientInfo.version });
     const caps = translate.upstreamCapabilities(arena, params.capabilities, self.options.capability_mask) catch
         return self.failInitialize(slot, translate.errorFor(.out_of_memory, null));
+    self.client_url_elicitation = declaresUrlElicitation(params.capabilities);
+    // A sign-in can start when the storage has no usable token. Then `server/discover` also
+    // waits for the browser. In the sandbox of VS Code, the sign-in cannot work.
+    var discover_timeout = self.options.discover_timeout;
+    var generation: u64 = 0;
+    if (self.options.sign_in) |a| {
+        generation = a.problemGeneration();
+        if (a.interactive()) {
+            if (a.sandboxed) {
+                const err = translate.signInError(arena, .sandbox, .{}, null);
+                log.warn("{s}", .{err.message});
+                return self.failInitialize(slot, err);
+            }
+            discover_timeout = .{ .nanoseconds = discover_timeout.nanoseconds +| a.signInTimeout().nanoseconds };
+            log.debug("no stored sign-in has a usable token: server/discover waits at most {f}", .{TimeLimit{ .duration = discover_timeout }});
+        }
+    }
     // On stdio, the log messages of the upstream server belong to no request.
     self.upstream.on_log = .{ .context = self, .call = upstreamLog };
     self.upstream.connect(params.clientInfo, caps) catch |e| {
-        const cause: translate.Cause = if (e == error.OutOfMemory) .out_of_memory else .spawn_failed;
+        const cause: translate.Cause = switch (e) {
+            error.OutOfMemory => .out_of_memory,
+            error.SpawnFailed => .spawn_failed,
+            error.ConnectFailed => .connect_failed,
+        };
         return self.failInitialize(slot, translate.errorFor(cause, null));
     };
     var diag: mcp.Client.Diagnostics = .{};
     const raw = self.upstream.discover(arena, .{
         .cancel = &slot.token,
-        .timeout = self.options.discover_timeout,
+        .timeout = discover_timeout,
         .diagnostics = &diag,
         .client_id = slot.id,
         .log_level = self.clientLogLevel(),
@@ -793,18 +860,20 @@ fn runInitialize(self: *Frontend, slot: *Slot) void {
             _ = self.lifecycle.cmpxchgStrong(.initializing, .awaiting_initialize, .acq_rel, .acquire);
             return;
         }
-        const err: translate.RpcError = switch (e) {
+        const err: translate.RpcError = self.signInFailure(arena, e, diag, generation) orelse
+            self.discoverSignInTimeout(arena, e, generation, discover_timeout) orelse switch (e) {
             error.Rpc => translate.discoverFailed(diag.rpc_error),
-            error.Timeout => translate.errorFor(.discover_failed, std.fmt.allocPrint(arena, "no response in {f}", .{TimeLimit{ .duration = self.options.discover_timeout }}) catch null),
-            else => translate.errorFor(translate.causeOf(e), "server/discover"),
+            error.Timeout => translate.errorFor(.discover_failed, std.fmt.allocPrint(arena, "no response in {f}", .{TimeLimit{ .duration = discover_timeout }}) catch null),
+            else => translate.errorFor(translate.causeOf(e), withStatus(arena, "server/discover", diag)),
         };
-        log.warn("server/discover failed: {t}", .{e});
+        log.warn("server/discover failed: {t}{f}", .{ e, StatusNote{ .status = diag.http_status } });
         return self.failInitialize(slot, err);
     };
     const result = translate.initializeResult(arena, raw, .{
         .profile = self.profile,
         .fallback_name = self.options.fallback_name,
         .mask = self.options.reply_mask,
+        .icons = self.iconRule(),
     }) catch return self.failInitialize(slot, translate.errorFor(.out_of_memory, null));
     self.declared = translate.declared(raw, self.options.reply_mask);
     // The state is `ready` before the response goes out, because the next requests of the
@@ -852,6 +921,7 @@ fn runForward(self: *Frontend, slot: *Slot) void {
     while (true) : (round += 1) {
         var diag: mcp.Client.Diagnostics = .{};
         const timeout = self.options.timeouts.forRound(slot.method, round);
+        const generation = if (self.options.sign_in) |a| a.problemGeneration() else 0;
         const raw = self.upstream.request(arena, slot.method, params, .{
             .cancel = &slot.token,
             .timeout = timeout,
@@ -869,7 +939,7 @@ fn runForward(self: *Frontend, slot: *Slot) void {
             if (e == error.Rpc and has_state) if (diag.rpc_error) |rpc| if (input.isRejectedState(rpc)) {
                 return self.rejectedState(slot, &session, rpc);
             };
-            return self.failForward(slot, &session, e, diag, timeout);
+            return self.failForward(slot, &session, e, diag, timeout, generation);
         };
         // The client gets the complete notification of an accepted URL before the response.
         session.observe(raw);
@@ -913,21 +983,91 @@ fn failRounds(self: *Frontend, slot: *Slot, session: *input.Session, err: transl
     self.respondError(slot, err);
 }
 
-/// Answer the client after a failed upstream request.
-fn failForward(self: *Frontend, slot: *Slot, session: *input.Session, e: Upstream.RequestError, diag: mcp.Client.Diagnostics, timeout: Io.Duration) void {
+/// Answer the client after a failed upstream request. `generation` is the number of the last
+/// problem of the sign-in before the request.
+fn failForward(self: *Frontend, slot: *Slot, session: *input.Session, e: Upstream.RequestError, diag: mcp.Client.Diagnostics, timeout: Io.Duration, generation: u64) void {
     const arena = slot.arena.allocator();
     const cause = translate.causeOf(e);
     self.logOutcome(slot, @errorName(e));
     session.finish();
     if (!translate.hasResponse(cause)) return;
+    if (self.signInFailure(arena, e, diag, generation)) |err| return self.respondError(slot, err);
     const err: translate.RpcError = switch (cause) {
         .rpc => if (diag.rpc_error) |rpc| translate.fromUpstream(rpc) else translate.errorFor(.rpc, null),
         .timeout => translate.errorFor(.timeout, std.fmt.allocPrint(arena, "{s}: no response in {f}", .{ slot.method, TimeLimit{ .duration = timeout } }) catch null),
         .closed => translate.errorFor(if (self.upstream.gone()) .upstream_exited else .closed, null),
-        else => translate.errorFor(cause, null),
+        else => translate.errorFor(cause, withStatus(arena, null, diag)),
     };
     if (cause == .timeout) log.warn("request {f} ({s}): no response in {f}", .{ slot.id, slot.method, TimeLimit{ .duration = timeout } });
     self.respondError(slot, err);
+}
+
+/// The error of the sign-in for a request that failed at a challenge of the upstream server,
+/// or null. The transport gives such a request `error.InvalidResponse` and the status 401 or
+/// 403. The sign-in recorded the cause after `generation`. The function writes the message to
+/// stderr, unless the sign-in wrote its own line.
+fn signInFailure(self: *Frontend, arena: Allocator, e: Upstream.RequestError, diag: mcp.Client.Diagnostics, generation: u64) ?translate.RpcError {
+    const a = self.options.sign_in orelse return null;
+    if (e != error.InvalidResponse) return null;
+    const status = diag.http_status orelse return null;
+    if (status != 401 and status != 403) return null;
+    const problem = a.problemSince(generation) orelse return null;
+    const err = translate.problemError(arena, problem, .{ .redirect_uri = a.redirectUri(), .name = self.profile.name });
+    // The sign-in wrote a line for each of its failures. The line of a timeout does not have
+    // the advice about a stored client that the authorization server forgot.
+    const own_line = if (problem.sign_in) |f| f.reason != .timeout else false;
+    if (!own_line) log.warn("{s}", .{err.message});
+    return err;
+}
+
+/// The error of `initialize` when the time limit of `server/discover` stopped a sign-in in the
+/// browser, or null. A sign-in can start although a stored token looked usable, for example
+/// when the authorization server revoked it. Then the time limit of `server/discover` cancels
+/// the sign-in. The client gets the error of a sign-in that did not complete in time, and not
+/// the error of a server that did not answer. The sign-in recorded the cause before the
+/// request returned, because the cancel waits for the task of the request.
+fn discoverSignInTimeout(self: *Frontend, arena: Allocator, e: Upstream.RequestError, generation: u64, limit: Io.Duration) ?translate.RpcError {
+    const a = self.options.sign_in orelse return null;
+    if (e != error.Timeout) return null;
+    const problem = a.problemSince(generation) orelse return null;
+    const failure = problem.sign_in orelse return null;
+    if (failure.reason != .canceled) return null;
+    const seconds: u64 = @intCast(@max(0, @divFloor(limit.nanoseconds +| (std.time.ns_per_s - 1), std.time.ns_per_s)));
+    const err = translate.signInError(arena, .sign_in_timeout, .{ .seconds = seconds, .name = self.profile.name }, "the time limit of server/discover");
+    log.warn("{s}", .{err.message});
+    return err;
+}
+
+/// True when the capabilities of an `initialize` request declare URL elicitation.
+fn declaresUrlElicitation(capabilities: Value) bool {
+    if (capabilities != .object) return false;
+    const elicitation = capabilities.object.get("elicitation") orelse return false;
+    if (elicitation != .object) return false;
+    const url = elicitation.object.get("url") orelse return false;
+    return url == .object;
+}
+
+/// The `data.detail` of an error after a failed upstream request: `prefix`, and the HTTP
+/// status of the last response when the transport gave one. Null when both are missing.
+fn withStatus(arena: Allocator, prefix: ?[]const u8, diag: mcp.Client.Diagnostics) ?[]const u8 {
+    const status = diag.http_status orelse return prefix;
+    if (prefix) |p| return std.fmt.allocPrint(arena, "{s}: HTTP status {d}", .{ p, status }) catch p;
+    return std.fmt.allocPrint(arena, "HTTP status {d}", .{status}) catch null;
+}
+
+/// The HTTP status of a failed request for a log line, or nothing without a status.
+const StatusNote = struct {
+    status: ?u16,
+
+    pub fn format(self: StatusNote, w: *Io.Writer) Io.Writer.Error!void {
+        if (self.status) |s| try w.print(" (HTTP status {d})", .{s});
+    }
+};
+
+/// The icons of the results for the client: only the `data:` icons for a remote upstream
+/// server.
+fn iconRule(self: *const Frontend) translate.IconRule {
+    return if (self.upstream.isRemote()) .data_only else .all;
 }
 
 /// Answer the client after the upstream server refused the `requestState` of a round.
@@ -947,8 +1087,9 @@ fn rejectedState(self: *Frontend, slot: *Slot, session: *input.Session, rpc: typ
 /// Answer the client with the complete result `raw` of the upstream server.
 fn finishForward(self: *Frontend, slot: *Slot, raw: Value) void {
     const arena = slot.arena.allocator();
-    const shaped = translate.shapeResult(arena, slot.method, raw, self.profile) catch
+    var shaped = translate.shapeResult(arena, slot.method, raw, self.profile) catch
         return self.respondError(slot, translate.errorFor(.out_of_memory, null));
+    translate.filterIcons(slot.method, &shaped.result, self.iconRule());
     for (shaped.fixes) |fix| switch (fix.kind) {
         .too_deep => log.info("tool '{s}': the input schema at '{s}' is too deep to examine", .{ fix.tool, fix.pointer }),
         else => log.info("tool '{s}': added an items schema at '{s}' of the input schema", .{ fix.tool, fix.pointer }),
@@ -1174,7 +1315,111 @@ fn notifyClient(context: *anyopaque, method: []const u8, params: Value) void {
 fn newElicitationId(context: *anyopaque, arena: Allocator) Allocator.Error![]const u8 {
     const slot: *Slot = @ptrCast(@alignCast(context));
     const n = slot.owner.next_elicitation.fetchAdd(1, .monotonic);
+    return elicitationId(arena, n);
+}
+
+/// The `elicitationId` of the URL elicitation with the number `n`.
+fn elicitationId(arena: Allocator, n: u64) Allocator.Error![]const u8 {
     return std.fmt.allocPrint(arena, "elicitation-{d}", .{n});
+}
+
+// ---------------------------------------------------------------------------------------------
+// The consent of the client to a sign-in
+// ---------------------------------------------------------------------------------------------
+
+const consent_vtable: oauth.Consent.VTable = .{ .ask = consentAsk, .complete = consentComplete };
+
+/// The consent of the client to a sign-in after `notifications/initialized`: a URL elicitation
+/// of the bridge. The client shows the full URL and asks the user. After the user accepted,
+/// the client opens the URL, and the redirect goes to the loopback receiver of the bridge.
+fn consent(self: *Frontend) oauth.Consent {
+    return .{ .context = self, .vtable = &consent_vtable };
+}
+
+/// The message of the URL elicitation of a sign-in.
+const consent_text: struct { message: []const u8 } = .{ .message = "The upstream server needs a new sign-in. Open the URL and sign in at the authorization server." };
+
+/// The params of a URL elicitation of revision 2025-11-25.
+const UrlElicitationParams = struct {
+    mode: []const u8 = "url",
+    message: []const u8,
+    url: []const u8,
+    elicitationId: []const u8,
+};
+
+/// Send the URL elicitation of a sign-in to the client, and wait for the answer at most
+/// `timeout`. The request belongs to no request of the client: the task of the HTTP client
+/// transport runs the sign-in. Its cancel, for example the cancel of the request of the
+/// client, ends the wait with `error.Canceled`. The end of the output ends it with
+/// `error.Declined`. Each path out sends `notifications/cancelled` for a request without an
+/// answer.
+fn consentAsk(context: *anyopaque, io: Io, url: []const u8, timeout: Io.Duration) oauth.ConsentError!oauth.Ticket {
+    const self: *Frontend = @ptrCast(@alignCast(context));
+    var arena_state: std.heap.ArenaAllocator = .init(self.gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const ticket = self.next_elicitation.fetchAdd(1, .monotonic);
+    const n = self.next_request.fetchAdd(1, .monotonic);
+    var wake: Io.Event = .unset;
+    var entries = [1]Pending{.{ .id = try std.fmt.allocPrint(arena, "{s}{d}", .{ self.profile.request_id_prefix, n }), .wake = &wake }};
+    const entry = &entries[0];
+    const frame = try mcp.json.writeAlloc(arena, mcp.jsonrpc.message.OutRequest(UrlElicitationParams){
+        .id = .{ .string = entry.id },
+        .method = input.Kind.elicitation_url.method(),
+        .params = .{ .message = consent_text.message, .url = url, .elicitationId = try elicitationId(arena, ticket) },
+    });
+    try self.registerPending(&entries);
+    defer self.releasePending(&entries);
+    // `error.Canceled` must come only from a cancel point of `io`, because the sign-in then
+    // cancels its task again. Thus the end of the output gives `error.Declined`.
+    entry.sent = self.writeFrameIfOpen(frame);
+    if (!entry.sent) return error.Declined;
+    log.debug("sent the URL of the sign-in to the client as request \"{s}\"", .{entry.id});
+    const deadline = Io.Clock.Timestamp.now(io, .awake).addDuration(.{ .raw = timeout, .clock = .awake });
+    while (true) {
+        wake.reset();
+        if (entry.resolved()) break;
+        if (self.closed.load(.acquire)) {
+            self.cancelPending(&entries, eof_cancel_reason);
+            return error.Declined;
+        }
+        const left = Io.Clock.Timestamp.now(io, .awake).durationTo(deadline).raw;
+        if (left.nanoseconds <= 0) {
+            log.warn("the client did not answer the URL elicitation of the sign-in in {f}", .{TimeLimit{ .duration = timeout }});
+            self.cancelPending(&entries, input_timeout_reason);
+            return error.Declined;
+        }
+        const wait: Io.Duration = if (left.nanoseconds < pending_poll_interval.nanoseconds) left else pending_poll_interval;
+        wake.waitTimeout(io, .{ .duration = .{ .raw = wait, .clock = .awake } }) catch |e| switch (e) {
+            error.Timeout => {},
+            error.Canceled => {
+                self.cancelPending(&entries, sign_in_stop_reason);
+                return error.Canceled;
+            },
+        };
+    }
+    self.unregisterPending(&entries);
+    const accepted = switch (try parseAnswer(arena, entry)) {
+        .result => |r| std.mem.eql(u8, mcp.json.getString(r, "action") orelse "", "accept"),
+        .rpc_error, .bad_line => false,
+    };
+    if (!accepted) return error.Declined;
+    log.debug("the client accepted the URL of the sign-in (request \"{s}\")", .{entry.id});
+    return ticket;
+}
+
+/// Send `notifications/elicitation/complete` for the URL elicitation `ticket`.
+fn consentComplete(context: *anyopaque, ticket: oauth.Ticket) void {
+    const self: *Frontend = @ptrCast(@alignCast(context));
+    var buf: [64]u8 = undefined;
+    var fba: std.heap.FixedBufferAllocator = .init(&buf);
+    const id = elicitationId(fba.allocator(), ticket) catch return;
+    const frame = mcp.json.writeAlloc(self.gpa, mcp.jsonrpc.message.OutNotification(struct { elicitationId: []const u8 }){
+        .method = "notifications/elicitation/complete",
+        .params = .{ .elicitationId = id },
+    }) catch return;
+    defer self.gpa.free(frame);
+    self.writeFrame(frame);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1196,7 +1441,7 @@ fn writeForSlot(self: *Frontend, slot: *Slot, frame: []const u8, kind: FrameKind
     defer self.out_lock.unlock(self.io);
     if (self.closed.load(.acquire) or slot.answered or slot.token.isCancelled()) return false;
     if (kind == .response) slot.answered = true;
-    self.sink.write(self.sink.ptr, frame) catch |e| {
+    self.sinkWrite(frame) catch |e| {
         log.debug("cannot write a frame: {t}", .{e});
         return false;
     };
@@ -1224,10 +1469,34 @@ fn writeFrame(self: *Frontend, frame: []const u8) void {
     self.writeLocked(frame);
 }
 
+/// Write a frame that belongs to no slot task. Returns false when the sink did not take it,
+/// also after the end of the output.
+fn writeFrameIfOpen(self: *Frontend, frame: []const u8) bool {
+    self.out_lock.lockUncancelable(self.io);
+    defer self.out_lock.unlock(self.io);
+    if (self.closed.load(.acquire)) return false;
+    self.sinkWrite(frame) catch |e| {
+        log.debug("cannot write a frame: {t}", .{e});
+        return false;
+    };
+    return true;
+}
+
 /// Write a frame that belongs to no slot task. The caller holds `out_lock`.
 fn writeLocked(self: *Frontend, frame: []const u8) void {
     if (self.closed.load(.acquire)) return;
-    self.sink.write(self.sink.ptr, frame) catch |e| log.debug("cannot write a frame: {t}", .{e});
+    self.sinkWrite(frame) catch |e| log.debug("cannot write a frame: {t}", .{e});
+}
+
+/// Give `frame` to the sink. The caller holds `out_lock`. The write is not a cancel point of
+/// the task: a write must never take the cancel of its task. On HTTP, the task of a stream
+/// gives the events of the stream to their callbacks, and the cancel of that task ends the
+/// stream. A write that took the cancel would leave the task in its read, and the end of the
+/// input would wait for it.
+fn sinkWrite(self: *Frontend, frame: []const u8) Sink.WriteError!void {
+    const prev = self.io.swapCancelProtection(.blocked);
+    defer _ = self.io.swapCancelProtection(prev);
+    return self.sink.write(self.sink.ptr, frame);
 }
 
 fn writeResult(self: *Frontend, id: RequestId, result: Value) void {
@@ -1414,6 +1683,8 @@ pub fn shutdown(self: *Frontend) void {
     self.shut_down = true;
     self.stop();
     self.lifecycle.store(.closing, .release);
+    // A sign-in that waits for the redirect ends at once, and no new sign-in starts.
+    if (self.options.sign_in) |a| a.abort();
     if (!self.upstream_lost.load(.acquire)) if (self.options.hooks.on_eof) |f| f(self.options.hooks.context, self.upstream);
     self.stopAdmission();
     self.cancelAll(eof_cancel_reason);
@@ -3143,4 +3414,179 @@ test "the end of the input stops the listen stream before the upstream closes" {
     // A subscribe after the end of the input gets nothing.
     try b.send("{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"resources/subscribe\",\"params\":{\"uri\":\"" ++ notes_uri ++ "\"}}");
     try testing.expectEqual(before, b.out.count());
+}
+
+/// Asks the client through the consent of the front end, as the gate of a sign-in does.
+const ConsentTask = struct {
+    const url = "https://as.example/authorize?response_type=code&state=s1";
+
+    fn run(c: oauth.Consent, result: *oauth.ConsentError!oauth.Ticket) void {
+        result.* = c.vtable.ask(c.context, testing.io, url, .fromSeconds(10));
+    }
+};
+
+test "the consent to a sign-in is a URL elicitation of the bridge with an elicitationId and its completion" {
+    const io = testing.io;
+    const b = try TestBridge.create(.{});
+    defer b.destroy();
+    try b.initialize();
+    const arena = b.arena_state.allocator();
+    const c = b.frontend.consent();
+
+    // The user accepts: the task gets the ticket, and the completion has the same id.
+    var result: oauth.ConsentError!oauth.Ticket = error.Declined;
+    var task = try io.concurrent(ConsentTask.run, .{ c, &result });
+    const request = try b.out.waitMethod(arena, "elicitation/create", 1);
+    const params = request.object.get("params").?;
+    try testing.expectEqualStrings("url", mcp.json.getString(params, "mode").?);
+    try testing.expectEqualStrings(ConsentTask.url, mcp.json.getString(params, "url").?);
+    try testing.expectEqualStrings(consent_text.message, mcp.json.getString(params, "message").?);
+    const id = mcp.json.getString(params, "elicitationId").?;
+    try testing.expect(std.mem.startsWith(u8, request.object.get("id").?.string, "b-"));
+    try b.send(try answerLine(arena, request, "{\"action\":\"accept\"}"));
+    task.await(io);
+    const ticket = try result;
+    c.vtable.complete(c.context, ticket);
+    const done = try b.out.waitMethod(arena, "notifications/elicitation/complete", 1);
+    try testing.expectEqualStrings(id, mcp.json.getString(done.object.get("params").?, "elicitationId").?);
+    try testing.expectEqual(@as(usize, 0), b.frontend.pendingCount());
+
+    // The user declines.
+    task = try io.concurrent(ConsentTask.run, .{ c, &result });
+    const second = try b.out.waitMethod(arena, "elicitation/create", 2);
+    // Each elicitation has its own id.
+    try testing.expect(!std.mem.eql(u8, id, mcp.json.getString(second.object.get("params").?, "elicitationId").?));
+    try b.send(try answerLine(arena, second, "{\"action\":\"decline\"}"));
+    task.await(io);
+    try testing.expectError(error.Declined, result);
+
+    // An error of the client is no consent.
+    task = try io.concurrent(ConsentTask.run, .{ c, &result });
+    const third = try b.out.waitMethod(arena, "elicitation/create", 3);
+    try b.send(try errorLine(arena, third, "{\"code\":-32603,\"message\":\"x\"}"));
+    task.await(io);
+    try testing.expectError(error.Declined, result);
+
+    // A cancel of the sign-in sends notifications/cancelled for the request.
+    task = try io.concurrent(ConsentTask.run, .{ c, &result });
+    const fourth = try b.out.waitMethod(arena, "elicitation/create", 4);
+    task.cancel(io);
+    try testing.expectError(error.Canceled, result);
+    const cancelled = try b.out.waitMethod(arena, "notifications/cancelled", 1);
+    try testing.expectEqualStrings(fourth.object.get("id").?.string, mcp.json.getString(cancelled.object.get("params").?, "requestId").?);
+    try testing.expectEqual(@as(usize, 0), b.frontend.pendingCount());
+    // A late answer goes nowhere.
+    try b.send(try answerLine(arena, fourth, "{\"action\":\"accept\"}"));
+    try testing.expectEqual(@as(usize, 1), (try b.out.withMethod(arena, "notifications/elicitation/complete")).len);
+}
+
+test "notifications/initialized gives the sign-in the consent only when the client declared URL elicitation" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try testing.expect(declaresUrlElicitation(try mcp.json.parseTree(arena, "{\"elicitation\":{\"form\":{},\"url\":{}}}")));
+    try testing.expect(!declaresUrlElicitation(try mcp.json.parseTree(arena, "{\"elicitation\":{\"form\":{}}}")));
+    try testing.expect(!declaresUrlElicitation(try mcp.json.parseTree(arena, "{\"elicitation\":{}}")));
+    try testing.expect(!declaresUrlElicitation(try mcp.json.parseTree(arena, "{\"elicitation\":{\"url\":true}}")));
+    try testing.expect(!declaresUrlElicitation(try mcp.json.parseTree(arena, "{}")));
+    try testing.expect(!declaresUrlElicitation(.null));
+
+    const b = try TestBridge.create(.{});
+    defer b.destroy();
+    try b.initialize();
+    try testing.expect(b.frontend.client_url_elicitation);
+}
+
+test "a sign-in that the time limit of server/discover stopped gives the error of the sign-in" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var memory: mcp.auth.MemoryTokenStorage = .init(io, gpa);
+    defer memory.deinit();
+    var authorizer: oauth.Authorizer = undefined;
+    try authorizer.init(io, gpa, .{ .identity = .of("mcp-bridge-test", "test", null), .server_url = "https://mcp.example/mcp", .storage = memory.storage() });
+    defer authorizer.deinit();
+    const b = try TestBridge.create(.{ .sign_in = &authorizer });
+    defer b.destroy();
+    const arena = b.arena_state.allocator();
+    const limit: Io.Duration = .fromSeconds(90);
+    try testing.expect(b.frontend.discoverSignInTimeout(arena, error.Timeout, 0, limit) == null);
+
+    // The cancel of the time limit stopped the sign-in in the browser.
+    authorizer.problem = .{ .generation = 1, .status = 401, .err = error.AuthorizationFailed, .sign_in = .{ .reason = .canceled } };
+    authorizer.generation = 1;
+    const saved = testing.log_level;
+    testing.log_level = .err;
+    defer testing.log_level = saved;
+    const err = b.frontend.discoverSignInTimeout(arena, error.Timeout, 0, limit).?;
+    try testing.expectEqual(translate.Cause.sign_in_timeout, err.cause.?);
+    try testing.expectEqual(@as(i64, -32603), err.code);
+    try testing.expect(std.mem.indexOf(u8, err.message, "did not complete in 90 s") != null);
+    try testing.expect(std.mem.indexOf(u8, err.message, "--discover-timeout") != null);
+    try testing.expect(std.mem.indexOf(u8, err.message, "\"mcp-bridge-test logout <url>\"") != null);
+    try testing.expectEqualStrings("the time limit of server/discover", err.detail.?);
+
+    // Only a timeout after a sign-in that a cancel stopped, and only a newer problem.
+    try testing.expect(b.frontend.discoverSignInTimeout(arena, error.Closed, 0, limit) == null);
+    try testing.expect(b.frontend.discoverSignInTimeout(arena, error.Timeout, 1, limit) == null);
+    authorizer.problem.?.sign_in = .{ .reason = .timeout };
+    try testing.expect(b.frontend.discoverSignInTimeout(arena, error.Timeout, 0, limit) == null);
+}
+
+/// A sink whose write is a cancel point of the task.
+const PausingSink = struct {
+    count: std.atomic.Value(u32) = .init(0),
+
+    fn sink(self: *PausingSink) Sink {
+        return .{ .ptr = self, .write = write };
+    }
+
+    fn write(ptr: *anyopaque, frame: []const u8) Sink.WriteError!void {
+        _ = frame;
+        const self: *PausingSink = @ptrCast(@alignCast(ptr));
+        testing.io.sleep(.fromMilliseconds(1), .awake) catch return error.WriteFailed;
+        _ = self.count.fetchAdd(1, .acq_rel);
+    }
+};
+
+/// A task that writes a frame after a cancel arrived, then waits at a cancel point.
+const WriteTask = struct {
+    started: Io.Event = .unset,
+    release: Io.Event = .unset,
+    /// True when the cancel point after the write gave `error.Canceled`.
+    canceled_after_write: bool = false,
+
+    fn run(self: *WriteTask, f: *Frontend) Io.Cancelable!void {
+        self.started.set(testing.io);
+        self.release.waitUncancelable(testing.io);
+        f.writeFrame("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}");
+        testing.io.sleep(.fromSeconds(10), .awake) catch |e| {
+            self.canceled_after_write = true;
+            return e;
+        };
+    }
+
+    fn releaseLater(self: *WriteTask) void {
+        testing.io.sleep(.fromMilliseconds(50), .awake) catch {};
+        self.release.set(testing.io);
+    }
+};
+
+test "a write of the front end does not take the cancel of its task" {
+    // On HTTP, the task of a stream runs the callbacks of its events. A write that took the
+    // cancel of that task would leave it in its read of the stream.
+    const io = testing.io;
+    const b = try TestBridge.create(.{});
+    defer b.destroy();
+    var pausing: PausingSink = .{};
+    b.frontend.sink = pausing.sink();
+    var task: WriteTask = .{};
+    var future = try io.concurrent(WriteTask.run, .{ &task, &b.frontend });
+    try task.started.wait(io);
+    var releaser = try io.concurrent(WriteTask.releaseLater, .{&task});
+    defer releaser.await(io);
+    const started = Io.Clock.Timestamp.now(io, .awake);
+    try testing.expectError(error.Canceled, future.cancel(io));
+    try testing.expect(task.canceled_after_write);
+    try testing.expectEqual(@as(u32, 1), pausing.count.load(.acquire));
+    try testing.expect(started.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.toMilliseconds() < 5000);
 }

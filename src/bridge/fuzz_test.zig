@@ -109,6 +109,9 @@ fn translateValues(_: void, smith: *Smith) anyerror!void {
     const info = init_result.object.get("serverInfo").?;
     try std.testing.expect(mcp.json.getString(info, "name").?.len > 0);
     _ = try mcp.json.writeAlloc(arena, init_result);
+    // For a remote upstream server, the server information has only data icons.
+    const remote = try translate.initializeResult(arena, value, .{ .profile = &profile, .fallback_name = "", .icons = .data_only });
+    try expectDataIcons(remote.object.get("serverInfo").?);
 
     const fwd = try translate.forwardParams(arena, value, &profile);
     try std.testing.expect(fwd.params == .object);
@@ -126,6 +129,39 @@ fn translateValues(_: void, smith: *Smith) anyerror!void {
             if (legacy.isListMethod(method)) if (object.get("nextCursor")) |cursor| try std.testing.expect(cursor == .string);
         }
         _ = try mcp.json.writeAlloc(arena, translate.strictLegacyResult(method, shaped.result, &strict_profile));
+        // The icon rule of a remote upstream server keeps only data icons in the items.
+        var remote_result = try translate.shapeResult(arena, method, mcp.json.parseTree(arena, bytes) catch unreachable, &profile);
+        translate.filterIcons(method, &remote_result.result, .data_only);
+        if (remote_result.result == .object) if (iconMember(method)) |member| if (remote_result.result.object.get(member)) |items| if (items == .array) {
+            for (items.array.items) |item| {
+                const is_link = std.mem.eql(u8, mcp.json.getString(item, "type") orelse "", "resource_link");
+                if (!std.mem.eql(u8, member, "content") or is_link) try expectDataIcons(item);
+            }
+        };
+        _ = try mcp.json.writeAlloc(arena, remote_result.result);
+    }
+}
+
+/// The member of a result of `method` whose items `translate.filterIcons` examines, or null.
+fn iconMember(method: []const u8) ?[]const u8 {
+    const members = [_]struct { []const u8, []const u8 }{
+        .{ "tools/list", "tools" },
+        .{ "prompts/list", "prompts" },
+        .{ "resources/list", "resources" },
+        .{ "resources/templates/list", "resourceTemplates" },
+        .{ "tools/call", "content" },
+    };
+    for (members) |m| if (std.mem.eql(u8, m[0], method)) return m[1];
+    return null;
+}
+
+/// Check that each icon of `holder` has a `data:` URI, and that `icons` is not empty.
+fn expectDataIcons(holder: Value) !void {
+    if (holder != .object) return;
+    const icons = holder.object.get("icons") orelse return;
+    try std.testing.expect(icons == .array and icons.array.items.len > 0);
+    for (icons.array.items) |icon| {
+        try std.testing.expect(std.ascii.startsWithIgnoreCase(mcp.json.getString(icon, "src") orelse "", "data:"));
     }
 }
 

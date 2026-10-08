@@ -31,6 +31,9 @@ pub const input = @import("bridge/input.zig");
 /// The listen stream of the upstream server: the list changes and the resource updates for
 /// the client.
 pub const notify = @import("bridge/notify.zig");
+/// The sign-in at an HTTP upstream server: the URL check, the browser opener, the loopback
+/// receiver, the token store and the OAuth identity.
+pub const oauth = @import("bridge/oauth.zig");
 
 test {
     _ = legacy;
@@ -40,6 +43,7 @@ test {
     _ = Upstream;
     _ = input;
     _ = notify;
+    _ = oauth;
     _ = @import("bridge/fuzz_test.zig");
 }
 
