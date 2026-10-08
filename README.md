@@ -6,13 +6,13 @@ A bridge connects an MCP client of revision 2025-11-25 to an MCP server of revis
 
 ## Status
 
-The project is in development. Milestones M0 to M5 of the `vscode` bridge are complete. The bridge starts the upstream command and speaks to it over stdio. It can also connect to an upstream server at an HTTPS URL over Streamable HTTP.
+The project is in development. Milestones M0 to M6 of the `vscode` bridge are complete. The bridge starts the upstream command and speaks to it over stdio. It can also connect to an upstream server at an HTTPS URL over Streamable HTTP.
 
 The bridge answers `initialize`, and it forwards the requests for tools, prompts, resources and completion. It also forwards the progress notifications of the upstream server and the cancellations of the client. When the upstream server asks for input, the bridge sends each input request to the client and sends the answers to the upstream server.
 
 The bridge also sends the list changes, the resource updates and the log messages of the upstream server to the client. When the upstream server declares them, the bridge keeps a listen stream open for the list changes and the resource updates. The log messages come with the requests. The client can subscribe to a resource and set the log level. The trace context and the `vscode.` keys in the `_meta` of the client go to the upstream server.
 
-When an upstream server at a URL asks for a sign-in, the bridge signs in at its authorization server with OAuth. The first sign-in opens the browser during `initialize`. For a later sign-in, the client gets a URL elicitation. The bridge keeps the tokens in the keychain of the host, in encrypted files or in memory. `mcp-bridge-vscode logout` deletes a stored sign-in.
+When an upstream server at a URL asks for a sign-in, the bridge signs in at its authorization server with OAuth. The first sign-in opens the browser during `initialize`. The browser opener gets only a one-time local start URL, and not the authorization URL. For a later sign-in, the client gets a URL elicitation. The bridge keeps the tokens in the keychain of the host, in encrypted files or in memory. `mcp-bridge-vscode logout` deletes a stored sign-in.
 
 A zig-sdk server can also put the bridge into its own executable with `vscode.serveStdio`. The first request of the client then selects revision 2025-11-25 or revision 2026-07-28. The section [The bridge in a zig-sdk server](#the-bridge-in-a-zig-sdk-server) gives the steps.
 
@@ -24,7 +24,7 @@ The first bridge is for Visual Studio Code (VS Code).
 
 | Bridge | Product | Client revision | Executable | Status |
 | --- | --- | --- | --- | --- |
-| `vscode` | Visual Studio Code | 2025-11-25 | `mcp-bridge-vscode` | M5: runtime, input requests, notifications, an HTTPS upstream server with OAuth, and `vscode.serveStdio` |
+| `vscode` | Visual Studio Code | 2025-11-25 | `mcp-bridge-vscode` | M6: runtime, input requests, notifications, an HTTPS upstream server with OAuth, `vscode.serveStdio`, and a one-time start URL for the sign-in |
 
 Each bridge has its own README. [`bridges/vscode/README.md`](bridges/vscode/README.md) tells how to build the `vscode` bridge and how to configure VS Code.
 

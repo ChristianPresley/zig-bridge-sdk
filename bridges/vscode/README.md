@@ -2,7 +2,7 @@
 
 `mcp-bridge-vscode` is a bridge between Visual Studio Code (VS Code) and an MCP server of specification revision 2026-07-28.[^mcp-2026] The MCP clients of VS Code speak revision 2025-11-25.[^mcp-2025] The bridge is a stdio server for VS Code. It starts the upstream server as a child process, or it connects to an upstream server at a URL over Streamable HTTP. It speaks to the upstream server with the `mcp.Client` of zig-sdk.
 
-This version is milestone M5. The bridge sends the input requests, the list changes, the resource updates and the log messages of the upstream server to VS Code. It also connects to an upstream server at an HTTPS URL, and it signs in with OAuth when that server asks for it. A zig-sdk server can also put the bridge into its own executable. The [Status](#status) section tells what each milestone adds.
+This version is milestone M6. The bridge sends the input requests, the list changes, the resource updates and the log messages of the upstream server to VS Code. It also connects to an upstream server at an HTTPS URL, and it signs in with OAuth when that server asks for it. For the sign-in, the browser gets a one-time local start URL. A zig-sdk server can also put the bridge into its own executable. The [Status](#status) section tells what each milestone adds.
 
 Visual Studio Code and VS Code are trademarks of Microsoft Corporation. This project has no affiliation with Microsoft, and Microsoft does not endorse it.
 
@@ -23,11 +23,11 @@ VS Code marks the Local harness for removal in a future release. Until VS Code s
 
 ## Status
 
-This is milestone M5. The bridge starts the upstream command and speaks to it over stdio, or it connects to the upstream server at a URL. It answers `initialize`, and it forwards the requests for tools, prompts, resources and completion. It also forwards the progress notifications of the upstream server and the cancellations of VS Code. When a tool, a prompt or a resource needs input, the bridge asks VS Code. The section [Input requests](#input-requests) gives the rules.
+This is milestone M6. The bridge starts the upstream command and speaks to it over stdio, or it connects to the upstream server at a URL. It answers `initialize`, and it forwards the requests for tools, prompts, resources and completion. It also forwards the progress notifications of the upstream server and the cancellations of VS Code. When a tool, a prompt or a resource needs input, the bridge asks VS Code. The section [Input requests](#input-requests) gives the rules.
 
 The bridge sends the list changes, the resource updates and the log messages of the upstream server to VS Code. It also sends the trace context of VS Code to the upstream server. The section [Notifications](#notifications) gives the rules. The section [Options](#options) gives the command line.
 
-For an upstream server at a URL, the bridge signs in at the authorization server of the upstream server, and it keeps the tokens. The sections [The URL form](#the-url-form), [Sign-in and accounts](#sign-in-and-accounts), [Token storage](#token-storage) and [Environment limits](#environment-limits) give the rules.
+For an upstream server at a URL, the bridge signs in at the authorization server of the upstream server, and it keeps the tokens. From M6, the browser opener gets only a one-time start URL on the redirect port, and not the authorization URL. The sections [The URL form](#the-url-form), [Sign-in and accounts](#sign-in-and-accounts), [Token storage](#token-storage) and [Environment limits](#environment-limits) give the rules.
 
 A zig-sdk server can put the bridge into its own executable with `vscode.serveStdio`. The section [The bridge in a zig-sdk server](#the-bridge-in-a-zig-sdk-server) gives the rules.
 
@@ -40,6 +40,7 @@ The [Roadmap](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/Roadmap) o
 | M3 | Notifications of list changes, resource subscriptions, the log level and the `_meta` keys of VS Code. M3 needs zig-sdk v0.4.0. |
 | M4 | An upstream server at an HTTPS URL, with OAuth sign-in, token storage and `logout`. M4 also needs zig-sdk v0.4.0. |
 | M5 | An API that puts the bridge into a zig-sdk server, so that one executable serves the two revisions. |
+| M6 | A one-time start URL for the browser of the sign-in. Other users of a shared host then cannot read the authorization URL in the arguments of the browser opener. |
 
 From M1, the two harnesses can list and call the tools of the upstream server. From M2, they can also complete the tools that need input. From M3, the Local harness lists the tools again after a call that changes them, before the next turn of the same chat request. An editor of a resource also shows the changes of the resource. The Copilot harness has no manual check of this yet.
 
@@ -193,7 +194,7 @@ These options apply only to the URL form:
 | `--account <label>` | The account of the stored sign-in. | `default` |
 | `--token-store <store>` | Where the bridge keeps the tokens: `auto`, `keychain`, `file` or `memory`. | `auto` |
 | `--token-key-file <path>` | The file with the key of the file store. Only your account can read it. | |
-| `--no-browser` | Do not open a browser. Write the URL of the sign-in to stderr only. | |
+| `--no-browser` | Do not open a browser. Write the URL of the sign-in to stderr only. We recommend it on a host that other users share (see [Environment limits](#environment-limits)). | |
 | `--sign-in-timeout <s>` | The time in seconds for the sign-in in the browser. | 300 |
 
 A static `Authorization` header (from `--header-env` or `--header`) and the sign-in options exclude each other. With such a header, the bridge does no sign-in. The bridge refuses the headers that the bridge or the HTTP connection sets, for example `Host`, `Content-Type` and `Accept`. It also refuses each name that starts with `mcp-`, and `Proxy-Authorization`. The executable has no option that permits `http` to other hosts. It also has no option that disables a check of the sign-in.
@@ -343,9 +344,9 @@ For an upstream server at a URL, VS Code gets only `data:` icons: of the server,
 
 An upstream server at a URL can ask for a sign-in with the status 401 or 403. The bridge then signs in at the authorization server of the upstream server with OAuth 2.1 and PKCE:
 
-1. The bridge listens for the redirect on `http://127.0.0.1:<port>/callback`, before the browser opens. The default port is 41894.
+1. The bridge listens for the redirect on `http://127.0.0.1:<port>/callback`, before the browser opens. The default port is 41894. For the browser, the same port also serves a one-time start URL `http://127.0.0.1:<port>/start/<token>`.
 2. The bridge writes the URL of the sign-in to stderr: `mcp-bridge-vscode: sign in at <url>`. VS Code shows the line in the Output channel of the server.
-3. During `initialize`, the bridge opens the URL in the browser. With `--no-browser`, it only writes the line.
+3. During `initialize`, the bridge opens the start URL in the browser. The start URL redirects the browser to the URL of the sign-in. A second request of the start URL stops the sign-in. With `--no-browser`, the bridge only writes the line.
 4. After `initialize`, the bridge never opens the browser itself. VS Code gets a URL elicitation with the URL. VS Code shows the full URL and asks you. When you accept, VS Code opens the URL.
 5. You sign in, and the browser goes to the redirect URI. The bridge gets the code and the tokens.
 
@@ -391,9 +392,10 @@ The file store protects the tokens against other accounts of the host and agains
 
 - Proxies: the bridge uses the proxy of `HTTPS_PROXY` or `ALL_PROXY` for the MCP requests and for the requests of the sign-in. `NO_PROXY` names the hosts without a proxy. A loopback host never uses a proxy. Put the user and the password of the proxy into the proxy URL. VS Code does not give its setting `http.proxy` to a stdio server. Thus set the variables in the `env` of the server entry, or in the environment of VS Code.
 - The sandbox of VS Code: with `sandboxEnabled`, the sandbox blocks the browser, the redirect port and the keychain. The variable `SANDBOX_RUNTIME=1` tells the bridge. A sign-in in the sandbox fails at once with an error that names the sandbox. Disable the sandbox for a server at a URL that needs a sign-in. This limit does not apply to the form with `--`.
-- Remote windows: a server of the workspace configuration runs on the remote host, for example over Secure Shell, in WSL or in a dev container. The bridge then opens the browser with the `$BROWSER` helper of VS Code. When the browser does not open, open the URL of the sign-in line in the Output channel. The redirect of the browser must reach the redirect port on the remote host. VS Code can forward the port. Else forward it in the Ports view of VS Code.
+- Remote windows: a server of the workspace configuration runs on the remote host, for example over Secure Shell, in WSL or in a dev container. The bridge then opens the start URL with the `$BROWSER` helper of VS Code. When the browser does not open, open the URL of the sign-in line in the Output channel. The start URL and the redirect both go to the redirect port on the remote host. VS Code can forward the port. Else forward it in the Ports view of VS Code.
 - Tokens on a remote host: the tokens of a server on a remote host stay on that host. A rebuild of a dev container removes them, unless the token directory is on a volume.
-- Shared hosts: on a POSIX host, other users can read the command lines of the processes. The browser opener gets the URL of the sign-in as its argument. Another user of the host can then send a redirect with the code of a different account to the bridge. On a host that other users share, use `--no-browser`, and open the URL of the sign-in line yourself.
+- Shared hosts: on a POSIX host, other users can read the command lines of the processes. Thus the browser opener gets only the one-time start URL, and not the URL of the sign-in with its `state` and its `code_challenge`. But another user of the host can read the start URL and send the first request. When that user completes a sign-in with a different account before your browser opens the start URL, the bridge gets the code for that account. The same applies when your browser does not open. On a host that other users share, use `--no-browser`, and open the URL of the sign-in line yourself.
+- The limits of `--no-browser` on a shared host: the option helps only when no program on that host gets the URL as an argument. For example, VS Code on that host starts `xdg-open` with the URL of a link that you click. In a remote window, VS Code opens the link on your computer. After `initialize`, VS Code gets the URL in a URL elicitation, also with `--no-browser`. On Linux, the administrator can also mount `/proc` with the option `hidepid`. Then users cannot read the command lines of other users.
 - VS Code for the Web cannot start the bridge.
 
 ## Input requests
@@ -542,8 +544,11 @@ These messages can occur in the channel:
 | `mcp-bridge-vscode: sign in at <url>` | The upstream server at a URL needs a sign-in. When no browser opens, open the URL in a browser. After `initialize`, VS Code also shows the URL in a URL elicitation. |
 | `mcp-bridge-vscode: bridge: warning: the bridge cannot start the browser opener: <error>` | The bridge cannot start `$BROWSER`, `open` or `xdg-open`. The line about the browser that did not open comes next. |
 | `mcp-bridge-vscode: bridge: warning: the browser opener stopped with an error` | The program that opens the browser stopped with an error. The line about the browser that did not open comes next. |
-| `mcp-bridge-vscode: bridge: warning: ShellExecuteW failed with the value N` | Windows did not open the URL, for example because no program opens `https` links. The line about the browser that did not open comes next. |
+| `mcp-bridge-vscode: bridge: warning: ShellExecuteW failed with the value N` | Windows did not open the start URL, for example because no program opens `http` links. The line about the browser that did not open comes next. |
 | `mcp-bridge-vscode: bridge: warning: the browser did not open: open the URL of the sign-in line in a browser` | The bridge cannot start a browser, for example on a host without a desktop. Open the URL of the sign-in line yourself. |
+| `mcp-bridge-vscode: bridge: warning: the bridge has no random data for the start URL, thus it does not open the browser` | The system gave the bridge no random data for the token of the start URL. The line about the browser that did not open comes next. Open the URL of the sign-in line yourself. |
+| `mcp-bridge-vscode: bridge: warning: The start URL of the sign-in received a second request, ...` | The start URL got a second request before the redirect. Another program on the host of the bridge possibly opened it, thus the bridge stopped the sign-in. The request gets an error. Restart the server to sign in again. When this occurs again on a host that other users share, use `--no-browser`. |
+| `mcp-bridge-vscode: bridge: warning: the start URL of the sign-in received a second request after the redirect. ...` | The start URL got a second request after the bridge received the redirect with a code. Another program possibly signed in with a different account. To be sure, run `mcp-bridge-vscode logout <url>`, and restart the server to sign in again. |
 | `mcp-bridge-vscode: bridge: warning: the authorization URL is not valid (<error>), thus the bridge does not open it` | The authorization server sent a URL that is not safe to open. The bridge did not write it and did not open it. |
 | `mcp-bridge-vscode: bridge: warning: the authorization URL has no state, thus the bridge does not open it` | Without the `state`, the bridge cannot identify the redirect. The bridge did not write the URL and did not open it. |
 | `mcp-bridge-vscode: bridge: warning: the redirect URI of the authorization URL is not the redirect URI of the receiver` | The URL sends the browser to a different redirect URI. The bridge did not write the URL and did not open it. |
@@ -601,6 +606,7 @@ The bridge sends these error messages. Each error also has `data.cause`, except 
 | `MPC -32603: The authorization server sent an authorization URL that is not valid. ...` | The authorization URL failed a check of the bridge. The bridge did not write it and did not open it. The Output channel tells which check failed. |
 | `MPC -32603: The authorization server refused the access. ...` | You denied the access in the browser. |
 | `MPC -32603: The authorization server sent an error for the sign-in. ...` | The redirect has an error other than `access_denied`. The Output channel gives the error code. |
+| `MPC -32603: The start URL of the sign-in received a second request, thus the bridge stopped the sign-in. ...` | The start URL got a second request during the sign-in. Another program on the host of the bridge possibly opened it. Restart the server to sign in again. When this occurs again on a host that other users share, use `--no-browser`. |
 | `MPC -32603: The upstream server refused the access after the sign-in. ...` | The account possibly does not have the necessary permissions. |
 | `MPC -32603: The upstream server needs a sign-in, but the bridge runs in the sandbox of VS Code. ...` | Disable the sandbox for this server. |
 | `MPC -32603: The sign-in at the authorization server of the upstream server failed. ...` | A different failure of the sign-in. `data.detail` gives the cause, and the Output channel has more lines. |
