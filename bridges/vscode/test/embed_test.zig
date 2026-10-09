@@ -711,6 +711,8 @@ test "two messages in one chunk: initialize and notifications/initialized" {
     try expectLegacyInitialize(try run.response(1));
     try testing.expect((try h.expectResult(try run.response(2))) == .object);
     // No line got an error, and the notification before the result started no listen stream.
+    // On a count that differs, the frames go to the log, with their methods.
+    if (run.frames.len != 2) run.printFrames();
     try testing.expectEqual(@as(usize, 2), run.frames.len);
     try run.verify();
 }
