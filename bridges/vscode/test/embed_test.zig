@@ -723,6 +723,23 @@ test "two messages in one chunk: initialize and notifications/initialized" {
     try run.verify();
 }
 
+test "notifications/initialized after the initialize result starts the listen stream before the next result" {
+    // The race of the test above, in a fixed order: the notification comes after the result of
+    // initialize. The listen stream then gives its list changes before the ping result.
+    const steps = [_]Step{
+        .{ .bytes = vscode_initialize },
+        .{ .after = .{ .response = 1 }, .bytes = initialized },
+        .{ .after = .{ .method = "notifications/resources/list_changed" }, .bytes = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n" },
+        .{ .after = .{ .response = 2 } },
+    };
+    const run = try serve(.{ .input = .{ .script = &steps } });
+    defer run.destroy();
+    try testing.expectEqual(Era.legacy, run.era);
+    try expectLegacyInitialize(try run.response(1));
+    try testing.expect((try h.expectResult(try run.response(2))) == .object);
+    try run.verify();
+}
+
 test "the legacy path: the list changes of the server reach VS Code over the memory link, and the end of the input with the listen stream stops at once" {
     const toggle_off = request("2", "tools/call", "{\"name\":\"toggle\",\"arguments\":{\"enabled\":false}}");
     const toggle_on = request("4", "tools/call", "{\"name\":\"toggle\",\"arguments\":{\"enabled\":true}}");
