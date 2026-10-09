@@ -147,6 +147,7 @@ Each release of zig-bridge-sdk pins one release of zig-sdk. `VERSIONING.md` give
 
 | zig-bridge-sdk | zig-sdk | zig-sdk commit |
 | --- | --- | --- |
+| 0.1.2 | 0.5.1 (`v0.5.1`) | `52fc1b83c5f70f9e6a1fc2f1e2e71250656672cc` |
 | 0.1.1 | 0.5.1 (`v0.5.1`) | `52fc1b83c5f70f9e6a1fc2f1e2e71250656672cc` |
 | 0.1.0 | 0.4.0 (`v0.4.0`) | `8334b1501644c9f8e1f65f7e24b1ef86b335093f` |
 

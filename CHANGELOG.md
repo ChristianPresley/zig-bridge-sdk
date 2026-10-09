@@ -4,6 +4,8 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-09
+
 ### Fixed
 
 - `bridge`: a `notifications/initialized` that reached the front end before the `initialize` result could start the listen stream. The state becomes `ready` a little before the result goes out, and the listener started in that window. The listener now starts only after the result, as the doc of the front end says. Such a notification gets no list changes, and the test of the two messages in one chunk has an exact frame count again.
@@ -147,6 +149,7 @@ Milestone M6 protects the sign-in on a POSIX host that other users share. On suc
 - `vscode`: `bridges/vscode/README.md` has the new lines of the Output channel and the new error message of M6. The status sections of `README.md` and `bridges/vscode/README.md` name M6.
 - Repository: the tests of M6. The unit tests of `bridge.oauth` cover the start path and a guess of the token. They also cover a second `GET` during the wait and after the redirect, and the page before the stop. The transcript tests and a process test check that the opener gets only the start URL. In the process test, a `BROWSER` script starts `bridge-fixture-server --browse`, the browser of the test.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ChristianPresley/zig-bridge-sdk/releases/tag/v0.1.0
