@@ -698,8 +698,9 @@ test "a line that is too long first gets no response and selects no path" {
 
 test "two messages in one chunk: initialize and notifications/initialized" {
     // The two lines and a ping come in one read. The front end reads the lines after
-    // initialize from the buffer of the same reader. It ignores a notifications/initialized
-    // before the initialize result, thus the ping shows that no byte is lost.
+    // initialize from the buffer of the same reader, and the ping shows that no byte is lost.
+    // A notifications/initialized that the reader handles after the result may start the
+    // listen stream, so the test accepts its list changes and nothing else.
     const steps = [_]Step{
         .{ .bytes = vscode_initialize ++ initialized ++ "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n" },
         .{ .after = .{ .response = 1 } },
@@ -710,10 +711,16 @@ test "two messages in one chunk: initialize and notifications/initialized" {
     try testing.expectEqual(Era.legacy, run.era);
     try expectLegacyInitialize(try run.response(1));
     try testing.expect((try h.expectResult(try run.response(2))) == .object);
-    // No line got an error, and the notification before the result started no listen stream.
-    // On a count that differs, the frames go to the log, with their methods.
-    if (run.frames.len != 2) run.printFrames();
-    try testing.expectEqual(@as(usize, 2), run.frames.len);
+    // No line got an error. The reader can handle the notification after the result of initialize
+    // went out, when the reader lags the upstream server. Then the listen stream starts, and its
+    // list changes come before the ping result. Those are the only other frames.
+    for (run.frames) |frame| {
+        if (frame != .object) return error.UnexpectedFrame;
+        if (frame.object.get("error") != null) return error.UnexpectedErrorFrame;
+        if (frame.object.get("id") != null) continue;
+        const method = mcp.json.getString(frame, "method") orelse return error.UnexpectedFrame;
+        try testing.expect(std.mem.endsWith(u8, method, "/list_changed"));
+    }
     try run.verify();
 }
 

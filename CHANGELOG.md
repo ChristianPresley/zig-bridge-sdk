@@ -4,6 +4,10 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
+### Fixed
+
+- `bridge`: the test of two messages in one chunk accepts the list changes of a listen stream after the result of `initialize`. A `notifications/initialized` in the same read can be handled after the result, when the reader lags the upstream server. The correction to the notes of 0.1.2: that release does not give an exact frame count for this test. The cause was observed on macOS ReleaseSafe: the frames were the result, the three list changes and the ping result.
+
 ## [0.1.2] - 2026-10-09
 
 ### Fixed
