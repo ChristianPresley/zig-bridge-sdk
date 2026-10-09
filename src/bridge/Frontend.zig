@@ -98,6 +98,10 @@ listener: notify.Listener,
 declared: translate.Declared = .{},
 /// True after the start of the listener. Guarded by `in_flight_lock`.
 listening: bool = false,
+/// True after the `initialize` result went out. The state is `ready` a little before that, and a
+/// `notifications/initialized` in that window must start nothing, as the client sends it only
+/// after the result.
+answered_initialize: std.atomic.Value(bool) = .init(false),
 /// True when the `initialize` request of the client declared URL elicitation. `runInitialize`
 /// sets it before the state becomes `ready`.
 client_url_elicitation: bool = false,
@@ -691,7 +695,7 @@ fn handleNotification(self: *Frontend, arena: Allocator, n: Message.Notification
 /// thus `stopAdmission` sees it. A second `notifications/initialized`, and one before the
 /// `initialize` result, start nothing.
 fn startListener(self: *Frontend) void {
-    if (self.lifecycle.load(.acquire) != .ready) return log.debug("ignored notifications/initialized: the connection is not ready", .{});
+    if (self.lifecycle.load(.acquire) != .ready or !self.answered_initialize.load(.acquire)) return log.debug("ignored notifications/initialized: the connection is not ready", .{});
     const d = self.declared;
     if (!d.listens()) return;
     self.in_flight_lock.lockUncancelable(self.io);
@@ -881,6 +885,7 @@ fn runInitialize(self: *Frontend, slot: *Slot) void {
     if (self.lifecycle.cmpxchgStrong(.initializing, .ready, .acq_rel, .acquire) != null) return;
     log.info("the upstream server is ready", .{});
     self.respond(slot, result);
+    self.answered_initialize.store(true, .release);
 }
 
 /// Stop the upstream server, return to `awaiting_initialize`, then answer with `err`. Thus a

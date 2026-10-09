@@ -4,6 +4,10 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
+### Fixed
+
+- `bridge`: a `notifications/initialized` that reached the front end before the `initialize` result could start the listen stream. The state becomes `ready` a little before the result goes out, and the listener started in that window. The listener now starts only after the result, as the doc of the front end says. Such a notification gets no list changes, and the test of the two messages in one chunk has an exact frame count again.
+
 ## [0.1.1] - 2026-10-09
 
 ### Changed

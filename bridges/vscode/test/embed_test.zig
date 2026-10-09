@@ -710,16 +710,8 @@ test "two messages in one chunk: initialize and notifications/initialized" {
     try testing.expectEqual(Era.legacy, run.era);
     try expectLegacyInitialize(try run.response(1));
     try testing.expect((try h.expectResult(try run.response(2))) == .object);
-    // No line got an error. The notifications/initialized of this chunk can arrive after the
-    // initialize result. Then it starts the listen stream, and the server sends its list
-    // changes before the ping result. Thus the other frames can only be notifications.
-    for (run.frames) |frame| {
-        if (frame != .object) return error.UnexpectedFrame;
-        if (frame.object.get("error") != null) return error.UnexpectedErrorFrame;
-        if (mcp.json.getString(frame, "method")) |method| {
-            try testing.expect(std.mem.startsWith(u8, method, "notifications/"));
-        }
-    }
+    // No line got an error, and the notification before the result started no listen stream.
+    try testing.expectEqual(@as(usize, 2), run.frames.len);
     try run.verify();
 }
 
