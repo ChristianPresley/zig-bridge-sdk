@@ -1,12 +1,12 @@
 .{
     .name = .bridge_sdk,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .fingerprint = 0x29b9c5f3bbd9826, // Changing this has security and trust implications.
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .mcp = .{
-            .url = "git+https://github.com/ChristianPresley/zig-sdk#7a937c450ad6a9898dabe55e428b9f38d41730a7",
-            .hash = "mcp-0.5.0-1aexQKUzNwChSznfgEb_J1kjh2RqY58wLaEL0Z6KhFSS",
+            .url = "git+https://github.com/ChristianPresley/zig-sdk#52fc1b83c5f70f9e6a1fc2f1e2e71250656672cc",
+            .hash = "mcp-0.5.1-1aexQEpBNwCH8d4mZSo3wmAj8eWiVL0IsYanbcGNtk2g",
         },
     },
     .paths = .{

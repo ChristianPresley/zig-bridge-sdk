@@ -4,9 +4,11 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-09
+
 ### Changed
 
-- Package: the pin of zig-sdk moves to the commit `7a937c450ad6a9898dabe55e428b9f38d41730a7` of zig-sdk pull request #36. That commit has zig-sdk 0.5.0 and a fix of `mcp.util.wake.wakeIp`. No tag of zig-sdk has this fix yet. Before the next release of zig-bridge-sdk, the pin moves to the commit of a tag.
+- Package: the pin of zig-sdk moves to the commit `52fc1b83c5f70f9e6a1fc2f1e2e71250656672cc` of the tag `v0.5.1` of zig-sdk. That release has the fixes of `mcp.util.wake.wakeIp` and of the stop of the servers after a cancel. Before, the pin was an untagged commit of zig-sdk pull request #36.
 - Package: from zig-sdk 0.5.0, the Secret Service backend of the keychain has time limits. Each answer of the Secret Service has a limit of 25 seconds, and a prompt to the user has a limit of 5 minutes. At a limit, the keychain store of the bridge gets `error.KeychainUnavailable` or `error.KeychainLocked`.
 
 ### Fixed
@@ -141,5 +143,6 @@ Milestone M6 protects the sign-in on a POSIX host that other users share. On suc
 - `vscode`: `bridges/vscode/README.md` has the new lines of the Output channel and the new error message of M6. The status sections of `README.md` and `bridges/vscode/README.md` name M6.
 - Repository: the tests of M6. The unit tests of `bridge.oauth` cover the start path and a guess of the token. They also cover a second `GET` during the wait and after the redirect, and the page before the stop. The transcript tests and a process test check that the opener gets only the start URL. In the process test, a `BROWSER` script starts `bridge-fixture-server --browse`, the browser of the test.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ChristianPresley/zig-bridge-sdk/releases/tag/v0.1.0
