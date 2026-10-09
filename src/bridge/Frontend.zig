@@ -98,9 +98,9 @@ listener: notify.Listener,
 declared: translate.Declared = .{},
 /// True after the start of the listener. Guarded by `in_flight_lock`.
 listening: bool = false,
-/// True after the `initialize` result went out. The state is `ready` a little before that, and a
-/// `notifications/initialized` in that window must start nothing, as the client sends it only
-/// after the result.
+/// True once the `initialize` result is about to go out. The state is `ready` before that. A
+/// `notifications/initialized` in that window starts nothing, because the client sends it
+/// only after the result.
 answered_initialize: std.atomic.Value(bool) = .init(false),
 /// True when the `initialize` request of the client declared URL elicitation. `runInitialize`
 /// sets it before the state becomes `ready`.
@@ -884,8 +884,9 @@ fn runInitialize(self: *Frontend, slot: *Slot) void {
     // client can come at once. At the end of the input, the state is `closing`.
     if (self.lifecycle.cmpxchgStrong(.initializing, .ready, .acq_rel, .acquire) != null) return;
     log.info("the upstream server is ready", .{});
-    self.respond(slot, result);
+    // Before the write: a client sends notifications/initialized only after it reads the result.
     self.answered_initialize.store(true, .release);
+    self.respond(slot, result);
 }
 
 /// Stop the upstream server, return to `awaiting_initialize`, then answer with `err`. Thus a
