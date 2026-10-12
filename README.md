@@ -32,7 +32,7 @@ Each bridge has its own README. [`bridges/vscode/README.md`](bridges/vscode/READ
 
 VS Code has two MCP clients. The Local harness operates the MCP user interface of VS Code. It speaks only revision 2025-11-25, and it starts each connection with `initialize`. A server of zig-sdk speaks only revision 2026-07-28. On stdio, it answers `initialize` with error -32601. Thus the Local harness cannot use a server of zig-sdk without a bridge.
 
-The Copilot harness first sends `server/discover`, so it can list and call the tools of a server of zig-sdk. But it has no support for multi round-trip requests, so a tool that asks for input cannot complete. `bridges/vscode/README.md` gives the details. The issue `microsoft/vscode#329848` records the request for revision 2026-07-28 in VS Code, and it is open.[^vscode-issue]
+The Copilot harness first sends `server/discover`, so it can list and call the tools of a server of zig-sdk. From Copilot runtime 1.0.95, it also has support for multi round-trip requests, and a tool that asks for input completes. An older Copilot harness cannot complete such a tool without the bridge. `bridges/vscode/README.md` gives the details. The issue `microsoft/vscode#329848` records the request for revision 2026-07-28 in VS Code, and it is open.[^vscode-issue]
 
 ## The package model
 
