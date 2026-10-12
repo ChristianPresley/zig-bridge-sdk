@@ -4,6 +4,10 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
+### Changed
+
+- `vscode`: the README says that the Copilot harness has MRTR with Copilot runtime 1.0.92 and later. Before, it said from 1.0.95. The manual check of 2026-10-12 in the stable VS Code 1.141.0 observed the MRTR rounds with Copilot runtime 1.0.92-4. That runtime answers a sampling request with the `stopReason` `cancelled`, without a consent dialog. The wiki page VS-Code has the third table of the check.
+
 ### Fixed
 
 - Repository: two corrections to the notes of 0.1.0. The release has the milestones M0 to M6, and not M0 to M5 as its first sentence says. The tag `v0.4.0` of zig-sdk is on the commit `8334b15`, thus the pin of 0.1.0 was not before the tag.

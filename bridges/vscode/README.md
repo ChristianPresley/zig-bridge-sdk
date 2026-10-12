@@ -11,7 +11,7 @@ Visual Studio Code and VS Code are trademarks of Microsoft Corporation. This pro
 VS Code 1.140 has two MCP clients: the Local harness and the Copilot harness. The setting `chat.defaultToCopilotHarness` selects the Copilot harness for the chat. It is false by default, and VS Code also enables the Copilot harness by experiment. In VS Code 1.142, the chat input also has a harness picker with the entries Copilot, Local, Cloud, Claude and Codex. The command `code-insiders chat` starts a new chat with the Copilot harness.
 
 - The Local harness operates the MCP user interface of VS Code: the server list, the prompts, the resources and the Output channel. It speaks only revision 2025-11-25 and starts each connection with an `initialize` request. A zig-sdk server answers `initialize` with the error -32601 (method not found), so the Local harness cannot use it.
-- The Copilot harness first sends `server/discover`. When the server answers with -32601, the harness sends `initialize` instead. From Copilot runtime 1.0.95, it has support for multi round-trip requests (MRTR).[^copilot-mrtr] An older harness can list and call the tools of a 2026-07-28 server, but a tool that asks for input cannot complete there.
+- The Copilot harness first sends `server/discover`. When the server answers with -32601, the harness sends `initialize` instead. With Copilot runtime 1.0.92 and later, it has support for multi round-trip requests (MRTR).[^copilot-mrtr] An older harness can list and call the tools of a 2026-07-28 server, but a tool that asks for input cannot complete there.
 
 VS Code marks the Local harness for removal in a future release. Until VS Code speaks revision 2026-07-28,[^vscode-2026] the bridge gives the two harnesses a server of revision 2025-11-25:
 
@@ -44,9 +44,9 @@ The [Roadmap](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/Roadmap) o
 
 From M1, the two harnesses can list and call the tools of the upstream server. From M2, they can also complete the tools that need input. From M3, the Local harness lists the tools again after a call that changes them, before the next turn of the same chat request. An editor of a resource also shows the changes of the resource. The Copilot harness lists the tools again after each call.
 
-The Local harness had a manual check on 2026-10-12 with VS Code Insiders 1.121. The Copilot harness had a manual check on the same day with VS Code Insiders 1.142 and Copilot runtime 1.0.95. The wiki section [Manual check in VS Code](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/VS-Code#manual-check-in-vs-code) gives the results.
+The Local harness had a manual check on 2026-10-12 with VS Code Insiders 1.121. The Copilot harness had a manual check on the same day with VS Code Insiders 1.142 and Copilot runtime 1.0.95. A third check on the same day used the stable VS Code 1.141 with Copilot runtime 1.0.92. The wiki section [Manual check in VS Code](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/VS-Code#manual-check-in-vs-code) gives the results.
 
-From M5, the Local harness can use a zig-sdk server that calls `vscode.serveStdio`, without `mcp-bridge-vscode`. By default, the Copilot harness takes the modern path of such a server. From Copilot runtime 1.0.95, a tool that asks for input also completes on that path. The option `.discover = .refuse` sends an older Copilot harness to the bridge.
+From M5, the Local harness can use a zig-sdk server that calls `vscode.serveStdio`, without `mcp-bridge-vscode`. By default, the Copilot harness takes the modern path of such a server. With Copilot runtime 1.0.92 and later, a tool that asks for input also completes on that path. The option `.discover = .refuse` sends an older Copilot harness to the bridge.
 
 ## Build and install
 
@@ -94,7 +94,7 @@ The upstream server of the tests, `bridge-fixture-server`, is a zig-sdk server w
 4. Open the Chat view in agent mode. Make sure that the tools of the server are in the tool list.
 5. Ask the chat to call `echo` or `add`. These tools are safe: they only send a result back.
 
-Do not call `crash` or `shutdown`. These tools stop the fixture server. The [manual check of 2026-10-12](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/VS-Code#manual-check-in-vs-code) used this procedure. The section [The file `.vscode/mcp.json`](#the-file-vscodemcpjson) gives the rules of the configuration. The [messages of the Output channel](#troubleshooting) tell the cause of a problem.
+Do not call `crash` or `shutdown`. These tools stop the fixture server. The [manual check of 2026-10-12](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/VS-Code#manual-check-in-vs-code) used this procedure, and so did the [check in the stable VS Code 1.141](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/VS-Code#manual-check-in-vs-code) of the same day. The section [The file `.vscode/mcp.json`](#the-file-vscodemcpjson) gives the rules of the configuration. The [messages of the Output channel](#troubleshooting) tell the cause of a problem.
 
 ### Remote windows
 
@@ -178,7 +178,7 @@ At the end of stdin, `vscode.serveStdio` ends the listen streams. The requests i
 
 ### The Copilot harness and an embedded server
 
-The Copilot harness sends `server/discover` first. By default, your server answers it, and the harness takes the modern path. From Copilot runtime 1.0.95, the harness does the MRTR rounds on that path,[^copilot-mrtr] and a tool that asks for input completes. The manual check of 2026-10-12 observed this with the consumer example. An older harness has no MRTR, thus a tool that asks for input cannot complete there. The other tools operate.
+The Copilot harness sends `server/discover` first. By default, your server answers it, and the harness takes the modern path. With Copilot runtime 1.0.92 and later, the harness does the MRTR rounds on that path,[^copilot-mrtr] and a tool that asks for input completes. The manual checks of 2026-10-12 observed this with the consumer example, with the runtimes 1.0.92 and 1.0.95. An older harness has no MRTR, thus a tool that asks for input cannot complete there. The other tools operate.
 
 For an older harness, give `.{ .discover = .refuse }` to `vscode.serveStdio`. The harness then gets -32601 for `server/discover` and sends `initialize`, and the bridge does the MRTR rounds for it. With this option, a client of revision 2026-07-28 that needs a `server/discover` result cannot use your server. A client that sends its requests without `server/discover` still takes the modern path.
 
@@ -445,7 +445,7 @@ A server of revision 2026-07-28 asks for input with a result of the type `input_
 | --- | --- | --- |
 | A form | `elicitation/create` with `mode: "form"` | It shows the questions of the form to the user. |
 | A URL | `elicitation/create` with `mode: "url"` | It shows the URL, and the user can open it in the web browser. |
-| Sampling | `sampling/createMessage` | It asks the user for consent, then it sends the messages to a language model. |
+| Sampling | `sampling/createMessage` | It asks the user for consent, then it sends the messages to a language model. Copilot runtime 1.0.92 shows no consent dialog, and it answers with the `stopReason` `cancelled` and the text "The user cancelled the request.". Copilot runtime 1.0.95 asks for consent and gives the answer of a model. |
 | Roots | `roots/list` | It gives the folders of the workspace. |
 
 The bridge declares to the upstream server the input kinds that VS Code declares. The Copilot harness declares no roots. The upstream server then refuses a roots input request with -32021, and the bridge forwards the error. Before VS Code gets an input request, the bridge examines it:
