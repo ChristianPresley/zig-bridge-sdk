@@ -272,6 +272,9 @@ fn addSchemaImports(b: *std.Build, module: *std.Build.Module) void {
 /// status still fails, and the test runner writes its error return trace. The root of a
 /// test is the test runner, thus a test file cannot set the option itself.
 ///
+/// Zig 0.17.0 maps the status to `error.ConnectionResetByPeer` (Zig pull request 32027 on
+/// Codeberg). Remove the change when the project moves to that release.
+///
 /// With `fuzz`, the copy also corrects the fuzz path: the runner of Zig 0.16.0 gives a
 /// `builtin.StackTrace` to `std.debug.writeStackTrace`, but that function takes a
 /// `debug.StackTrace`. Thus no test with a fuzz target compiles with `-ffuzz`. The copy calls
