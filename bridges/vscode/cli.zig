@@ -100,8 +100,8 @@ pub const usage = std.fmt.comptimePrint(
     \\                               <command> without its extension, or the host of <url>.
     \\  --log-level <level>          The level of the log lines on stderr: err, warn, info
     \\                               or debug. The default is info.
-    \\  --discover-timeout <s>       The time in seconds for the first response of the
-    \\                               upstream server. The default is {d}.
+    \\  --discover-timeout <s>       The time in seconds for the answer of the upstream
+    \\                               server to server/discover. The default is {d}.
     \\  --max-line-bytes <n>         The maximum length of one message in bytes, from 1 to
     \\                               {d}. The default is {d} (64 MiB).
     \\  --help                       Show this text.
