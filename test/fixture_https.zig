@@ -500,8 +500,11 @@ const Connection = struct {
             .allow_truncation_attacks = true,
         });
         // The front sends no close_notify. HTTP gives the length of each message. The client
-        // often closes first after the response, and the write then fails. On Windows, Zig std
-        // writes a stack trace for that failure in a Debug build.
+        // often closes first after the response, and the write then fails. A client that does
+        // not trust the CA resets the connection during the handshake, and the read of the
+        // accept fails. On Windows, Zig std maps these failures to error.Unexpected and writes
+        // a stack trace in a Debug build. The test runner of the build turns that trace off
+        // there (see testRunner in build.zig).
         defer tls_conn.deinit();
         var http_server: http.Server = .init(&tls_conn.reader, &tls_conn.writer);
         var served: usize = 0;

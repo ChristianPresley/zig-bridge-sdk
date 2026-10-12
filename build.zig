@@ -101,7 +101,7 @@ pub fn build(b: *std.Build) void {
     // runner whose fuzz path compiles, and the LLVM backend, because the self-hosted backend of
     // Debug builds emits no `__sancov_pcs1` table and the fuzzer then sees no coverage.
     const fuzz = b.option(bool, "fuzz", "Prepare the unit tests for --fuzz on Zig 0.16.0") orelse false;
-    const test_runner: ?std.Build.Step.Compile.TestRunner = if (fuzz) fuzzTestRunner(b) else null;
+    const test_runner: ?std.Build.Step.Compile.TestRunner = testRunner(b, target.result.os.tag == .windows, fuzz);
     const use_llvm: ?bool = if (fuzz) true else null;
 
     const test_step = b.step("test", "Run all tests");
@@ -261,20 +261,42 @@ fn addSchemaImports(b: *std.Build, module: *std.Build.Module) void {
     module.addAnonymousImport("schema_2026_07_28", .{ .root_source_file = b.path("test/fixtures/mcp_schema_2026_07_28/schema.json") });
 }
 
-/// The fuzz path of the test runner of Zig 0.16.0 gives a `builtin.StackTrace` to
-/// `std.debug.writeStackTrace`, but that function takes a `debug.StackTrace`. Thus no test
-/// with a fuzz target compiles with `-ffuzz`. This makes a copy of the runner of the installed
-/// toolchain with `std.debug.writeErrorReturnTrace` in that call. The repository keeps no copy.
-fn fuzzTestRunner(b: *std.Build) std.Build.Step.Compile.TestRunner {
+/// Gives the tests a copy of the test runner of the installed toolchain with one or two changes.
+/// The result is null when the tests need no change. The repository keeps no copy.
+///
+/// On Windows, the copy sets `unexpected_error_tracing` of `std.Options` to false. Zig std
+/// 0.16.0 maps the status `CONNECTION_RESET` of a read to `error.Unexpected`, and in a Debug
+/// build it then writes a stack trace to stderr. A client that does not trust the CA of the
+/// HTTPS fixture resets the connection during the handshake, and the fixture handles the
+/// error. With the change, the tests pass without that trace. A test with an unexpected
+/// status still fails, and the test runner writes its error return trace. The root of a
+/// test is the test runner, thus a test file cannot set the option itself.
+///
+/// With `fuzz`, the copy also corrects the fuzz path: the runner of Zig 0.16.0 gives a
+/// `builtin.StackTrace` to `std.debug.writeStackTrace`, but that function takes a
+/// `debug.StackTrace`. Thus no test with a fuzz target compiles with `-ffuzz`. The copy calls
+/// `std.debug.writeErrorReturnTrace` in that place.
+fn testRunner(b: *std.Build, windows: bool, fuzz: bool) ?std.Build.Step.Compile.TestRunner {
+    if (!windows and !fuzz) return null;
     const sub_path = "compiler/test_runner.zig";
-    const source = b.graph.zig_lib_directory.handle.readFileAlloc(b.graph.io, sub_path, b.allocator, .limited(1 << 20)) catch |err|
+    var source: []const u8 = b.graph.zig_lib_directory.handle.readFileAlloc(b.graph.io, sub_path, b.allocator, .limited(1 << 20)) catch |err|
         std.debug.panic("cannot read {s} of the Zig library: {t}", .{ sub_path, err });
-    const needle = "std.debug.writeStackTrace(trace, stderr)";
-    if (std.mem.count(u8, source, needle) != 1)
-        std.debug.panic("{s} of the Zig library does not have one '{s}'; remove -Dfuzz", .{ sub_path, needle });
-    const fixed = std.mem.replaceOwned(u8, b.allocator, source, needle, "std.debug.writeErrorReturnTrace(trace, stderr)") catch @panic("OOM");
+    if (windows) {
+        source = replaceOnce(b, sub_path, source, "    .logFn = log,", "    .logFn = log,\n    .unexpected_error_tracing = false,");
+    }
+    if (fuzz) {
+        source = replaceOnce(b, sub_path, source, "std.debug.writeStackTrace(trace, stderr)", "std.debug.writeErrorReturnTrace(trace, stderr)");
+    }
     const files = b.addWriteFiles();
-    return .{ .path = files.add("fuzz_test_runner.zig", fixed), .mode = .server };
+    return .{ .path = files.add("test_runner.zig", source), .mode = .server };
+}
+
+/// Replaces the one occurrence of `needle` in `source`. A different count of occurrences stops
+/// the build, because the toolchain then differs from the one that the change expects.
+fn replaceOnce(b: *std.Build, sub_path: []const u8, source: []const u8, needle: []const u8, replacement: []const u8) []const u8 {
+    if (std.mem.count(u8, source, needle) != 1)
+        std.debug.panic("{s} of the Zig library does not have one '{s}'", .{ sub_path, needle });
+    return std.mem.replaceOwned(u8, b.allocator, source, needle, replacement) catch @panic("OOM");
 }
 
 fn addTool(b: *std.Build, step_name: []const u8, description: []const u8, source: []const u8, default_args: []const []const u8) void {
