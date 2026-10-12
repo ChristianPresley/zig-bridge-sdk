@@ -12,7 +12,7 @@ The bridge answers `initialize`, and it forwards the requests for tools, prompts
 
 The bridge also sends the list changes, the resource updates and the log messages of the upstream server to the client. When the upstream server declares them, the bridge keeps a listen stream open for the list changes and the resource updates. The log messages come with the requests. The client can subscribe to a resource and set the log level. The trace context and the `vscode.` keys in the `_meta` of the client go to the upstream server.
 
-When an upstream server at a URL asks for a sign-in, the bridge signs in at its authorization server with OAuth. The first sign-in opens the browser during `initialize`. The browser opener gets only a one-time local start URL, and not the authorization URL. For a later sign-in, the client gets a URL elicitation. The bridge keeps the tokens in the keychain of the host, in encrypted files or in memory. `mcp-bridge-vscode logout` deletes a stored sign-in.
+When an upstream server at a URL asks for a sign-in, the bridge signs in at its authorization server with OAuth. Before `notifications/initialized`, the first sign-in opens the browser. The browser opener gets only a one-time local start URL, and not the authorization URL. For a later sign-in, the client gets a URL elicitation. The bridge keeps the tokens in the keychain of the host, in encrypted files or in memory. `mcp-bridge-vscode logout` deletes a stored sign-in.
 
 A zig-sdk server can also put the bridge into its own executable with `vscode.serveStdio`. The first request of the client then selects revision 2025-11-25 or revision 2026-07-28. The section [The bridge in a zig-sdk server](#the-bridge-in-a-zig-sdk-server) gives the steps.
 
