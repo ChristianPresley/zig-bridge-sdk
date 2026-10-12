@@ -44,7 +44,7 @@ The [Roadmap](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/Roadmap) o
 
 From M1, the two harnesses can list and call the tools of the upstream server. From M2, they can also complete the tools that need input. From M3, the Local harness lists the tools again after a call that changes them, before the next turn of the same chat request. An editor of a resource also shows the changes of the resource. The Copilot harness lists the tools again after each call.
 
-The Local harness had a manual check on 2026-10-12 with VS Code Insiders 1.121. The Copilot harness had a manual check on the same day with VS Code Insiders 1.142 and Copilot runtime 1.0.95. A third check on the same day used the stable VS Code 1.141 with Copilot runtime 1.0.92. The wiki section [Manual check in VS Code](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/VS-Code#manual-check-in-vs-code) gives the results.
+The Local harness had a manual check on 2026-10-12 with VS Code Insiders 1.121. The Copilot harness had a manual check on the same day with VS Code Insiders 1.142 and Copilot runtime 1.0.95. Two checks on the same day used the stable VS Code 1.141: the Copilot harness with Copilot runtime 1.0.92, and the Local harness through the extension API, with the roots and the OAuth sign-in. The wiki section [Manual check in VS Code](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/VS-Code#manual-check-in-vs-code) gives the results.
 
 From M5, the Local harness can use a zig-sdk server that calls `vscode.serveStdio`, without `mcp-bridge-vscode`. By default, the Copilot harness takes the modern path of such a server. With Copilot runtime 1.0.92 and later, a tool that asks for input also completes on that path. The option `.discover = .refuse` sends an older Copilot harness to the bridge.
 
@@ -94,7 +94,7 @@ The upstream server of the tests, `bridge-fixture-server`, is a zig-sdk server w
 4. Open the Chat view in agent mode. Make sure that the tools of the server are in the tool list.
 5. Ask the chat to call `echo` or `add`. These tools are safe: they only send a result back.
 
-Do not call `crash` or `shutdown`. These tools stop the fixture server. The [manual check of 2026-10-12](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/VS-Code#manual-check-in-vs-code) used this procedure, and so did the [check in the stable VS Code 1.141](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/VS-Code#manual-check-in-vs-code) of the same day. The section [The file `.vscode/mcp.json`](#the-file-vscodemcpjson) gives the rules of the configuration. The [messages of the Output channel](#troubleshooting) tell the cause of a problem.
+Do not call `crash` or `shutdown`. These tools stop the fixture server. The [manual check of 2026-10-12](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/VS-Code#manual-check-in-vs-code) used this procedure, and so did the [checks in the stable VS Code 1.141](https://github.com/ChristianPresley/zig-bridge-sdk/wiki/VS-Code#manual-check-in-vs-code) of the same day. The section [The file `.vscode/mcp.json`](#the-file-vscodemcpjson) gives the rules of the configuration. The [messages of the Output channel](#troubleshooting) tell the cause of a problem.
 
 ### Remote windows
 

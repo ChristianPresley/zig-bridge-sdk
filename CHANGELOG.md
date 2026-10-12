@@ -6,7 +6,7 @@ This file records all notable changes to this project. The format follows Keep a
 
 ### Changed
 
-- `vscode`: the README says that the Copilot harness has MRTR with Copilot runtime 1.0.92 and later. Before, it said from 1.0.95. The manual check of 2026-10-12 in the stable VS Code 1.141.0 observed the MRTR rounds with Copilot runtime 1.0.92-4. That runtime answers a sampling request with the `stopReason` `cancelled`, without a consent dialog. The wiki page VS-Code has the third table of the check.
+- `vscode`: the README says that the Copilot harness has MRTR with Copilot runtime 1.0.92 and later. Before, it said from 1.0.95. The manual check of 2026-10-12 in the stable VS Code 1.141.0 observed the MRTR rounds with Copilot runtime 1.0.92-4. That runtime answers a sampling request with the `stopReason` `cancelled`, without a consent dialog. A second check in that VS Code covered the Local harness through the extension API, with the roots and the OAuth sign-in. The wiki page VS-Code has the two tables.
 
 ### Fixed
 
