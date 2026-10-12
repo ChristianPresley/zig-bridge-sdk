@@ -8,7 +8,7 @@ Visual Studio Code and VS Code are trademarks of Microsoft Corporation. This pro
 
 ## Why VS Code needs a bridge
 
-VS Code 1.140 has two MCP clients: the Local harness and the Copilot harness.
+VS Code 1.140 has two MCP clients: the Local harness and the Copilot harness. The setting `chat.defaultToCopilotHarness` selects the Copilot harness for the chat. It is false by default, and VS Code also enables the Copilot harness by experiment.
 
 - The Local harness operates the MCP user interface of VS Code: the server list, the prompts, the resources and the Output channel. It speaks only revision 2025-11-25 and starts each connection with an `initialize` request. A zig-sdk server answers `initialize` with the error -32601 (method not found), so the Local harness cannot use it.
 - The Copilot harness first sends `server/discover`. When the server answers with -32601, the harness sends `initialize` instead. It has no support for multi round-trip requests (MRTR).[^copilot-mrtr] It can list and call the tools of a 2026-07-28 server, but a tool that asks for input cannot complete.
@@ -68,6 +68,31 @@ You need Zig 0.16.0. The project gives source code only, without prebuilt execut
 5. Make sure that it starts: run `mcp-bridge-vscode --version`.
 
 If you write your server with zig-sdk, you do not need a separate bridge process. The section [The bridge in a zig-sdk server](#the-bridge-in-a-zig-sdk-server) tells how to put the bridge into your server.
+
+### Smoke test
+
+The upstream server of the tests, `bridge-fixture-server`, is a zig-sdk server with the tools of `test/fixture.zig`. Use it to make sure that the bridge and VS Code operate together:
+
+1. Build it with `zig build fixture-server`. The executable is `zig-out/bin/bridge-fixture-server`, or `bridge-fixture-server.exe` on Windows.
+2. Put this entry in `.vscode/mcp.json`, with the absolute paths of the two executables:
+
+   ```json
+   {
+     "servers": {
+       "fixture": {
+         "type": "stdio",
+         "command": "/abs/path/mcp-bridge-vscode",
+         "args": ["--", "/abs/path/bridge-fixture-server"]
+       }
+     }
+   }
+   ```
+
+3. In VS Code, run **MCP: List Servers**, select the server `fixture`, then select **Start Server**.
+4. Open the Chat view in agent mode. Make sure that the tools of the server are in the tool list.
+5. Ask the chat to call `echo` or `add`. These tools are safe: they only send a result back.
+
+Do not call `crash` or `shutdown`. These tools stop the fixture server. The section [The file `.vscode/mcp.json`](#the-file-vscodemcpjson) gives the rules of the configuration. The [messages of the Output channel](#troubleshooting) tell the cause of a problem.
 
 ### Remote windows
 
@@ -191,7 +216,7 @@ These options apply only to the URL form:
 | `--client-issuer <url>` | The issuer of `--client-id`. A client with a secret needs it. | |
 | `--client-metadata-url <url>` | Use the client ID metadata document at this URL. | The document of the bridge |
 | `--redirect-port <port>` | The port of the redirect URI `http://127.0.0.1:<port>/callback`. | 41894 |
-| `--account <label>` | The account of the stored sign-in. | `default` |
+| `--account <label>` | The account of the stored sign-in: 1 to 64 letters, digits, `-`, `.`, `_`, `@` or `+`. | `default` |
 | `--token-store <store>` | Where the bridge keeps the tokens: `auto`, `keychain`, `file` or `memory`. | `auto` |
 | `--token-key-file <path>` | The file with the key of the file store. Only your account can read it. | |
 | `--no-browser` | Do not open a browser. Write the URL of the sign-in to stderr only. We recommend it on a host that other users share (see [Environment limits](#environment-limits)). | |
@@ -215,7 +240,7 @@ The exit code of the bridge tells why it stopped:
 
 At the end of stdin, the bridge cancels the requests in flight and stops the upstream server. A sign-in that waits for the browser also stops. A watchdog stops the bridge and the process tree of the upstream server 8 s after the end of stdin.
 
-The exit code of `logout` is 0 when the deletion succeeded, also when there was nothing to delete. It is 1 when a deletion failed, and 2 for arguments that are not valid or for a token store that does not open.
+The exit code of `logout` is 0 when the deletion succeeded, also when there was nothing to delete. It is 1 when a deletion failed. It is 2 for arguments that are not valid and for a `--ca-file` that the bridge cannot use. A token store that does not open also gives 2.
 
 ## Configuration
 
@@ -235,7 +260,19 @@ This file is the primary configuration of VS Code. Put the entry in `.vscode/mcp
 }
 ```
 
-The `--` separates the options of the bridge from the command of the upstream server. The bridge starts that command and speaks revision 2026-07-28 to it over stdio. Write absolute paths. In this file, you can also use the variables of VS Code, such as `${workspaceFolder}`. On Windows, write each backslash two times, for example `"C:\\tools\\mcp-bridge-vscode.exe"`.
+The `--` separates the options of the bridge from the command of the upstream server. The bridge starts that command and speaks revision 2026-07-28 to it over stdio. Write absolute paths. In this file, you can also use the variables of VS Code, such as `${workspaceFolder}`. On Windows, write each backslash two times, because JSON uses the backslash as the escape character:
+
+```json
+{
+  "servers": {
+    "demo": {
+      "type": "stdio",
+      "command": "C:\\tools\\mcp-bridge-vscode.exe",
+      "args": ["--", "C:\\tools\\your-server.exe", "--its-args"]
+    }
+  }
+}
+```
 
 VS Code writes the full command line to the Output channel at the Debug level. Do not write a secret in `args`. Give a secret to the upstream server in an environment variable from a password input:
 
