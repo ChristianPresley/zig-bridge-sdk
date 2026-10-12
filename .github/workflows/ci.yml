@@ -102,11 +102,23 @@ jobs:
   # --ca-file. The script reads the sign-in URL from stderr of the bridge and opens it with the
   # redirects, as a browser does (the same pattern as the authorization scenarios of zig-sdk). It
   # also checks a static authorization header from the environment.
+  #
+  # The job runs on Linux and on Windows. VS Code starts the bridge on Windows too, where the
+  # executables have the extension .exe and the bridge starts its upstream command with PATHEXT.
+  # The steps run in bash on each system, so that one command line serves both.
   interop:
-    name: interop
-    runs-on: ubuntu-24.04
+    name: interop (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-zig
@@ -137,10 +149,20 @@ jobs:
   # starts the consumer over pipes two times: as VS Code (initialize, a tool call and a form) and
   # as a client of revision 2026-07-28 (server/discover, tools/list and a tool call). The consumer
   # must exit with code 0 at the end of each stdin.
-  consumer:
-    name: consumer
-    runs-on: ubuntu-24.04
+  #
+  # The job runs on Linux and on Windows, in bash on each system. The ruleset of main requires
+  # a check with the name `consumer`, thus the job `consumer` below collects the two results.
+  consumer-system:
+    name: consumer (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-zig
@@ -158,3 +180,14 @@ jobs:
       - name: Drive one legacy and one modern connection through the consumer
         run: zig build drive
         working-directory: examples/consumer
+
+  # The required check `consumer` of the ruleset: it passes only when the consumer check of each
+  # system passed. A skipped or cancelled system fails it too.
+  consumer:
+    name: consumer
+    needs: consumer-system
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check the result of the consumer job of each system
+        run: test "${{ needs.consumer-system.result }}" = "success"

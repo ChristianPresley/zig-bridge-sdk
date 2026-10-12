@@ -36,7 +36,7 @@ On Windows, the build can also stop with "unable to read results of configure ph
 
 ## The interop checks
 
-The CI job `interop` connects the legacy TypeScript SDK client to the bridge with two scripts in `.github/interop/`. To run them on your computer, install Node.js and the pinned packages, and build the three executables:
+The CI job `interop` connects the legacy TypeScript SDK client to the bridge with two scripts in `.github/interop/`. The job runs on Linux and on Windows, as the job `consumer` does. To run the scripts on your computer, install Node.js and the pinned packages, and build the three executables:
 
 ```bash
 npm ci --ignore-scripts --no-audit --no-fund --prefix .github/interop
