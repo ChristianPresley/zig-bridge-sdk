@@ -100,4 +100,4 @@ Each other skip in WSL is a failure.
 
 On Windows, a cancel does not always wake a task that waits in `accept`. Thus every new accept loop uses the wake pattern of zig-sdk, `mcp.util.wake`.[^wake] The loop reads a stop flag after each `accept`. To stop the loop, `cancelAcceptLoop` sets the flag and connects to the listener until the task ends.
 
-[^wake]: zig-sdk `src/mcp/util/wake.zig`. https://github.com/ChristianPresley/zig-sdk/blob/v0.3.0/src/mcp/util/wake.zig
+[^wake]: zig-sdk `src/mcp/util/wake.zig`. https://github.com/ChristianPresley/zig-sdk/blob/v0.5.1/src/mcp/util/wake.zig
