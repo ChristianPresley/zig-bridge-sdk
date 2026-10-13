@@ -121,7 +121,7 @@ If you write your server with zig-sdk, we recommend this path. You then do not n
 
 ### Steps to put the bridge into your server
 
-1. Add the package to the `build.zig.zon` of your server with `zig fetch --save-exact=bridge_sdk git+https://github.com/ChristianPresley/zig-bridge-sdk#v0.1.2`.
+1. Add the package to the `build.zig.zon` of your server with `zig fetch --save-exact=bridge_sdk git+https://github.com/ChristianPresley/zig-bridge-sdk#v0.2.0`.
 2. In `build.zig`, import the modules `vscode` and `mcp` of the package:
 
    ```zig

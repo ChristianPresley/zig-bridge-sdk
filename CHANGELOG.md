@@ -4,8 +4,13 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-12
+
+This release pins zig-sdk 0.5.2 (`v0.5.2`, commit `03b8049d59d2abdb6fa6c08beaac33c370de8eb0`).
+
 ### Changed
 
+- zig-sdk: the pin moves from 0.5.1 to 0.5.2. The release 0.5.2 of zig-sdk changes only its README, thus the `mcp` module is the one of 0.5.1. The pin is a part of the public API, thus the version is 0.2.0.
 - `vscode`: the README says that the Copilot harness has MRTR with Copilot runtime 1.0.92 and later. Before, it said from 1.0.95. The manual check of 2026-10-12 in the stable VS Code 1.141.0 observed the MRTR rounds with Copilot runtime 1.0.92-4. That runtime answers a sampling request with the `stopReason` `cancelled`, without a consent dialog. A second check in that VS Code covered the Local harness through the extension API, with the roots and the OAuth sign-in. The wiki page VS-Code has the two tables.
 
 ### Fixed
@@ -159,7 +164,8 @@ Milestone M6 protects the sign-in on a POSIX host that other users share. On suc
 - `vscode`: `bridges/vscode/README.md` has the new lines of the Output channel and the new error message of M6. The status sections of `README.md` and `bridges/vscode/README.md` name M6.
 - Repository: the tests of M6. The unit tests of `bridge.oauth` cover the start path and a guess of the token. They also cover a second `GET` during the wait and after the redirect, and the page before the stop. The transcript tests and a process test check that the opener gets only the start URL. In the process test, a `BROWSER` script starts `bridge-fixture-server --browse`, the browser of the test.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.2...HEAD
+[Unreleased]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ChristianPresley/zig-bridge-sdk/releases/tag/v0.1.0
