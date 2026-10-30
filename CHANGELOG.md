@@ -4,6 +4,8 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-30
+
 This release pins zig-sdk 0.9.1 (`v0.9.1`, commit `2f26f9dee38c89e51d11e07791e0153fc390979c`).
 
 ### Changed
@@ -18,7 +20,7 @@ This release pins zig-sdk 0.9.1 (`v0.9.1`, commit `2f26f9dee38c89e51d11e07791e01
 - Repository: a `zig build` step takes its arguments after `--` only (`addPassthruArgs`). The tools `lint-docs` and `gen-dictionary` use their default arguments when they get no argument. Thus `zig build lint-docs` still means `--strict --string-literals`, and `zig build gen-dictionary` still writes `docs/generated/dictionary.md`.
 - Repository: the CI installs Zig 0.17.0.
 
-<!-- The entries of `bridge`, the test fixture and `vscode` for this release go here. -->
+- `bridge`: the embedded server (`serveStdio`) follows the stdio server of zig-sdk 0.9.1. The server of zig-sdk no longer has the fields `out_lock`, `out` and `in_flight_lock`. The modern path now writes each frame through a `Sink` of the stdio server, with a lock of its own and a flush. The bytes on the wire do not change.
 
 ## [0.2.0] - 2026-10-12
 
@@ -180,7 +182,8 @@ Milestone M6 protects the sign-in on a POSIX host that other users share. On suc
 - `vscode`: `bridges/vscode/README.md` has the new lines of the Output channel and the new error message of M6. The status sections of `README.md` and `bridges/vscode/README.md` name M6.
 - Repository: the tests of M6. The unit tests of `bridge.oauth` cover the start path and a guess of the token. They also cover a second `GET` during the wait and after the redirect, and the page before the stop. The transcript tests and a process test check that the opener gets only the start URL. In the process test, a `BROWSER` script starts `bridge-fixture-server --browse`, the browser of the test.
 
-[Unreleased]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ChristianPresley/zig-bridge-sdk/compare/v0.1.0...v0.1.1
