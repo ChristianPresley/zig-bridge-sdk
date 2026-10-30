@@ -682,7 +682,7 @@ test "a line that is too long first gets no response and selects no path" {
     limits.stdio.max_line_bytes = 2048;
     // A request of revision 2026-07-28 that is longer than the limit and than the buffer of
     // the reader. If it selected the modern path, zig-sdk would refuse initialize.
-    const long = request("9", "tools/list", "{\"cursor\":\"" ++ "x" ** 10000 ++ "\"," ++ modern_meta ++ "}");
+    const long = request("9", "tools/list", "{\"cursor\":\"" ++ @as([10000]u8, @splat('x')) ++ "\"," ++ modern_meta ++ "}");
     const steps = [_]Step{
         .{ .bytes = long },
         .{ .bytes = vscode_initialize },

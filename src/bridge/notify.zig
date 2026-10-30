@@ -1537,7 +1537,7 @@ test "new streams after a loss wait longer each time, and a stream that lived fo
     const burst = (mcp.Limits{}).max_lost_stream_retries + 1;
     const fail: FakeServer.Attempt = .{ .ack = false, .end = .closed };
     // After the failures, one stream sends its acknowledgment and its result.
-    const plan = [_]FakeServer.Attempt{fail} ** (3 * burst) ++ [_]FakeServer.Attempt{.{ .end = .result }};
+    const plan = @as([3 * burst]FakeServer.Attempt, @splat(fail)) ++ [_]FakeServer.Attempt{.{ .end = .result }};
     // Each stream with an acknowledgment is stable.
     const options: Options = .{ .tools = true, .backoff = .fromMilliseconds(20), .max_backoff = .fromMilliseconds(50), .stable = .fromNanoseconds(0) };
     const t = try TestListener.create(&plan, options, null);
@@ -1570,7 +1570,7 @@ test "an upstream server that ends each stream after its acknowledgment gets the
     // stream and ends it at once.
     const ends: FakeServer.Attempt = .{ .end = .result };
     const options: Options = .{ .tools = true, .backoff = .fromMilliseconds(20), .max_backoff = .fromMilliseconds(80) };
-    const t = try TestListener.create(&([_]FakeServer.Attempt{ends} ** 5), options, null);
+    const t = try TestListener.create(&@as([5]FakeServer.Attempt, @splat(ends)), options, null);
     defer t.destroy();
     try t.waitAcks(6);
     // Each stream follows a loss, thus each acknowledgment gives the list change. The waits
@@ -1892,7 +1892,7 @@ test "the stop cancels the stream, opens no new stream, and a change after the s
 test "the stop does not wait for the end of a wait after a loss" {
     const burst = (mcp.Limits{}).max_lost_stream_retries + 1;
     const fail: FakeServer.Attempt = .{ .ack = false, .end = .closed };
-    const t = try TestListener.create(&([_]FakeServer.Attempt{fail} ** 16), .{ .tools = true, .backoff = .fromSeconds(30) }, null);
+    const t = try TestListener.create(&@as([16]FakeServer.Attempt, @splat(fail)), .{ .tools = true, .backoff = .fromSeconds(30) }, null);
     defer t.destroy();
     try t.fake.waitAttempts(burst);
     const started = Io.Clock.Timestamp.now(testing.io, .awake);

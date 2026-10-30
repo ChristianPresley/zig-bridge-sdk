@@ -3079,7 +3079,7 @@ test "account labels" {
     try testing.expect(!validAccount(""));
     try testing.expect(!validAccount("a|b"));
     try testing.expect(!validAccount("a b"));
-    try testing.expect(!validAccount("x" ** (max_account_len + 1)));
+    try testing.expect(!validAccount(@as([max_account_len + 1]u8, @splat('x'))));
 }
 
 test "the URL check refuses the characters, schemes and parts of P1" {
@@ -3113,7 +3113,7 @@ test "the URL check refuses the characters, schemes and parts of P1" {
         "https://a.example:44x/authorize",
         "https://a.example/authorize#fragment",
         "",
-        "https://a.example/?" ++ "a" ** max_url_bytes,
+        "https://a.example/?" ++ @as([max_url_bytes]u8, @splat('a')),
     };
     for (refused) |url| {
         if (validateAuthorizationUrl(url, .{})) |_| {
@@ -3125,7 +3125,7 @@ test "the URL check refuses the characters, schemes and parts of P1" {
     try testing.expectError(error.UrlCharacter, validateAuthorizationUrl("https://a.example/?u=%USERNAME%", .{}));
     try testing.expectError(error.UrlScheme, validateAuthorizationUrl("javascript:alert(1)", .{}));
     try testing.expectError(error.UrlAuthority, validateAuthorizationUrl("https://user@a.example/", .{}));
-    try testing.expectError(error.UrlLength, validateAuthorizationUrl("https://a.example/?" ++ "a" ** max_url_bytes, .{}));
+    try testing.expectError(error.UrlLength, validateAuthorizationUrl("https://a.example/?" ++ @as([max_url_bytes]u8, @splat('a')), .{}));
     try testing.expectError(error.UrlFragment, validateAuthorizationUrl("https://a.example/#x", .{}));
 }
 
@@ -3138,7 +3138,7 @@ test "the URL check accepts an authorization URL of OAuthClient with many fields
     try validateAuthorizationUrl("HTTPS://AUTH.EXAMPLE.COM:8443/authorize?x=1", .{});
     try validateAuthorizationUrl("https://[2001:db8::1]:443/authorize?x=1", .{});
     try validateAuthorizationUrl("https://a.example?x=1", .{});
-    try validateAuthorizationUrl("https://a.example/?" ++ "a" ** (max_url_bytes - "https://a.example/?".len), .{});
+    try validateAuthorizationUrl("https://a.example/?" ++ @as([max_url_bytes - "https://a.example/?".len]u8, @splat('a')), .{});
 }
 
 test "http needs allow_http and a loopback host" {
@@ -3435,7 +3435,7 @@ test "an oversize head gets 431 and does not end the wait" {
     try r.start(io, testing.allocator, .{ .port = 0, .state = "st", .limits = test_limits });
     defer r.stop();
 
-    const request = "GET /callback?code=c&state=st HTTP/1.1\r\nx-filler: " ++ "a" ** (17 * 1024) ++ "\r\n\r\n";
+    const request = "GET /callback?code=c&state=st HTTP/1.1\r\nx-filler: " ++ @as([17 * 1024]u8, @splat('a')) ++ "\r\n\r\n";
     if (testExchange(io, arena, r.port, request)) |response| {
         try testing.expectEqual(@as(u16, 431), response.status);
     } else |_| {
@@ -3599,7 +3599,7 @@ test "the wait gives a redirect that came before it, then Timeout at once, and A
 }
 
 /// A start token for the receiver tests.
-const test_token: StartToken = ("0123456789" ** 4 ++ "abc").*;
+const test_token: StartToken = ("0123456789" ++ "0123456789" ++ "0123456789" ++ "0123456789" ++ "abc").*;
 const test_location = "https://as.example/authorize?response_type=code&client_id=c1&state=st&code_challenge=abc&code_challenge_method=S256";
 
 fn testStartRequest(arena: Allocator, method: []const u8, path: []const u8) ![]const u8 {
@@ -3663,7 +3663,7 @@ test "a different start token gets 404 and does not end the wait" {
         token[i] = if (token[i] == 'z') 'y' else 'z';
         try wrong.append(arena, try arena.dupe(u8, &token));
     }
-    try wrong.append(arena, "0123456789" ** 4 ++ "ABC");
+    try wrong.append(arena, "0123456789" ++ "0123456789" ++ "0123456789" ++ "0123456789" ++ "ABC");
     try wrong.append(arena, test_token[0 .. start_token_len - 1]);
     try wrong.append(arena, test_token ++ "d");
     try wrong.append(arena, "");
@@ -4192,7 +4192,7 @@ test "with no_browser the receiver serves no start path" {
             var a: std.heap.ArenaAllocator = .init(testing.allocator);
             defer a.deinit();
             // Each start path gets 404, and the sign-in goes on.
-            for ([_][]const u8{ start_path_prefix, start_path_prefix ++ "A" ** start_token_len, start_path_prefix ++ "x" }) |target| {
+            for ([_][]const u8{ start_path_prefix, start_path_prefix ++ @as([start_token_len]u8, @splat('A')), start_path_prefix ++ "x" }) |target| {
                 const status = testGet(testing.io, a.allocator(), p, target) catch 0;
                 if (status != 404) _ = self.others.fetchAdd(1, .acq_rel);
             }
@@ -4730,7 +4730,11 @@ test "the token key: a bad length, a key file that is not private, and a private
     var store: TokenStore = undefined;
     try env.put(token_key_variable, "0011");
     try testing.expectError(error.InvalidTokenKey, store.open(io, testing.allocator, .{ .identity = test_identity, .environ_map = &env, .keychain = .{ .init_error = error.KeychainUnavailable }, .token_dir = token_dir }));
-    try env.put(token_key_variable, "zz" ** 32);
+    try env.put(token_key_variable, comptime blk: {
+        var r: []const u8 = "";
+        for (0..32) |_| r = r ++ "zz";
+        break :blk r;
+    });
     try testing.expectError(error.InvalidTokenKey, store.open(io, testing.allocator, .{ .identity = test_identity, .environ_map = &env, .keychain = .{ .init_error = error.KeychainUnavailable }, .token_dir = token_dir }));
     _ = env.swapRemove(token_key_variable);
 

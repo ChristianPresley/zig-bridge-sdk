@@ -831,7 +831,7 @@ pub const Cause = enum {
 
     /// True for a cause of the sign-in.
     pub fn isSignIn(cause: Cause) bool {
-        return @intFromEnum(cause) >= @intFromEnum(Cause.sign_in_failed);
+        return @backingInt(cause) >= @backingInt(Cause.sign_in_failed);
     }
 };
 

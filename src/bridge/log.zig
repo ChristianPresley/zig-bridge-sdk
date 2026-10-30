@@ -41,21 +41,21 @@ pub const truncation_marker = " [truncated]";
 
 /// The level at run time. The atomic value holds the integer of a `Level`, because
 /// `std.atomic.Value` cannot hold an enum without an explicit tag type.
-var current_level: std.atomic.Value(u8) = .init(@intFromEnum(default_level));
+var current_level: std.atomic.Value(u8) = .init(@backingInt(default_level));
 
 /// Sets the level at run time. A line with a less important level does not go to stderr.
 pub fn setLevel(new_level: Level) void {
-    current_level.store(@intFromEnum(new_level), .monotonic);
+    current_level.store(@backingInt(new_level), .monotonic);
 }
 
 /// Returns the level at run time.
 pub fn currentLevel() Level {
-    return @enumFromInt(current_level.load(.monotonic));
+    return @fromBackingInt(@intCast(current_level.load(.monotonic)));
 }
 
 /// Returns true when a line of level `message_level` goes to stderr.
 pub fn isEnabled(message_level: Level) bool {
-    return @intFromEnum(message_level) <= current_level.load(.monotonic);
+    return @backingInt(message_level) <= current_level.load(.monotonic);
 }
 
 /// Returns the level of the text `err`, `warn`, `info` or `debug`, or null for a different
@@ -156,7 +156,7 @@ test "a control character in the message becomes a space" {
 
 test "a long message gets the end marker and stays in the buffer" {
     var buf: [64]u8 = undefined;
-    const long = "x" ** 100;
+    const long = @as([100]u8, @splat('x'));
     const line = formatLine(&buf, "t", .info, .bridge, "{s}", .{long});
     try std.testing.expectEqual(buf.len, line.len);
     try std.testing.expect(std.mem.startsWith(u8, line, "t: bridge: info: xxx"));
@@ -166,7 +166,7 @@ test "a long message gets the end marker and stays in the buffer" {
 test "a message that fills the buffer exactly has no end marker" {
     var buf: [32]u8 = undefined;
     const prefix = "t: bridge: info: ";
-    const fill = "y" ** (buf.len - 1 - prefix.len);
+    const fill = @as([buf.len - 1 - prefix.len]u8, @splat('y'));
     const line = formatLine(&buf, "t", .info, .bridge, "{s}", .{fill});
     try std.testing.expectEqualStrings(prefix ++ fill ++ "\n", line);
 }
@@ -176,7 +176,11 @@ test "the end marker does not cut a UTF-8 sequence" {
     // Each "é" has two bytes. The cut point is in the middle of a sequence for one of the two
     // parities, so test both.
     for ([_][]const u8{ "", "a" }) |pad| {
-        const line = formatLine(&buf, "t", .info, .bridge, "{s}{s}", .{ pad, "é" ** 40 });
+        const line = formatLine(&buf, "t", .info, .bridge, "{s}{s}", .{ pad, comptime blk: {
+            var r: []const u8 = "";
+            for (0..40) |_| r = r ++ "é";
+            break :blk r;
+        } });
         try std.testing.expect(std.unicode.utf8ValidateSlice(line));
         try std.testing.expect(std.mem.endsWith(u8, line, truncation_marker ++ "\n"));
         try std.testing.expect(line.len <= buf.len);

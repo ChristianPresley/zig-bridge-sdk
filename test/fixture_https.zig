@@ -595,7 +595,7 @@ fn respondChallenge(arena: Allocator, request: *http.Server.Request, c: mcp.auth
     var headers: std.ArrayList(http.Header) = .empty;
     try headers.appendSlice(arena, c.headers(&buf));
     try headers.append(arena, json_headers[0]);
-    try request.respond(c.body, .{ .status = @enumFromInt(c.status), .keep_alive = false, .extra_headers = headers.items });
+    try request.respond(c.body, .{ .status = @fromBackingInt(@intCast(c.status)), .keep_alive = false, .extra_headers = headers.items });
 }
 
 /// The authorization server and the resource server of an `HttpsServer` with OAuth. The
@@ -988,7 +988,7 @@ pub fn browse(io: Io, gpa: Allocator, arena: Allocator, url: []const u8, options
         defer conn.close();
         conn.send("GET", target.path, target.host_header, &.{.{ .name = "accept", .value = "text/html" }}, "") catch return error.BadResponse;
         const response = conn.receiveHead() catch return error.BadResponse;
-        const status: u16 = @intFromEnum(response.head.status);
+        const status: u16 = @backingInt(response.head.status);
         const location: ?[]const u8 = if (response.head.location) |l| try arena.dupe(u8, l) else null;
         _ = conn.bodyReader(&response).discardRemaining() catch {};
         if (status < 300 or status >= 400) return .{ .status = status, .url = current };

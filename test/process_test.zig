@@ -2231,7 +2231,7 @@ const Watchdog = struct {
     /// Stop the process at once. The function does not release the process id.
     fn killProcess(id: std.process.Child.Id) void {
         switch (builtin.os.tag) {
-            .windows => _ = std.os.windows.ntdll.NtTerminateProcess(id, @enumFromInt(1)),
+            .windows => _ = std.os.windows.ntdll.NtTerminateProcess(id, @fromBackingInt(@intCast(1))),
             .wasi => {},
             else => std.posix.kill(id, .KILL) catch {},
         }

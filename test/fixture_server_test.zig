@@ -64,7 +64,7 @@ const KillTimer = struct {
             if (Io.Timestamp.now(self.io, .awake).nanoseconds >= deadline.nanoseconds) {
                 self.fired.store(true, .release);
                 switch (builtin.os.tag) {
-                    .windows => _ = std.os.windows.ntdll.NtTerminateProcess(self.target, @enumFromInt(1)),
+                    .windows => _ = std.os.windows.ntdll.NtTerminateProcess(self.target, @fromBackingInt(@intCast(1))),
                     .wasi => {},
                     else => std.posix.kill(self.target, .KILL) catch {},
                 }

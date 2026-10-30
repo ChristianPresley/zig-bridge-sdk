@@ -1159,7 +1159,7 @@ test "a start path with a wrong token gets 404, and the sign-in goes on and comp
         defer r.browser.lock.unlock(io);
         break :blk try arena.dupe(u16, r.browser.guesses.items);
     };
-    try testing.expectEqual((try wrongTokens(arena, "x" ** oauth.start_token_len)).len, guesses.len);
+    try testing.expectEqual((try wrongTokens(arena, @as([oauth.start_token_len]u8, @splat('x')))).len, guesses.len);
     for (guesses) |status| try testing.expectEqual(@as(u16, 404), status);
     try testing.expectEqual(@as(u16, 200), r.browser.lastStatus());
     try testing.expectEqual(@as(u32, 1), r.browser.count());
@@ -1550,7 +1550,7 @@ const ConnectProxy = struct {
     }
 
     fn answer(w: *Io.Writer, status: std.http.Status) !void {
-        try w.print("HTTP/1.1 {d} {s}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", .{ @intFromEnum(status), status.phrase() orelse "" });
+        try w.print("HTTP/1.1 {d} {s}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n", .{ @backingInt(status), status.phrase() orelse "" });
         try w.flush();
     }
 

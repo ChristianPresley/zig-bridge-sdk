@@ -342,7 +342,7 @@ pub fn state(self: *const Frontend) State {
 /// The level of the last `logging/setLevel` of the client, or null.
 pub fn clientLogLevel(self: *const Frontend) ?types.LoggingLevel {
     const v = self.client_level.load(.acquire);
-    return if (v == 0) null else @enumFromInt(v - 1);
+    return if (v == 0) null else @fromBackingInt(@intCast(v - 1));
 }
 
 /// The number of requests in flight.
@@ -614,7 +614,7 @@ fn handleRequest(self: *Frontend, slot: *Slot, req: Message.Request) void {
             };
             // Revision 2026-07-28 has no setLevel request. Each upstream request carries the
             // stored level in its `_meta` (RequestOptions.log_level).
-            self.client_level.store(@as(u8, @intFromEnum(p.level)) + 1, .release);
+            self.client_level.store(@as(u8, @backingInt(p.level)) + 1, .release);
             self.answerInline(slot, .{ .object = .empty });
         },
         // A client of two revisions sends `server/discover` first. The answer -32601 makes it
@@ -1603,7 +1603,7 @@ fn upstreamLost(self: *Frontend) void {
     self.lifecycle.store(.closing, .release);
     if (self.upstream.reap()) |term| switch (term) {
         .exited => |code| log.err("the upstream server exited with code {d}", .{code}),
-        .signal => |sig| log.err("the upstream server stopped on signal {d}", .{@intFromEnum(sig)}),
+        .signal => |sig| log.err("the upstream server stopped on signal {d}", .{@backingInt(sig)}),
         else => log.err("the upstream server stopped", .{}),
     } else log.err("the upstream server stopped", .{});
     self.stopAdmission();
@@ -2025,11 +2025,11 @@ test "the line reader keeps the start and the end of a line that is too long" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
-    const long = "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\",\"params\":{\"x\":\"" ++ "y" ** 300 ++ "\"}}";
+    const long = "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\",\"params\":{\"x\":\"" ++ @as([300]u8, @splat('y')) ++ "\"}}";
     // The order of the members of the TypeScript SDK 1.x: the id comes last.
-    const ts_long = "{\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"" ++ "y" ** 300 ++ "\"}},\"jsonrpc\":\"2.0\",\"id\":43}";
+    const ts_long = "{\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"" ++ @as([300]u8, @splat('y')) ++ "\"}},\"jsonrpc\":\"2.0\",\"id\":43}";
     // Much longer than the buffer of the slow path, thus the tail comes from the rest only.
-    const ts_longer = "{\"method\":\"x\",\"params\":{\"text\":\"" ++ "z" ** 2000 ++ "\"},\"jsonrpc\":\"2.0\",\"id\":\"ts-44\"}";
+    const ts_longer = "{\"method\":\"x\",\"params\":{\"text\":\"" ++ @as([2000]u8, @splat('z')) ++ "\"},\"jsonrpc\":\"2.0\",\"id\":\"ts-44\"}";
     // A small buffer takes the slow path, a large buffer the fast path.
     for ([_]usize{ 16, 4096 }) |buffer_len| {
         var fixed: Io.Reader = .fixed("{\"a\":1}\r\n\n  \n" ++ long ++ "\n" ++ ts_long ++ "\r\n" ++ ts_longer ++ "\nok\n\xff\xfe\nlast");
@@ -3020,7 +3020,7 @@ test "the rounds stop at the limit of the upstream client" {
     defer testing.log_level = saved;
     const state_only = "{\"resultType\":\"input_required\",\"requestState\":\"again\"}";
     const max = (mcp.Limits{}).mrtr_max_rounds_client;
-    const script = [_][]const u8{state_only} ** (max + 2);
+    const script = @as([max + 2][]const u8, @splat(state_only));
     const b = try ScriptBridge.create(&script, .{});
     defer b.destroy();
     const arena = b.arena();
@@ -3157,9 +3157,9 @@ test "lines that are not valid get an error with the id of the request" {
     // A lone surrogate escape, which std.json rejects.
     try expectError(try b.call(2, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"\\ud800\"}}"), -32700, "parse_error");
     try expectError(try b.call(3, "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"a\":[[[[[[[[[[1]]]]]]]]]}}"), -32600, "too_deep");
-    try expectError(try b.call(4, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"x\":\"" ++ "y" ** 1100 ++ "\"}}"), -32600, "line_too_long");
+    try expectError(try b.call(4, "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"x\":\"" ++ @as([1100]u8, @splat('y')) ++ "\"}}"), -32600, "line_too_long");
     // The TypeScript SDK 1.x writes the id last.
-    try expectError(try b.call(8, "{\"method\":\"tools/call\",\"params\":{\"x\":\"" ++ "y" ** 1100 ++ "\"},\"jsonrpc\":\"2.0\",\"id\":8}"), -32600, "line_too_long");
+    try expectError(try b.call(8, "{\"method\":\"tools/call\",\"params\":{\"x\":\"" ++ @as([1100]u8, @splat('y')) ++ "\"},\"jsonrpc\":\"2.0\",\"id\":8}"), -32600, "line_too_long");
     try expectError(try b.call(5, "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\",\"params\":{\"x\":\"\xff\"}}"), -32700, "parse_error");
     try expectError(try b.call(6, "{\"jsonrpc\":\"1.0\",\"id\":6,\"method\":\"ping\"}"), -32600, "invalid_request_shape");
     // Without an id, the error has the id null.

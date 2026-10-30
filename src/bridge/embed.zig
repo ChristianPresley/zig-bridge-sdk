@@ -915,7 +915,7 @@ test "a line that is too long first gets no response, and the next line selects 
     const c = try TestConnection.create(.{ .limits = limits });
     defer c.destroy();
     // The line is longer than the limit and than the buffer of the reader.
-    const long = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/list\",\"params\":{\"x\":\"" ++ "x" ** 6000 ++ "\"}}";
+    const long = "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"tools/list\",\"params\":{\"x\":\"" ++ @as([6000]u8, @splat('x')) ++ "\"}}";
     try c.send(long);
     try expectLegacyInitialize(try c.call(1, vscode_initialize));
     try expectText(try c.call(2, legacy_add), "5");

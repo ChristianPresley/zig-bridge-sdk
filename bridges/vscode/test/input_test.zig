@@ -1026,7 +1026,7 @@ test "answers with an unknown, numeric or null id get nothing, and a bad answer 
 
     // A line with the id of a request of the bridge that is not a valid message resolves the
     // request as an error. VS Code gets no error for it, and the upstream server gets cancel.
-    const deep = "[" ** 12 ++ "\"x\"" ++ "]" ** 12;
+    const deep = @as([12]u8, @splat('[')) ++ "\"x\"" ++ @as([12]u8, @splat(']'));
     const bad_answers = [_][]const u8{
         // A lone surrogate, which JSON.stringify of VS Code can write.
         "{\"action\":\"accept\",\"content\":{\"name\":\"\\ud800\"}}",
@@ -1035,7 +1035,7 @@ test "answers with an unknown, numeric or null id get nothing, and a bad answer 
         // Nesting deeper than the limit.
         "{\"action\":\"accept\",\"content\":{\"name\":" ++ deep ++ "}}",
         // A line longer than the limit.
-        try std.fmt.allocPrint(a, "{{\"action\":\"accept\",\"content\":{{\"name\":\"{s}\"}}}}", .{"y" ** 3000}),
+        try std.fmt.allocPrint(a, "{{\"action\":\"accept\",\"content\":{{\"name\":\"{s}\"}}}}", .{@as([3000]u8, @splat('y'))}),
     };
     for (bad_answers, 0..) |answer, i| {
         const id: i64 = @intCast(i + 3);

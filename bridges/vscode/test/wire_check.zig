@@ -79,7 +79,7 @@ pub const Schemas = struct {
     }
 
     fn document(self: *Schemas, revision: Revision) !Value {
-        const index = @intFromEnum(revision);
+        const index = @backingInt(revision);
         if (self.documents[index]) |d| return d;
         const text = switch (revision) {
             .legacy => schema_2025_11_25,

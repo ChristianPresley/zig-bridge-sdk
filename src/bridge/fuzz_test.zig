@@ -277,11 +277,11 @@ fn lineReader(_: void, smith: *Smith) anyerror!void {
 test "fuzz: the line reader and the id recovery" {
     try std.testing.fuzz({}, lineReader, .{
         .corpus = corpus(&.{
-            "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\",\"params\":{\"x\":\"" ++ "y" ** 80 ++ "\"}}\n{\"id\":\"b-1\"}\r\n\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\",\"params\":{\"x\":\"" ++ @as([80]u8, @splat('y')) ++ "\"}}\n{\"id\":\"b-1\"}\r\n\n",
             "{\"params\":{\"id\":5},\"id\":\"a\\\"b\"}\n\xff\xfe\nlast",
             "{\"id\":123456789012345678901234567890",
             // The order of the members of the TypeScript SDK 1.x: the id comes last.
-            "{\"method\":\"tools/call\",\"params\":{\"x\":\"" ++ "y" ** 80 ++ "\"},\"jsonrpc\":\"2.0\",\"id\":7}\r\n",
+            "{\"method\":\"tools/call\",\"params\":{\"x\":\"" ++ @as([80]u8, @splat('y')) ++ "\"},\"jsonrpc\":\"2.0\",\"id\":7}\r\n",
         }),
     });
 }
@@ -552,7 +552,7 @@ test "fuzz: the lines of the client through the front end" {
                 "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"resources/unsubscribe\",\"params\":{\"uri\":1}}\n" ++
                 "{\"jsonrpc\":\"2.0\",\"id\":8,\"method\":\"resources/subscribe\"}",
             // A line that is too long, with the id last as the TypeScript SDK 1.x writes it.
-            "\x01{\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"" ++ "a" ** 300 ++ "\"}},\"jsonrpc\":\"2.0\",\"id\":9}",
+            "\x01{\"method\":\"tools/call\",\"params\":{\"name\":\"echo\",\"arguments\":{\"text\":\"" ++ @as([300]u8, @splat('a')) ++ "\"}},\"jsonrpc\":\"2.0\",\"id\":9}",
             // The pending table: an answer, a second answer, an answer with a lone surrogate,
             // a late answer after a cancellation, and a form without an answer at the end.
             "\x01{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ask\"}}\n" ++
@@ -653,7 +653,7 @@ test "fuzz: the first line of a connection in the process of the server" {
             "\xff\xfe\n" ++ initialize_line,
             "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n" ++ initialize_line,
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"initialize\"}}",
-            "{\"x\":\"" ++ "a" ** 300 ++ "\"}\n" ++ initialize_line ++ "\r\n",
+            "{\"x\":\"" ++ @as([300]u8, @splat('a')) ++ "\"}\n" ++ initialize_line ++ "\r\n",
             "",
         }),
     });

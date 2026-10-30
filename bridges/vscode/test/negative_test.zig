@@ -294,7 +294,7 @@ test "an input schema deeper than the default depth limit of zig-sdk does not fa
     // rules.
     const levels = 80;
     tap.setScript(.{ .result = "{\"resultType\":\"complete\",\"tools\":[{\"name\":\"deep\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"list\":{\"type\":\"array\"},\"deep\":" ++
-        "{\"not\":" ** levels ++ "{\"type\":\"string\"}" ++ "}" ** levels ++ "}}}]}" });
+        repeat("{\"not\":", levels) ++ "{\"type\":\"string\"}" ++ repeat("}", levels) ++ "}}}]}" });
     const list = try h.expectResult(try t.request(2, "tools/list", "{}"));
     const schema = list.object.get("tools").?.array.items[0].object.get("inputSchema").?;
     const properties = schema.object.get("properties").?;
@@ -307,4 +307,13 @@ test "an input schema deeper than the default depth limit of zig-sdk does not fa
     try testing.expectEqual(@as(usize, levels), depth);
     try testing.expectEqualStrings("string", node.object.get("type").?.string);
     try t.verify();
+}
+
+/// Gives `s` repeated `n` times at compile time.
+fn repeat(comptime s: []const u8, comptime n: usize) []const u8 {
+    comptime {
+        var r: []const u8 = "";
+        for (0..n) |_| r = r ++ s;
+        return r;
+    }
 }
