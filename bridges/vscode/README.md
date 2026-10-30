@@ -62,7 +62,7 @@ You need Zig 0.16.0. The project gives source code only, without prebuilt execut
 2. Build the bridge:
 
    ```bash
-   zig build -Doptimize=ReleaseSafe
+   zig build -Doptimize=safe
    ```
 
 3. Find the executable at `zig-out/bin/mcp-bridge-vscode`. On Windows, the name is `mcp-bridge-vscode.exe`.

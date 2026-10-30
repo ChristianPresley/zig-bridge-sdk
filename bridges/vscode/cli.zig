@@ -452,7 +452,7 @@ const Raw = struct {
     sign_in_timeout: ?u32 = null,
     all: bool = false,
     /// The options of the command line in their order, each one time.
-    given: std.EnumSet(Option) = .initEmpty(),
+    given: std.EnumSet(Option) = .empty,
     order: std.ArrayList(Option) = .empty,
 };
 
@@ -1374,10 +1374,10 @@ test "the account and the token store" {
     var env = try testEnv(&.{.{ token_key_variable, key_hex }});
     defer env.deinit();
 
-    for ([_][]const u8{ "", "a|b", "a b", "ä", @as([max_account_bytes + 1]u8, @splat('x')) }) |label| {
+    for ([_][]const u8{ "", "a|b", "a b", "ä", &@as([max_account_bytes + 1]u8, @splat('x')) }) |label| {
         try expectError(error.InvalidValue, "--account", &.{ "--account", label, url });
     }
-    try testing.expectEqualStrings(@as([max_account_bytes]u8, @splat('x')), (try parse(a, &.{ "--account", @as([max_account_bytes]u8, @splat('x')), url }, null)).oauth.?.account);
+    try testing.expectEqualStrings(&@as([max_account_bytes]u8, @splat('x')), (try parse(a, &.{ "--account", &@as([max_account_bytes]u8, @splat('x')), url }, null)).oauth.?.account);
     try expectError(error.InvalidValue, "--token-store", &.{ "--token-store", "disk", url });
 
     // The key of the environment for the stores auto and file.

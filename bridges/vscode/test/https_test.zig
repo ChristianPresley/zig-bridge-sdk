@@ -1159,7 +1159,7 @@ test "a start path with a wrong token gets 404, and the sign-in goes on and comp
         defer r.browser.lock.unlock(io);
         break :blk try arena.dupe(u16, r.browser.guesses.items);
     };
-    try testing.expectEqual((try wrongTokens(arena, @as([oauth.start_token_len]u8, @splat('x')))).len, guesses.len);
+    try testing.expectEqual((try wrongTokens(arena, &@as([oauth.start_token_len]u8, @splat('x')))).len, guesses.len);
     for (guesses) |status| try testing.expectEqual(@as(u16, 404), status);
     try testing.expectEqual(@as(u16, 200), r.browser.lastStatus());
     try testing.expectEqual(@as(u32, 1), r.browser.count());
