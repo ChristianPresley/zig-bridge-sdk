@@ -83,7 +83,7 @@ try vscode.serveStdio(io, gpa, &server, .{});
 
 ## Requirements
 
-- Zig 0.16.0. The package sets `minimum_zig_version` to this version.
+- Zig 0.17.0. The package sets `minimum_zig_version` to this version.
 - zig-sdk, the only dependency. `build.zig.zon` pins it with a commit and a hash, and `zig build` fetches it.
 
 ## Build
@@ -132,7 +132,7 @@ Other build steps: `test-vscode`, `fixture-server`, `embedded-server`, `run-vsco
 
 ## Troubleshooting
 
-If your package does not use the `mcp` module of this package, Zig 0.16.0 can show these errors:
+If your package does not use the `mcp` module of this package, Zig 0.17.0 can show these errors:
 
 | Error | Cause |
 | --- | --- |

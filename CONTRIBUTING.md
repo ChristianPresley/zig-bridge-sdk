@@ -16,7 +16,7 @@ If you send a pull request, the maintainer applies your change as a signed commi
 
 ## Set up the repository
 
-1. Install Zig 0.16.0.
+1. Install Zig 0.17.0.
 2. Clone the repository.
 3. Run `git config core.hooksPath .githooks`.
 4. Run `zig build test --test-timeout 10m`. The first build fetches the pinned zig-sdk.
@@ -30,7 +30,7 @@ If you send a pull request, the maintainer applies your change as a signed commi
 
 ### The test timeout
 
-Always give `--test-timeout 10m` to `zig build test`. The CI does this too. Without the option, the build runner waits only 60 s for each answer of a test runner. On Windows, a race of Zig 0.16.0 in parallel process starts (an inherited pipe) can delay that answer. The build runner then reports "test runner failed to respond", although no test hangs. With the option, each test has a limit of 10 minutes, and the build runner waits as long for each answer.
+Always give `--test-timeout 10m` to `zig build test`, as the CI does. Without the option, the build waits only 60 s for each answer of a test runner. On Windows with Zig 0.16.0, a race in parallel process starts (an inherited pipe) delayed that answer. The build then reported "test runner failed to respond", although no test hung. The release notes of Zig 0.17.0 do not name a correction, thus the option stays. With the option, each test has a limit of 10 minutes, and the build waits as long for each answer.
 
 On Windows, the build can also stop with "unable to read results of configure phase" or "unable to load ...: Unexpected". These errors are transient. Run the command again.
 

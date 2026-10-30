@@ -4,6 +4,22 @@ This file records all notable changes to this project. The format follows Keep a
 
 ## [Unreleased]
 
+This release pins zig-sdk 0.9.1 (`v0.9.1`, commit `2f26f9dee38c89e51d11e07791e0153fc390979c`).
+
+### Changed
+
+- Package: the package needs Zig 0.17.0 (`minimum_zig_version`). Zig 0.16.0 does not build it. Zig 0.17.0 renamed the optimize modes to `debug`, `safe`, `fast` and `small`, and the source follows this change and the other changes of the standard library.
+- Package: the pin of zig-sdk moves from 0.5.2 to 0.9.1. zig-sdk 0.9.0 and later need Zig 0.17.0. The releases 0.5.3 to 0.9.1 of zig-sdk bring these changes to the bridges and to a server that embeds a bridge:
+  - The stdio server of zig-sdk runs `server/discover`, `tools/list`, `prompts/list`, `resources/templates/list` and a call of a tool with `ToolDef.quick` on its reader task, without a new task. When the input holds more complete lines, the responses go out in one write. The path of a call has no lock, and the server uses fewer threads under load.
+  - `ToolDef.quick` marks a tool whose handler does not wait for I/O, a timer or a lock, and returns in some microseconds.
+  - A request with an `MCP-Protocol-Version` value other than 2026-07-28 gets `UnsupportedProtocolVersion` (-32022, with `data.supported` and `data.requested`) before the checks of the other headers, on Streamable HTTP and on gRPC. Before, a 2025-11-25 client got `HeaderMismatch` (-32020) and did not see the supported versions.
+  - `Limits.http` has `max_in_flight` (256 by default), `listen_backlog` (1024 by default) and `shards`. The Streamable HTTP server and the WebSocket server run one task for each connection, and they set `TCP_NODELAY` on each connection.
+- Repository: `build.zig` no longer gives the tests a copy of the test runner of the toolchain. The two changes of that copy were for Zig 0.16.0.
+- Repository: a `zig build` step takes its arguments after `--` only (`addPassthruArgs`). The tools `lint-docs` and `gen-dictionary` use their default arguments when they get no argument. Thus `zig build lint-docs` still means `--strict --string-literals`, and `zig build gen-dictionary` still writes `docs/generated/dictionary.md`.
+- Repository: the CI installs Zig 0.17.0.
+
+<!-- The entries of `bridge`, the test fixture and `vscode` for this release go here. -->
+
 ## [0.2.0] - 2026-10-12
 
 This release pins zig-sdk 0.5.2 (`v0.5.2`, commit `03b8049d59d2abdb6fa6c08beaac33c370de8eb0`).

@@ -50,7 +50,7 @@ From M5, the Local harness can use a zig-sdk server that calls `vscode.serveStdi
 
 ## Build and install
 
-You need Zig 0.16.0. The project gives source code only, without prebuilt executables. The first build fetches zig-sdk, the only dependency, from GitHub. `build.zig.zon` pins a commit of zig-sdk. The compatibility table of the main README names the zig-sdk of each release.
+You need Zig 0.17.0. The project gives source code only, without prebuilt executables. The first build fetches zig-sdk, the only dependency, from GitHub. `build.zig.zon` pins a commit of zig-sdk. The compatibility table of the main README names the zig-sdk of each release.
 
 1. Get the source code:
 
