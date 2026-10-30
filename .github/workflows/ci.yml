@@ -60,11 +60,11 @@ jobs:
         with:
           path: ${{ runner.temp }}/zig-global-cache
           key: zig-global-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
-      # Without --test-timeout, the build runner waits only 60 s for each answer of a test runner.
-      # On Windows, a race of Zig 0.16.0 in parallel process starts (an inherited pipe) can delay
-      # that answer. The build runner then reports "test runner failed to respond", although no
-      # test hangs. With the option, each test has a limit of 10 min, and the build runner waits
-      # as long for each answer.
+      # Without --test-timeout, the build waits only 60 s for each answer of a test runner. On
+      # Windows with Zig 0.16.0, a race in parallel process starts (an inherited pipe) delayed that
+      # answer, and the build reported "test runner failed to respond", although no test hung.
+      # The release notes of Zig 0.17.0 do not name a correction, thus the option stays. With the
+      # option, each test has a limit of 10 min, and the build waits as long for each answer.
       - run: zig build test -Doptimize=${{ matrix.optimize }} --test-timeout 10m --summary all
       # The install step builds mcp-bridge-vscode.
       - run: zig build -Doptimize=${{ matrix.optimize }}
