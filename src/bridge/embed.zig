@@ -340,7 +340,8 @@ fn serveModern(
     out: *Io.Writer,
     grace: Io.Duration,
 ) !void {
-    var transport: mcp.transport.stdio.Server = .init(io, gpa, server, out);
+    var modern_out: ModernOut = .{ .out = out };
+    var transport: mcp.transport.stdio.Server = .initSink(io, gpa, server, modern_out.sink());
     transport.peer = peer;
     // As in the front end, a request above the limit gets -32603 at once. A listen stream
     // also holds a slot. Thus the reader always reads the cancellations and the end of the
@@ -350,7 +351,7 @@ fn serveModern(
     defer stopModern(io, server, &transport, grace);
     switch (first) {
         .line => |line| try transport.receive(line),
-        .invalid_utf8 => writeParseError(io, &transport),
+        .invalid_utf8 => writeParseError(io, &modern_out),
     }
     while (true) {
         _ = scratch.reset(.{ .retain_with_limit = scratch_retain });
@@ -361,7 +362,7 @@ fn serveModern(
                 continue;
             },
             error.InvalidUtf8, error.ControlCharacter => {
-                writeParseError(io, &transport);
+                writeParseError(io, &modern_out);
                 continue;
             },
             error.OutOfMemory => return error.OutOfMemory,
@@ -396,20 +397,39 @@ fn stopModern(io: Io, server: *mcp.Server, transport: *mcp.transport.stdio.Serve
 
 /// The number of requests in flight of `transport`, also the listen streams.
 fn inFlightCount(io: Io, transport: *mcp.transport.stdio.Server) usize {
-    transport.in_flight_lock.lockUncancelable(io);
-    defer transport.in_flight_lock.unlock(io);
-    return transport.in_flight.items.len;
+    _ = io;
+    return transport.in_flight.load(.seq_cst);
 }
 
+/// The output of the modern path. The transport writes each frame through `sink`, and the
+/// reader writes the parse errors with `writeParseError`. Each frame goes out as one line
+/// under `lock`, with a flush. Thus no frame waits in the buffer of `out`, as on the legacy
+/// path.
+const ModernOut = struct {
+    out: *Io.Writer,
+    lock: Io.Mutex = .init,
+
+    fn sink(self: *ModernOut) mcp.transport.stdio.Server.Sink {
+        return .{ .ptr = self, .write = write };
+    }
+
+    fn write(ptr: *anyopaque, io: Io, frame: []const u8) Transport.SendError!void {
+        const self: *ModernOut = @ptrCast(@alignCast(ptr));
+        self.lock.lockUncancelable(io);
+        defer self.lock.unlock(io);
+        line_framer.writeFrame(self.out, frame) catch return error.WriteFailed;
+    }
+};
+
 /// Answer a line that is not valid UTF-8 with the error of `stdio.Server.run`. The function
-/// writes under the output lock of the transport.
-fn writeParseError(io: Io, transport: *mcp.transport.stdio.Server) void {
+/// writes under the output lock of the modern path.
+fn writeParseError(io: Io, modern_out: *ModernOut) void {
     var buf: [256]u8 = undefined;
     var w: Io.Writer = .fixed(&buf);
     mcp.jsonrpc.message.writeErrorResponse(&w, null, mcp.protocol.errors.parseError("Parse error: invalid UTF-8").toWire()) catch return;
-    transport.out_lock.lockUncancelable(io);
-    defer transport.out_lock.unlock(io);
-    writeLine(transport.out.?, w.buffered());
+    modern_out.lock.lockUncancelable(io);
+    defer modern_out.lock.unlock(io);
+    writeLine(modern_out.out, w.buffered());
 }
 
 // ---------------------------------------------------------------------------------------------

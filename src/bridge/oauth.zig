@@ -655,7 +655,7 @@ const win = if (builtin.os.tag == .windows) struct {
     extern "ws2_32" fn WSAGetLastError() callconv(.winapi) i32;
 
     /// Listens on `127.0.0.1:<port>` with `SO_EXCLUSIVEADDRUSE`. The listener of std in Zig
-    /// 0.16.0 lets each later listener of std share the port. Then the redirect can go to the
+    /// 0.17.0 lets each later listener of std share the port. Then the redirect can go to the
     /// wrong process. The accept of `Io` works on this socket.
     fn listenExclusive(port: u16) error{ AddressInUse, ListenFailed }!Io.net.Server {
         var data: WSADATA align(8) = undefined;
@@ -691,7 +691,7 @@ const win = if (builtin.os.tag == .windows) struct {
     }
 
     /// True when a socket with `SO_REUSEADDR` can bind `127.0.0.1:<port>`. For tests. In Zig
-    /// 0.16.0, the listen of std reports the refusal of Windows as an unexpected error, and it
+    /// 0.17.0, the listen of std reports the refusal of Windows as an unexpected error, and it
     /// writes a stack trace. Thus the test uses this function.
     fn canBindShared(port: u16) bool {
         var data: WSADATA align(8) = undefined;
@@ -3079,7 +3079,7 @@ test "account labels" {
     try testing.expect(!validAccount(""));
     try testing.expect(!validAccount("a|b"));
     try testing.expect(!validAccount("a b"));
-    try testing.expect(!validAccount(@as([max_account_len + 1]u8, @splat('x'))));
+    try testing.expect(!validAccount(&@as([max_account_len + 1]u8, @splat('x'))));
 }
 
 test "the URL check refuses the characters, schemes and parts of P1" {

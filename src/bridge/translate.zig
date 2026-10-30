@@ -59,9 +59,9 @@ fn parseMember(comptime T: type, arena: Allocator, member: ?Value) Allocator.Err
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    inline for (@typeInfo(T).@"struct".fields) |field| {
-        if (field.type == ?Value) if (@field(out, field.name)) |settings| if (settings != .object) {
-            @field(out, field.name) = null;
+    inline for (@typeInfo(T).@"struct".field_names, @typeInfo(T).@"struct".field_types) |fname, ftype| {
+        if (ftype == ?Value) if (@field(out, fname)) |settings| if (settings != .object) {
+            @field(out, fname) = null;
         };
     }
     return out;
@@ -2130,11 +2130,11 @@ test "error table covers each member of RequestError" {
     try testing.expectEqual(Cause.invalid_request, causeOf(E.InvalidRequest));
     try testing.expectEqual(Cause.invalid_meta, causeOf(E.InvalidMeta));
     // The names of the causes are the names of the errors in snake case.
-    inline for (@typeInfo(E).error_set.?) |member| {
-        const cause = causeOf(@field(E, member.name));
+    inline for (@typeInfo(E).error_set.error_names.?) |name| {
+        const cause = causeOf(@field(E, name));
         var buf: [64]u8 = undefined;
         var len: usize = 0;
-        for (member.name, 0..) |c, i| {
+        for (name, 0..) |c, i| {
             if (std.ascii.isUpper(c)) {
                 if (i != 0) {
                     buf[len] = '_';

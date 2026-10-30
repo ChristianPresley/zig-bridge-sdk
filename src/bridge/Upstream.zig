@@ -400,8 +400,9 @@ fn onStdioNotification(userdata: ?*anyopaque, method: []const u8, params: ?Value
         return;
     }
     const sink = self.on_log orelse return;
-    var fallback = std.heap.stackFallback(4096, self.gpa);
-    var scratch: std.heap.ArenaAllocator = .init(fallback.get());
+    var buffer: [4096]u8 = undefined;
+    var fallback: std.heap.BufferFirstAllocator = .init(&buffer, self.gpa);
+    var scratch: std.heap.ArenaAllocator = .init(fallback.allocator());
     defer scratch.deinit();
     const p = mcp.json.parseValue(types.LoggingMessageNotificationParams, scratch.allocator(), params orelse .null) catch {
         log.debug("dropped a log message of the upstream server that is not valid", .{});

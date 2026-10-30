@@ -504,8 +504,9 @@ pub const Listener = struct {
 
     /// Start the change `c`.
     fn begin(self: *Listener, c: *Change) void {
-        var fallback = std.heap.stackFallback(1024, self.gpa);
-        var scratch: std.heap.ArenaAllocator = .init(fallback.get());
+        var buffer: [1024]u8 = undefined;
+        var fallback: std.heap.BufferFirstAllocator = .init(&buffer, self.gpa);
+        var scratch: std.heap.ArenaAllocator = .init(fallback.allocator());
         defer scratch.deinit();
         const uris = self.changedUris(scratch.allocator(), c) catch {
             c.respond.fail(c.respond.context, translate.errorFor(.out_of_memory, null));
@@ -671,8 +672,9 @@ pub const Listener = struct {
     /// own scratch memory.
     fn writeUpdates(self: *Listener, uris: []const []const u8) void {
         for (uris) |uri| {
-            var fallback = std.heap.stackFallback(1024, self.gpa);
-            var scratch: std.heap.ArenaAllocator = .init(fallback.get());
+            var buffer: [1024]u8 = undefined;
+            var fallback: std.heap.BufferFirstAllocator = .init(&buffer, self.gpa);
+            var scratch: std.heap.ArenaAllocator = .init(fallback.allocator());
             defer scratch.deinit();
             const frame = mcp.json.writeAlloc(scratch.allocator(), mcp.jsonrpc.message.OutNotification(Updated){
                 .method = "notifications/resources/updated",
@@ -776,8 +778,9 @@ const Stream = struct {
     fn onEvent(context: ?*anyopaque, method: []const u8, params: ?Value) void {
         const s: *Stream = @ptrCast(@alignCast(context.?));
         const listener = s.listener;
-        var fallback = std.heap.stackFallback(2048, listener.gpa);
-        var scratch: std.heap.ArenaAllocator = .init(fallback.get());
+        var buffer: [2048]u8 = undefined;
+        var fallback: std.heap.BufferFirstAllocator = .init(&buffer, listener.gpa);
+        var scratch: std.heap.ArenaAllocator = .init(fallback.allocator());
         defer scratch.deinit();
         const event = translate.listenEvent(scratch.allocator(), method, params) catch {
             log.debug("dropped the notification {s} of the listen stream: no memory", .{method});
@@ -952,8 +955,10 @@ const TestHost = struct {
 const TestResponse = struct {
     host: *TestHost,
     id: i64,
-    /// The error of `fail`, or null.
+    /// The error of `fail`, or null. Its message is a copy in `message_buf`: the listener
+    /// frees the stream, and with it the message of the upstream server, after the response.
     err: ?translate.RpcError = null,
+    message_buf: [128]u8 = undefined,
 
     fn respond(self: *TestResponse) Respond {
         return .{ .context = self, .ok = ok, .fail = fail };
@@ -967,7 +972,10 @@ const TestResponse = struct {
 
     fn fail(context: *anyopaque, err: translate.RpcError) void {
         const self: *TestResponse = @ptrCast(@alignCast(context));
+        const n = @min(err.message.len, self.message_buf.len);
+        @memcpy(self.message_buf[0..n], err.message[0..n]);
         self.err = err;
+        self.err.?.message = self.message_buf[0..n];
         var buf: [96]u8 = undefined;
         TestHost.write(self.host, std.fmt.bufPrint(&buf, "{{\"jsonrpc\":\"2.0\",\"id\":{d},\"error\":{{\"code\":{d},\"message\":\"m\"}}}}", .{ self.id, err.code }) catch unreachable);
     }
