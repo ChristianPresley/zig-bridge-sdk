@@ -52,7 +52,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-26, windows-2025]
-        optimize: [debug, safe]
+        # The names of the jobs are required status checks of the ruleset of main, thus the labels
+        # stay Debug and ReleaseSafe. `mode` is the optimize mode of Zig 0.17.0.
+        optimize: [Debug, ReleaseSafe]
+        include:
+          - optimize: Debug
+            mode: debug
+          - optimize: ReleaseSafe
+            mode: safe
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/setup-zig
@@ -65,10 +72,10 @@ jobs:
       # answer, and the build reported "test runner failed to respond", although no test hung.
       # The release notes of Zig 0.17.0 do not name a correction, thus the option stays. With the
       # option, each test has a limit of 10 min, and the build waits as long for each answer.
-      - run: zig build test -Doptimize=${{ matrix.optimize }} --test-timeout 10m --summary all
+      - run: zig build test -Doptimize=${{ matrix.mode }} --test-timeout 10m --summary all
       # The install step builds mcp-bridge-vscode.
-      - run: zig build -Doptimize=${{ matrix.optimize }}
-      - run: zig build fixture-server -Doptimize=${{ matrix.optimize }}
+      - run: zig build -Doptimize=${{ matrix.mode }}
+      - run: zig build fixture-server -Doptimize=${{ matrix.mode }}
       - name: Run the installed executable
         shell: bash
         run: zig-out/bin/mcp-bridge-vscode --version
