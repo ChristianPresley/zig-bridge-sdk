@@ -103,8 +103,8 @@ A remote window of VS Code connects to a host over Secure Shell, to WSL or to a 
 For a server on the remote host, put the bridge and the upstream server on that host. Build the bridge for the target of the host, for example:
 
 ```bash
-zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl
-zig build -Doptimize=ReleaseSafe -Dtarget=aarch64-linux-musl
+zig build -Doptimize=safe -Dtarget=x86_64-linux-musl
+zig build -Doptimize=safe -Dtarget=aarch64-linux-musl
 ```
 
 VS Code for the Web cannot start stdio servers. The bridge does not operate there.

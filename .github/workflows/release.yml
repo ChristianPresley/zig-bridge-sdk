@@ -41,8 +41,8 @@ jobs:
       - run: zig build fmt
       - run: zig build lint-docs -- --strict --string-literals
       # --test-timeout: see the test job of ci.yml (a race on Windows, observed with Zig 0.16.0).
-      - run: zig build test -Doptimize=ReleaseSafe --test-timeout 10m --summary all
-      - run: zig build install fixture-server -Doptimize=ReleaseSafe
+      - run: zig build test -Doptimize=safe --test-timeout 10m --summary all
+      - run: zig build install fixture-server -Doptimize=safe
 
   publish:
     name: publish

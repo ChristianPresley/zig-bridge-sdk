@@ -91,7 +91,7 @@ try vscode.serveStdio(io, gpa, &server, .{});
 The project gives the source only. It does not publish executables. Build the executables with this command:
 
 ```bash
-zig build -Doptimize=ReleaseSafe
+zig build -Doptimize=safe
 ```
 
 The result is `zig-out/bin/mcp-bridge-vscode`, or `zig-out/bin/mcp-bridge-vscode.exe` on Windows. The usage has these forms:
